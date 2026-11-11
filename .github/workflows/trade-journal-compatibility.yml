@@ -1,0 +1,50 @@
+name: Trade Journal Compatibility
+
+on:
+  pull_request:
+    paths:
+      - "ggpbot.py"
+      - "roro_trade_journal.py"
+      - "roro_postgres_trade_journal.py"
+      - "bingx_execution.py"
+      - "test_*journal*.py"
+      - "test_bingx_execution.py"
+      - "test_ggp_recovery.py"
+      - "test_recovery_lifecycle.py"
+      - "requirements.txt"
+      - ".github/workflows/trade-journal-compatibility.yml"
+  workflow_dispatch:
+
+jobs:
+  sqlite-and-postgres-contract:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ggp_test
+          POSTGRES_USER: ggp_test
+          POSTGRES_PASSWORD: ggp_test_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ggp_test -d ggp_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_POSTGRES_DSN: postgresql://ggp_test:ggp_test_only@127.0.0.1:5432/ggp_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: PostgreSQL journal contract
+        run: pytest -q test_postgres_trade_journal.py
+      - name: Execution and recovery regression
+        run: pytest -q test_bingx_execution.py test_ggp_recovery.py test_recovery_lifecycle.py
