@@ -5050,10 +5050,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             target_margin = wallet_balance * 0.20
             if wallet_balance <= 0 or target_margin <= 0:
                 raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
-            if free_balance + 1e-9 < target_margin:
+            if free_balance <= 0:
                 raise ValueError(
-                    f"SNIPER_FREE_MARGIN_INSUFFICIENT: wallet_total={wallet_balance:.4f} "
-                    f"target_margin={target_margin:.4f} free={free_balance:.4f}"
+                    f"SNIPER_FREE_MARGIN_UNAVAILABLE: wallet_total={wallet_balance:.4f} "
+                    f"free={free_balance:.4f}"
                 )
             balance = wallet_balance
             log_execution(
@@ -5113,6 +5113,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
         actual_notional = qty * contract_size * reference_price
         margin = actual_notional / LEVERAGE
+        if institutional_entry_ctx.get("sniper_v2") is True:
+            required_free_margin = margin * 1.01
+            if free_balance + 1e-9 < required_free_margin:
+                raise ValueError(
+                    f"SNIPER_FREE_MARGIN_INSUFFICIENT_AFTER_RISK_GATE: "
+                    f"wallet_total={wallet_balance:.4f} target_margin={target_margin:.4f} "
+                    f"actual_margin={margin:.4f} required_with_buffer={required_free_margin:.4f} "
+                    f"free={free_balance:.4f}"
+                )
         effective_stop_distance = abs(reference_price - structural_stop) + reference_price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
         estimated_stop_loss = qty * contract_size * effective_stop_distance
         max_stop_loss = sizing.max_risk_usdt
@@ -8435,6 +8444,7 @@ SNIPER_V2_SL_ATR_BUFFER = _env_float_range("SNIPER_V2_SL_ATR_BUFFER", 0.40, 0.10
 SNIPER_V2_TP1_MOVE_PCT = 0.40
 SNIPER_V2_TP2_MOVE_PCT = 1.00
 SNIPER_V2_ZONE_MAX_AGE_SEC = _env_int_range("SNIPER_V2_ZONE_MAX_AGE_SEC", 14400, 900, 86400)
+SNIPER_V2_CONFIRMATION_WINDOW_BARS = _env_int_range("SNIPER_V2_CONFIRMATION_WINDOW_BARS", 3, 1, 10)
 SNIPER_V2_MAX_ENTRY_DISTANCE_ATR = _env_float_range("SNIPER_V2_MAX_ENTRY_DISTANCE_ATR", 0.75, 0.20, 2.00)
 _SNIPER_V2_LAST_SCAN = 0.0
 _SNIPER_V2_LOCK = threading.Lock()
@@ -8541,32 +8551,99 @@ def _sniper_v2_symbols():
 
 
 def _sniper_v2_update_zone(symbol, closed):
-    """Create/update a persistent zone for one symbol; never places an order."""
+    """Create/update a persistent zone from closed candles; never places an order.
+
+    Lifecycle is deliberately explicit:
+      PIVOT_CONFIRMED -> WAIT_FOR_DEPARTURE -> WAIT_FOR_RETEST -> READY.
+    A candle that created/confirmed the pivot cannot also count as its retest.
+    """
     key = roro_canonical_symbol(symbol)
     if not key or closed is None or len(closed) < 80:
+        return None
+    try:
+        candle_ts = int(closed.timestamp.iloc[-1])
+        price = float(closed.close.iloc[-1])
+        previous_close = float(closed.close.iloc[-2])
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    if candle_ts <= 0 or not np.isfinite(price) or price <= 0:
         return None
     atr_series = compute_atr(closed, 14)
     atr_value = float(atr_series.iloc[-1]) if len(atr_series) else float("nan")
     if not np.isfinite(atr_value) or atr_value <= 0:
         return None
-    price = float(closed.close.iloc[-1])
+
     zone = SNIPER_ZONES.get(key)
     if isinstance(zone, dict):
+        # One transition pass per confirmed closed candle, not every 15-second scan.
+        last_processed_ts = int(zone.get("last_candle_ts", 0) or 0)
+        if candle_ts <= last_processed_ts:
+            return zone
+
+        zone["last_candle_ts"] = candle_ts
         age = time.time() - float(zone.get("created_at", time.time()))
         if age > SNIPER_V2_ZONE_MAX_AGE_SEC:
             zone["state"] = "EXPIRED"
+
+        zone_type = str(zone.get("type", "")).upper()
+        zone_low = float(zone.get("low", 0.0))
+        zone_high = float(zone.get("high", 0.0))
+        if zone_type not in {"TOP", "BOTTOM"} or zone_low <= 0 or zone_high <= zone_low:
+            zone["state"] = "INVALIDATED"
+
         if zone.get("state") == "WAIT":
-            if float(zone["low"]) <= price <= float(zone["high"]):
-                zone["state"] = "READY"
-                zone["retest_candle_ts"] = int(closed.timestamp.iloc[-1])
-                log_execution(f"[SNIPER_V2] {key} RETEST confirmed; state=READY", "INFO")
-            elif zone["type"] == "TOP" and price > float(zone["high"]) + atr_value * 0.20:
+            if zone_type == "TOP":
+                if price > zone_high + atr_value * 0.20:
+                    zone["state"] = "INVALIDATED"
+                elif not zone.get("departed") and price < zone_low - atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} TOP departure confirmed; waiting for retest", "INFO")
+                elif (
+                    zone.get("departed")
+                    and int(zone.get("departure_candle_ts", 0)) < candle_ts
+                    and previous_close < zone_low
+                    and float(closed.high.iloc[-1]) >= zone_low
+                    and zone_low <= price <= zone_high
+                ):
+                    zone["state"] = "READY"
+                    zone["retest_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} TOP retest confirmed; state=READY", "INFO")
+            else:
+                if price < zone_low - atr_value * 0.20:
+                    zone["state"] = "INVALIDATED"
+                elif not zone.get("departed") and price > zone_high + atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} BOTTOM departure confirmed; waiting for retest", "INFO")
+                elif (
+                    zone.get("departed")
+                    and int(zone.get("departure_candle_ts", 0)) < candle_ts
+                    and previous_close > zone_high
+                    and float(closed.low.iloc[-1]) <= zone_high
+                    and zone_low <= price <= zone_high
+                ):
+                    zone["state"] = "READY"
+                    zone["retest_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} BOTTOM retest confirmed; state=READY", "INFO")
+
+        elif zone.get("state") == "READY":
+            # Do not keep a stale retest authorization indefinitely.
+            retest_ts = int(zone.get("retest_candle_ts", 0) or 0)
+            max_age_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000 * SNIPER_V2_CONFIRMATION_WINDOW_BARS)
+            if retest_ts <= 0 or candle_ts - retest_ts > max_age_ms:
+                zone["state"] = "EXPIRED"
+            elif zone_type == "TOP" and price > zone_high + atr_value * 0.20:
                 zone["state"] = "INVALIDATED"
-            elif zone["type"] == "BOTTOM" and price < float(zone["low"]) - atr_value * 0.20:
+            elif zone_type == "BOTTOM" and price < zone_low - atr_value * 0.20:
                 zone["state"] = "INVALIDATED"
-        elif zone.get("state") in {"EXPIRED", "INVALIDATED", "USED", "NO_CHASE"}:
+
+        if zone.get("state") in {"EXPIRED", "INVALIDATED", "USED", "NO_CHASE"}:
             SNIPER_ZONES.pop(key, None)
             zone = None
+        else:
+            return zone
+
     if zone is None:
         n = SNIPER_V2_PIVOT_LOOKBACK
         if is_pivot_high(closed, n):
@@ -8584,9 +8661,14 @@ def _sniper_v2_update_zone(symbol, closed):
                     "symbol": symbol, "canonical_symbol": key, "type": "TOP",
                     "high": pivot_high, "low": pivot_high - pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH,
                     "pivot_timestamp": pivot_ts,
-                    "created_at": time.time(), "last_candle_ts": int(closed.timestamp.iloc[-1]),
-                    "state": "WAIT", "reasons": reasons,
+                    "created_at": time.time(), "last_candle_ts": candle_ts,
+                    "state": "WAIT", "departed": False, "reasons": reasons,
                 }
+                # Right-side closed candles may already have moved price away.
+                # Record the departure, but never mark READY on this same candle.
+                if price < float(zone["low"]) - atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
         elif is_pivot_low(closed, n):
             pivot_idx = len(closed) - n - 1
             pivot_ts = int(closed.timestamp.iloc[pivot_idx])
@@ -8602,20 +8684,54 @@ def _sniper_v2_update_zone(symbol, closed):
                     "symbol": symbol, "canonical_symbol": key, "type": "BOTTOM",
                     "high": pivot_low + pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH, "low": pivot_low,
                     "pivot_timestamp": pivot_ts,
-                    "created_at": time.time(), "last_candle_ts": int(closed.timestamp.iloc[-1]),
-                    "state": "WAIT", "reasons": reasons,
+                    "created_at": time.time(), "last_candle_ts": candle_ts,
+                    "state": "WAIT", "departed": False, "reasons": reasons,
                 }
+                if price > float(zone["high"]) + atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+
         if zone:
             SNIPER_V2_LAST_PIVOT_TS[key] = int(zone["pivot_timestamp"])
             SNIPER_ZONES[key] = zone
             log_execution(
                 f"[SNIPER_V2] {key} {zone['type']} zone created "
-                f"pivot_ts={zone['pivot_timestamp']} bounds={zone['low']:.12g}-{zone['high']:.12g}",
+                f"pivot_ts={zone['pivot_timestamp']} bounds={zone['low']:.12g}-{zone['high']:.12g} "
+                f"departed={bool(zone.get('departed'))}",
                 "INFO",
             )
-    if zone:
-        zone["last_candle_ts"] = int(closed.timestamp.iloc[-1])
     return zone
+
+
+def _sniper_v2_confirmation_due(zone, candle_ts):
+    """Require a later closed candle after the retest candle for confirmation."""
+    if not isinstance(zone, dict) or str(zone.get("state", "")).upper() != "READY":
+        return False
+    retest_ts = int(zone.get("retest_candle_ts", 0) or 0)
+    current_ts = int(candle_ts or 0)
+    if retest_ts <= 0 or current_ts <= retest_ts:
+        return False
+    max_age_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000 * SNIPER_V2_CONFIRMATION_WINDOW_BARS)
+    return (current_ts - retest_ts) <= max_age_ms
+
+
+def _sniper_v2_structural_stop(side, zone, atr_value, roro_stop):
+    """Keep the RORO stop at least as far beyond the pivot zone as configured."""
+    direction = str(side or "").strip().upper()
+    if direction not in {"BUY", "SELL"} or not isinstance(zone, dict):
+        raise ValueError("invalid Sniper V2 stop inputs")
+    atr = float(atr_value)
+    authority_stop = float(roro_stop)
+    zone_low = float(zone.get("low"))
+    zone_high = float(zone.get("high"))
+    if not all(np.isfinite(v) and v > 0 for v in (atr, authority_stop, zone_low, zone_high)):
+        raise ValueError("Sniper V2 stop inputs must be finite and positive")
+    if zone_high <= zone_low:
+        raise ValueError("Sniper V2 zone geometry is invalid")
+    buffer = atr * SNIPER_V2_SL_ATR_BUFFER
+    if direction == "SELL":
+        return max(authority_stop, zone_high + buffer)
+    return min(authority_stop, zone_low - buffer)
 
 
 def sniper_engine_v2():
@@ -8661,13 +8777,16 @@ def sniper_engine_v2():
                 continue
             SNIPER_V2_METRICS["zones_ready"] += 1
             candle_ts = int(closed.timestamp.iloc[-1])
+            if not _sniper_v2_confirmation_due(zone, candle_ts):
+                continue
             if int(zone.get("confirmation_candle_ts", 0)) == candle_ts:
                 continue
+            # Mark before evaluation so a closed candle is evaluated once only.
+            zone["confirmation_candle_ts"] = candle_ts
             confirmed, count = check_sniper_confirmation(closed, zone["type"], zone)
             zone["confirmation_count"] = count
             if not confirmed:
                 continue
-            zone["confirmation_candle_ts"] = candle_ts
             side = "SELL" if zone["type"] == "TOP" else "BUY"
             live_price = get_ticker_safe(symbol)
             if not live_price or not np.isfinite(float(live_price)) or float(live_price) <= 0:
@@ -8709,7 +8828,7 @@ def sniper_engine_v2():
             if structural_stop is None or not np.isfinite(float(structural_stop)):
                 log_execution(f"[SNIPER_V2] {key} blocked: structural_stop_missing", "WARN")
                 continue
-            structural_stop = float(structural_stop)
+            structural_stop = _sniper_v2_structural_stop(side, zone, atr_value, float(structural_stop))
             if (side == "SELL" and structural_stop <= price) or (side == "BUY" and structural_stop >= price):
                 log_execution(f"[SNIPER_V2] {key} blocked: invalid_RORO_stop_geometry", "WARN")
                 continue
