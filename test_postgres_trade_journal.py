@@ -60,7 +60,7 @@ def test_entry_snapshot_event_and_restart_reads(journal):
     assert journal.save_snapshot(trade_id, state, "snapshot-1", "CONTRACT_SNAPSHOT") is True
     assert journal.save_snapshot(trade_id, state, "snapshot-1", "CONTRACT_SNAPSHOT") is False
     restored = journal.get(trade_id)
-    assert restored["state"]["trade_id"] == trade_id
+    assert restored["state"]["status"] == "OPEN"
     assert restored["state"]["tp2_price"] == 102000.0
     rows = [row for row in journal.open_trades() if row["trade_id"] == trade_id]
     assert len(rows) == 1
