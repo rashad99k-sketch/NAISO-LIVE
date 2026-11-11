@@ -5035,17 +5035,12 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         if institutional_entry_ctx.get("sniper_v2") is True:
             if institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
                 raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
-            if PAPER_MODE:
-                wallet_balance = safe_float(paper.get("balance"), 0.0)
-                free_balance = wallet_balance
-                balance_source = "PAPER_WALLET_TOTAL"
-            else:
-                wallet_snapshot = safe_api_call(ex.fetch_balance)
-                if not isinstance(wallet_snapshot, dict):
-                    raise ValueError("SNIPER_WALLET_BALANCE_UNAVAILABLE")
-                wallet_balance = safe_float((wallet_snapshot.get("total") or {}).get("USDT"), 0.0)
-                free_balance = safe_float((wallet_snapshot.get("free") or {}).get("USDT"), 0.0)
-                balance_source = "BINGX_WALLET_TOTAL_USDT"
+            wallet_snapshot = None if PAPER_MODE else safe_api_call(ex.fetch_balance)
+            wallet_balance, free_balance, balance_source = _sniper_v2_wallet_balances(
+                wallet_snapshot=wallet_snapshot,
+                paper_wallet_balance=paper.get("balance", 0.0),
+                paper_mode=PAPER_MODE,
+            )
             balance_ts = time.time()
             target_margin = wallet_balance * 0.20
             if wallet_balance <= 0 or target_margin <= 0:
@@ -8453,6 +8448,25 @@ SNIPER_V2_METRICS = {
     "symbols_scanned": 0, "zones_waiting": 0, "zones_ready": 0,
     "entries": 0, "last_scan": 0.0, "last_error": None,
 }
+
+
+def _sniper_v2_wallet_balances(*, wallet_snapshot=None, paper_wallet_balance=0.0, paper_mode=False):
+    """Return (total wallet USDT, free USDT, source); total sizes, free only gates execution."""
+    if paper_mode:
+        total = safe_float(paper_wallet_balance, 0.0)
+        free = total
+        source = "PAPER_WALLET_TOTAL"
+    else:
+        if not isinstance(wallet_snapshot, dict):
+            raise ValueError("SNIPER_WALLET_BALANCE_UNAVAILABLE")
+        total = safe_float((wallet_snapshot.get("total") or {}).get("USDT"), 0.0)
+        free = safe_float((wallet_snapshot.get("free") or {}).get("USDT"), 0.0)
+        source = "BINGX_WALLET_TOTAL_USDT"
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
+    if not math.isfinite(free) or free < 0:
+        raise ValueError("SNIPER_FREE_MARGIN_INVALID")
+    return total, free, source
 
 
 def is_pivot_high(df, lookback=None):
