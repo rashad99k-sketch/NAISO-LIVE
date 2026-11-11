@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from urllib.parse import unquote, urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,15 +58,27 @@ def backup() -> str:
     dsn = _required("DATABASE_URL")
     bucket = _required("DO_SPACES_BUCKET")
     cipher = _cipher()
+    parsed = urlsplit(dsn)
+    if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname:
+        raise RuntimeError("DATABASE_URL must be a PostgreSQL URI")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     with tempfile.TemporaryDirectory(prefix="ggp-journal-backup-") as tmp:
         dump_path = Path(tmp) / "journal.dump"
-        # Password is supplied via PGPASSFILE by the platform/operator; never
-        # put credentials in command arguments or log output.
+        # Credentials travel through the child environment, never process arguments.
+        query = dict(item.split("=", 1) for item in parsed.query.split("&") if "=" in item)
+        pg_env = os.environ.copy()
+        pg_env.update({
+            "PGHOST": parsed.hostname,
+            "PGPORT": str(parsed.port or 5432),
+            "PGUSER": unquote(parsed.username or ""),
+            "PGPASSWORD": unquote(parsed.password or ""),
+            "PGDATABASE": unquote(parsed.path.lstrip("/")),
+            "PGSSLMODE": query.get("sslmode", "require"),
+        })
         subprocess.run(
-            ["pg_dump", "--format=custom", "--no-owner", "--no-acl", "--file", str(dump_path), dsn],
+            ["pg_dump", "--format=custom", "--no-owner", "--no-acl", "--file", str(dump_path)],
             check=True, timeout=int(os.getenv("PG_DUMP_TIMEOUT_SEC", "180")),
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=pg_env,
         )
         plaintext = dump_path.read_bytes()
         sha = hashlib.sha256(plaintext).hexdigest()
