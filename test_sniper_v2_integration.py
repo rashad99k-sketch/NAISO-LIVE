@@ -194,13 +194,13 @@ def test_sniper_v2_watchlist_scan_rotates_across_universe(monkeypatch):
     monkeypatch.setattr(ggpbot, "SNIPER_V2_MAX_SYMBOLS", 2)
     monkeypatch.setattr(ggpbot, "_SNIPER_V2_SYMBOL_CURSOR", 0)
     now = __import__("time").time()
-    ggpbot.MEMORY["watchlist"] = {
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {
         f"COIN{i}/USDT": {
             "symbol": f"COIN{i}/USDT", "score": float(100 - i),
             "decision_state": "WAITING_FOR_RETEST", "last_update": now,
         }
         for i in range(5)
-    }
+    })
     first = ggpbot._sniper_v2_symbols()
     second = ggpbot._sniper_v2_symbols()
     assert len(first) == 2
