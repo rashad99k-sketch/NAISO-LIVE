@@ -4916,6 +4916,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
+                require_journal=not PAPER_MODE,
             )
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
@@ -8864,15 +8865,33 @@ from ggp_institutional_bridge import (
 )
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
 from roro_confluence import ema9_vwap_proximity as _roro_ema9_vwap_proximity, timeframe_seconds as _roro_timeframe_seconds
+# Keep optional scanner/resource caches independent from the trade journal.
+# A cache initialization failure must never disable durable trade-state persistence.
 try:
     from roro_resource_manager import ResourceManager
-    from roro_trade_journal import TradeJournal
     INSTITUTIONAL_RESOURCE_MANAGER = ResourceManager(max_cache_items=5000, max_history=2000)
-    INSTITUTIONAL_TRADE_JOURNAL = TradeJournal(os.getenv("TRADE_JOURNAL_PATH", "data/ggp_trade_journal.sqlite3"))
-except Exception as _integration_init_error:
+except Exception as _resource_init_error:
     INSTITUTIONAL_RESOURCE_MANAGER = None
+    log_execution(f"[INTEGRATION] resource manager unavailable: {_resource_init_error}", "WARN")
+
+try:
+    from roro_trade_journal import TradeJournal
+    _journal_configured_path = str(os.getenv("TRADE_JOURNAL_PATH", "data/ggp_trade_journal.sqlite3")).strip()
+    if not _journal_configured_path:
+        raise RuntimeError("TRADE_JOURNAL_PATH is empty")
+    # Resolve relative paths against the source directory, never the process CWD.
+    # This prevents silent creation of a second empty SQLite DB after a run-command
+    # or working-directory change. App Platform local storage is still ephemeral.
+    _journal_absolute_path = (
+        _journal_configured_path if os.path.isabs(_journal_configured_path)
+        else os.path.join(ENV_DIR, _journal_configured_path)
+    )
+    _journal_absolute_path = os.path.abspath(_journal_absolute_path)
+    INSTITUTIONAL_TRADE_JOURNAL = TradeJournal(_journal_absolute_path)
+    log_execution(f"[JOURNAL] initialized path={_journal_absolute_path}", "SUCCESS")
+except Exception as _journal_init_error:
     INSTITUTIONAL_TRADE_JOURNAL = None
-    log_execution(f"[INTEGRATION] optional persistence unavailable: {_integration_init_error}", "WARN")
+    log_execution(f"[JOURNAL] initialization FAILED: {type(_journal_init_error).__name__}: {_journal_init_error}", "ERROR")
 
 def _integration_fetch_frame(symbol):
     return get_ohlcv_safe(roro_exchange_symbol(symbol), 150)
