@@ -8425,6 +8425,7 @@ SNIPER_ZONES = {}
 # Stateful zone watcher. It is a signal provider only: actual orders still pass
 # through execute_entry(), which remains the only entry gateway.
 SNIPER_ZONES = {}
+SNIPER_V2_LAST_PIVOT_TS = {}
 SNIPER_V2_ENABLED = _env_bool("SNIPER_V2_ENABLED", True)
 SNIPER_V2_SCAN_INTERVAL = _env_int_range("SNIPER_V2_SCAN_INTERVAL", 15, 5, 120)
 SNIPER_V2_MAX_SYMBOLS = _env_int_range("SNIPER_V2_MAX_SYMBOLS", 8, 1, 20)
@@ -8563,36 +8564,49 @@ def _sniper_v2_update_zone(symbol, closed):
                 zone["state"] = "INVALIDATED"
             elif zone["type"] == "BOTTOM" and price < float(zone["low"]) - atr_value * 0.20:
                 zone["state"] = "INVALIDATED"
-        elif zone.get("state") in {"EXPIRED", "INVALIDATED", "USED"}:
+        elif zone.get("state") in {"EXPIRED", "INVALIDATED", "USED", "NO_CHASE"}:
             SNIPER_ZONES.pop(key, None)
             zone = None
     if zone is None:
         n = SNIPER_V2_PIVOT_LOOKBACK
         if is_pivot_high(closed, n):
             pivot_idx = len(closed) - n - 1
-            strong, reasons = detect_strong_pivot(closed.iloc[:pivot_idx + 1], "TOP", atr_value)
-            if strong:
+            pivot_ts = int(closed.timestamp.iloc[pivot_idx])
+            if int(SNIPER_V2_LAST_PIVOT_TS.get(key, 0)) == pivot_ts:
+                return None
+            pivot_frame = closed.iloc[:pivot_idx + 1]
+            pivot_atr_series = compute_atr(pivot_frame, 14)
+            pivot_atr = float(pivot_atr_series.iloc[-1]) if len(pivot_atr_series) else float("nan")
+            strong, reasons = detect_strong_pivot(pivot_frame, "TOP", pivot_atr)
+            if strong and np.isfinite(pivot_atr) and pivot_atr > 0:
                 pivot_high = float(closed.high.iloc[pivot_idx])
                 zone = {
                     "symbol": symbol, "canonical_symbol": key, "type": "TOP",
-                    "high": pivot_high, "low": pivot_high - atr_value * SNIPER_V2_ZONE_ATR_WIDTH,
-                    "pivot_timestamp": int(closed.timestamp.iloc[pivot_idx]),
+                    "high": pivot_high, "low": pivot_high - pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH,
+                    "pivot_timestamp": pivot_ts,
                     "created_at": time.time(), "last_candle_ts": int(closed.timestamp.iloc[-1]),
                     "state": "WAIT", "reasons": reasons,
                 }
         elif is_pivot_low(closed, n):
             pivot_idx = len(closed) - n - 1
-            strong, reasons = detect_strong_pivot(closed.iloc[:pivot_idx + 1], "BOTTOM", atr_value)
-            if strong:
+            pivot_ts = int(closed.timestamp.iloc[pivot_idx])
+            if int(SNIPER_V2_LAST_PIVOT_TS.get(key, 0)) == pivot_ts:
+                return None
+            pivot_frame = closed.iloc[:pivot_idx + 1]
+            pivot_atr_series = compute_atr(pivot_frame, 14)
+            pivot_atr = float(pivot_atr_series.iloc[-1]) if len(pivot_atr_series) else float("nan")
+            strong, reasons = detect_strong_pivot(pivot_frame, "BOTTOM", pivot_atr)
+            if strong and np.isfinite(pivot_atr) and pivot_atr > 0:
                 pivot_low = float(closed.low.iloc[pivot_idx])
                 zone = {
                     "symbol": symbol, "canonical_symbol": key, "type": "BOTTOM",
-                    "high": pivot_low + atr_value * SNIPER_V2_ZONE_ATR_WIDTH, "low": pivot_low,
-                    "pivot_timestamp": int(closed.timestamp.iloc[pivot_idx]),
+                    "high": pivot_low + pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH, "low": pivot_low,
+                    "pivot_timestamp": pivot_ts,
                     "created_at": time.time(), "last_candle_ts": int(closed.timestamp.iloc[-1]),
                     "state": "WAIT", "reasons": reasons,
                 }
         if zone:
+            SNIPER_V2_LAST_PIVOT_TS[key] = int(zone["pivot_timestamp"])
             SNIPER_ZONES[key] = zone
             log_execution(
                 f"[SNIPER_V2] {key} {zone['type']} zone created "
@@ -8747,8 +8761,8 @@ def sniper_engine_v2():
         _SNIPER_V2_LOCK.release()
 
 
-def _dispatch_sniper_scan_if_due():
-    """Rate-limited dispatcher using the existing scanner task lock."""
+def _run_sniper_scan_if_due():
+    """Run synchronously inside the supervisor; avoid racing the other entry path."""
     global _SNIPER_V2_LAST_SCAN
     if not SNIPER_V2_ENABLED:
         return False
@@ -8756,7 +8770,7 @@ def _dispatch_sniper_scan_if_due():
     if now - _SNIPER_V2_LAST_SCAN < SNIPER_V2_SCAN_INTERVAL:
         return False
     _SNIPER_V2_LAST_SCAN = now
-    return dispatch_scanner_task("sniper_v2", sniper_engine_v2)
+    return sniper_engine_v2()
 
 
 # ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
@@ -9006,7 +9020,7 @@ def main_loop_sniper():
                         last_candidate_scan = now
                     # Sniper is an entry-only candidate engine; it never runs while
                     # a position is open and uses the same bounded scanner cache.
-                    _dispatch_sniper_scan_if_due()
+                    _run_sniper_scan_if_due()
                     time.sleep(1)
                 else:
                     time.sleep(1)
