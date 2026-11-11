@@ -93,3 +93,121 @@ def test_sniper_v2_risk_gate_can_still_reduce_target_position():
     assert sizing.target_margin == pytest.approx(20.0)
     assert sizing.binding_constraint == "RISK_GATE"
     assert sizing.margin_required < sizing.target_margin
+
+
+def _closed_zone_frame(ts_base, *, previous_close=100.0, last_open=100.0,
+                       last_high=100.5, last_low=99.5, last_close=100.0):
+    ts = [ts_base + i * 900_000 for i in range(80)]
+    close = [100.0] * 80
+    open_ = [100.0] * 80
+    high = [100.5] * 80
+    low = [99.5] * 80
+    close[-2] = previous_close
+    open_[-2] = previous_close
+    close[-1] = last_close
+    open_[-1] = last_open
+    high[-1] = last_high
+    low[-1] = last_low
+    return pd.DataFrame({
+        "timestamp": ts, "open": open_, "high": high,
+        "low": low, "close": close, "volume": [1000.0] * 80,
+    })
+
+
+def test_sniper_v2_waits_for_departure_then_a_later_retest(monkeypatch):
+    monkeypatch.setattr(ggpbot, "roro_canonical_symbol", lambda value: str(value))
+    monkeypatch.setattr(ggpbot, "compute_atr", lambda frame, period=14: pd.Series(
+        [1.0] * len(frame), index=frame.index
+    ))
+    ggpbot.SNIPER_ZONES.clear()
+    ggpbot.SNIPER_V2_LAST_PIVOT_TS.clear()
+
+    departure = _closed_zone_frame(
+        1_700_000_000_000, previous_close=99.2,
+        last_open=99.0, last_high=99.0, last_low=98.5, last_close=98.8,
+    )
+    zone = {
+        "symbol": "BTC/USDT", "canonical_symbol": "BTC/USDT", "type": "TOP",
+        "high": 100.0, "low": 99.5, "created_at": __import__("time").time(),
+        "last_candle_ts": int(departure.timestamp.iloc[-2]), "state": "WAIT",
+        "departed": False,
+    }
+    ggpbot.SNIPER_ZONES["BTC/USDT"] = zone
+    updated = ggpbot._sniper_v2_update_zone("BTC/USDT", departure)
+    assert updated["state"] == "WAIT"
+    assert updated["departed"] is True
+
+    retest = _closed_zone_frame(
+        int(departure.timestamp.iloc[-1]) + 900_000,
+        previous_close=99.2, last_open=99.8,
+        last_high=100.0, last_low=99.4, last_close=99.7,
+    )
+    updated = ggpbot._sniper_v2_update_zone("BTC/USDT", retest)
+    assert updated["state"] == "READY"
+    assert updated["retest_candle_ts"] == int(retest.timestamp.iloc[-1])
+    assert ggpbot._sniper_v2_confirmation_due(updated, int(retest.timestamp.iloc[-1])) is False
+    assert ggpbot._sniper_v2_confirmation_due(
+        updated, int(retest.timestamp.iloc[-1]) + 900_000
+    ) is True
+
+
+def test_sniper_v2_confirmation_requires_rejection_after_retest():
+    frame = _closed_zone_frame(
+        1_700_000_000_000, previous_close=99.8,
+        last_open=99.8, last_high=100.2, last_low=99.4, last_close=99.6,
+    )
+    zone = {"type": "TOP", "high": 100.0, "low": 99.5}
+    confirmed, checks = ggpbot.check_sniper_confirmation(frame, "TOP", zone)
+    assert confirmed is True
+    assert checks >= 2
+
+
+def test_sniper_v2_structural_stop_stays_beyond_the_pivot_zone():
+    top = {"low": 99.5, "high": 100.0}
+    bottom = {"low": 99.0, "high": 99.5}
+    assert ggpbot._sniper_v2_structural_stop("SELL", top, 2.0, 100.5) == pytest.approx(100.8)
+    assert ggpbot._sniper_v2_structural_stop("BUY", bottom, 2.0, 98.5) == pytest.approx(98.2)
+
+
+def test_sniper_v2_sizing_uses_total_wallet_and_only_uses_free_as_feasibility():
+    total, free, source = ggpbot._sniper_v2_wallet_balances(
+        wallet_snapshot={"total": {"USDT": 100.0}, "free": {"USDT": 7.0}},
+        paper_mode=False,
+    )
+    assert total == pytest.approx(100.0)
+    assert free == pytest.approx(7.0)
+    assert source == "BINGX_WALLET_TOTAL_USDT"
+
+
+def test_sniper_v2_paper_wallet_balance_is_used_as_total():
+    total, free, source = ggpbot._sniper_v2_wallet_balances(
+        paper_wallet_balance=25.0, paper_mode=True,
+    )
+    assert total == pytest.approx(25.0)
+    assert free == pytest.approx(25.0)
+    assert source == "PAPER_WALLET_TOTAL"
+
+
+def test_sniper_v2_watchlist_scan_rotates_across_universe(monkeypatch):
+    monkeypatch.setattr(ggpbot, "roro_exchange_symbol", lambda value: str(value))
+    monkeypatch.setattr(ggpbot, "roro_canonical_symbol", lambda value: str(value))
+    monkeypatch.setattr(ggpbot, "SNIPER_V2_MAX_SYMBOLS", 2)
+    monkeypatch.setattr(ggpbot, "_SNIPER_V2_SYMBOL_CURSOR", 0)
+    now = __import__("time").time()
+    ggpbot.MEMORY["watchlist"] = {
+        f"COIN{i}/USDT": {
+            "symbol": f"COIN{i}/USDT", "score": float(100 - i),
+            "decision_state": "WAITING_FOR_RETEST", "last_update": now,
+        }
+        for i in range(5)
+    }
+    first = ggpbot._sniper_v2_symbols()
+    second = ggpbot._sniper_v2_symbols()
+    assert len(first) == 2
+    assert len(second) == 2
+    assert set(first).isdisjoint(set(second))
+
+
+def test_sniper_v2_wallet_balance_fails_closed_when_snapshot_missing():
+    with pytest.raises(ValueError, match="SNIPER_WALLET_BALANCE_UNAVAILABLE"):
+        ggpbot._sniper_v2_wallet_balances(wallet_snapshot=None, paper_mode=False)
