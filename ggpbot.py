@@ -10495,29 +10495,67 @@ def _exchange_fetch_live_snapshot(self, symbol):
         return None
 
 
-def _exchange_reconcile(self, symbol, local_state):
+def _exchange_reconcile(self, symbol, local_state, *, force=False):
+    """Tri-state reconciliation; force bypasses throttle, never bypasses safety."""
+    global RECOVERY_BLOCK_ENTRIES
     now = time.time()
-    if now - self._last_reconcile < 10:
-        return
-    self._last_reconcile = now
-    snap = self.fetch_live_snapshot(symbol)
-    status = getattr(self, "last_fetch_status", "UNKNOWN")
-    if status == "UNKNOWN":
-        MEMORY["position_status"] = "UNKNOWN"
-        log_execution(f"[RECONCILIATION] {symbol} state UNKNOWN; preserving local position and sending no close order", "ERROR")
-        return
-    if status == "FLAT":
-        if local_state.get("open"):
-            _clear_confirmed_flat(symbol)
-        return
-    if snap is None:
-        MEMORY["position_status"] = "UNKNOWN"
-        return
-    if STATE.get("pending_close_order_id"):
-        _resolve_pending_close_from_snapshot(symbol, snap)
-    _apply_open_snapshot(symbol, snap)
-    self._last_snapshot = snap
-    self.event_bus.emit("reconciled", snap)
+    lock = getattr(self, "_reconcile_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        self._reconcile_lock = lock
+    if not lock.acquire(blocking=False):
+        return "BUSY"
+    try:
+        if not force and now - self._last_reconcile < 10:
+            return "THROTTLED"
+        self._last_reconcile = now
+        try:
+            snap = self.fetch_live_snapshot(symbol)
+        except Exception as exc:
+            status = "UNKNOWN"
+            log_execution(
+                f"[RECONCILIATION] {symbol} snapshot error; state UNKNOWN: {type(exc).__name__}: {exc}",
+                "ERROR", debounce_key=f"exchange_reconcile_error_{symbol}", debounce_sec=30
+            )
+            snap = None
+        else:
+            status = getattr(self, "last_fetch_status", "UNKNOWN")
+
+        if status == "UNKNOWN":
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "EXCHANGE_STATE_UNKNOWN"
+            if local_state.get("open"):
+                STATE["recovery_hold"] = True
+                STATE["recovery_reason"] = "EXCHANGE_POSITION_STATE_UNKNOWN"
+                RECOVERY_BLOCK_ENTRIES = True
+            log_execution(
+                f"[RECONCILIATION] {symbol} state UNKNOWN; preserving local exposure; no close/finalize action",
+                "ERROR", debounce_key=f"exchange_reconcile_unknown_{symbol}", debounce_sec=30
+            )
+            return "UNKNOWN"
+
+        if status == "FLAT":
+            if local_state.get("open"):
+                _clear_confirmed_flat(symbol)
+            MEMORY["position_status"] = "FLAT"
+            return "FLAT"
+
+        if status != "OPEN" or snap is None:
+            MEMORY["position_status"] = "UNKNOWN"
+            if local_state.get("open"):
+                STATE["recovery_hold"] = True
+                STATE["recovery_reason"] = "INVALID_EXCHANGE_SNAPSHOT"
+                RECOVERY_BLOCK_ENTRIES = True
+            return "UNKNOWN"
+
+        if STATE.get("pending_close_order_id"):
+            _resolve_pending_close_from_snapshot(symbol, snap)
+        _apply_open_snapshot(symbol, snap)
+        self._last_snapshot = snap
+        self.event_bus.emit("reconciled", snap)
+        return "OPEN"
+    finally:
+        lock.release()
 
 
 ExchangeSyncService.fetch_live_snapshot = _exchange_fetch_live_snapshot
