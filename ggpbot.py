@@ -8533,21 +8533,85 @@ def check_sniper_confirmation(df, zone_type, zone=None):
     return checks >= 2, checks
 
 
+_SNIPER_V2_SYMBOL_CURSOR = 0
+
+
 def _sniper_v2_symbols():
-    rows = MEMORY.get("radar_top5") or MEMORY.get("radar_watchlist") or []
-    symbols, seen = [], set()
-    for row in rows:
-        raw = row.get("symbol") if isinstance(row, dict) else row
-        if not raw:
-            continue
-        exchange_symbol = roro_exchange_symbol(raw)
+    """Build a rotating bounded batch from the live unified Watchlist.
+
+    Legacy Radar and scanner feeds are fallbacks only. The current unified
+    Watchlist is the primary universe, so Sniper observes the same symbols
+    already enriched by the production discovery pipeline.
+    """
+    global _SNIPER_V2_SYMBOL_CURSOR
+    now = time.time()
+    candidates = {}
+
+    def add_candidate(raw_symbol, score=0.0):
+        if not raw_symbol:
+            return
+        exchange_symbol = roro_exchange_symbol(raw_symbol)
         key = roro_canonical_symbol(exchange_symbol)
-        if key and key not in seen:
-            seen.add(key)
-            symbols.append(exchange_symbol)
-        if len(symbols) >= SNIPER_V2_MAX_SYMBOLS:
-            break
-    return symbols
+        if not key:
+            return
+        try:
+            rank = float(score or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            rank = 0.0
+        current = candidates.get(key)
+        if current is None or rank > current[0]:
+            candidates[key] = (rank, exchange_symbol)
+
+    # Primary: active unified institutional Watchlist entries.
+    watchlist = MEMORY.get("watchlist", {})
+    if isinstance(watchlist, dict):
+        terminal_states = {
+            "REJECTED", "HARD_REJECT", "INVALIDATED", "EXPIRED",
+            "NO_DATA", "STALE", "ENTRY_WINDOW_MISSED",
+        }
+        for canonical, item in watchlist.items():
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("decision_state") or item.get("state") or "").upper()
+            if state in terminal_states:
+                continue
+            updated = safe_float(
+                item.get("last_update", item.get("last_updated", item.get("updated_at", 0.0))),
+                0.0,
+            )
+            # Ignore old residual Watchlist rows; fresh discovery refreshes these.
+            if updated > 0 and now - updated > 1800:
+                continue
+            raw = item.get("exchange_symbol") or item.get("symbol") or canonical
+            add_candidate(raw, item.get("score", item.get("discovery_score", 0.0)))
+
+    # Fallbacks keep the feature useful during Watchlist warm-up without
+    # introducing a new broad-market scan or extra exchange API fan-out.
+    fallback_feeds = (
+        MEMORY.get("radar_top5") or [],
+        MEMORY.get("radar_watchlist") or [],
+        MEMORY.get("scanner_v2_buy") or [],
+        MEMORY.get("scanner_v2_sell") or [],
+        MEMORY.get("rf_watchlist") or [],
+    )
+    if not candidates:
+        for feed in fallback_feeds:
+            for row in feed:
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get("exchange_symbol") or row.get("symbol")
+                add_candidate(raw, row.get("score", row.get("discovery_score", 0.0)))
+
+    ranked = [value[1] for _, value in sorted(
+        candidates.items(), key=lambda pair: pair[1][0], reverse=True
+    )]
+    if not ranked:
+        return []
+    batch_size = min(SNIPER_V2_MAX_SYMBOLS, len(ranked))
+    start = _SNIPER_V2_SYMBOL_CURSOR % len(ranked)
+    selected = [ranked[(start + offset) % len(ranked)] for offset in range(batch_size)]
+    _SNIPER_V2_SYMBOL_CURSOR = (start + batch_size) % len(ranked)
+    return selected
 
 
 def _sniper_v2_update_zone(symbol, closed):
