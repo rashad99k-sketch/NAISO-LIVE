@@ -6,3 +6,6 @@ requests
 psutil
 pytest
 python-dotenv
+psycopg[binary]>=3.2,<4
+boto3>=1.34,<2
+cryptography>=50,<51

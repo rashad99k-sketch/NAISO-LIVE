@@ -238,6 +238,29 @@ def test_native_sl_does_not_accept_generic_market_without_raw_stop_type():
        trigger_price=5.25, required_qty=10.0)
 
 
+
+def test_live_entry_is_blocked_when_journal_is_missing():
+    exchange = FakeExchange()
+    result = TradeExecutionService(exchange, journal=None, require_journal=True).submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-no-journal")
+    assert result.state is ExecutionState.REJECTED
+    assert "journal pre-entry persistence failed" in result.reason
+    assert not [call for call in exchange.create_calls if call[1] == "market"]
+
+
+def test_live_entry_is_blocked_when_journal_write_fails():
+    class BrokenJournal:
+        def persist_entry_pending(self, **fields):
+            raise OSError("simulated disk write failure")
+
+    exchange = FakeExchange()
+    result = TradeExecutionService(exchange, journal=BrokenJournal(), require_journal=True).submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-journal-write-fail")
+    assert result.state is ExecutionState.REJECTED
+    assert "simulated disk write failure" in result.reason
+    assert not [call for call in exchange.create_calls if call[1] == "market"]
+
+
 def test_journal_entry_pending_precedes_execution_and_migrates(tmp_path: Path):
     journal = TradeJournal(str(tmp_path / "trade.sqlite3"))
     exchange = FakeExchange()
