@@ -50,3 +50,46 @@ def test_sniper_v2_pauses_when_position_open(monkeypatch):
     monkeypatch.setitem(ggpbot.STATE, "open", True)
     assert ggpbot.sniper_engine_v2() is False
     monkeypatch.setitem(ggpbot.STATE, "open", False)
+
+
+def test_sniper_v2_uses_twenty_percent_wallet_target_at_twenty_x():
+    from ggp_position_sizing import allocation_for_classification, calculate_position_size
+
+    allocation, reason = allocation_for_classification("SNIPER_V2")
+    assert allocation == pytest.approx(0.20)
+    assert reason == "STANDARD_20_PERCENT_MARGIN"
+
+    sizing = calculate_position_size(
+        classification="SNIPER_V2",
+        available_balance=100.0,
+        entry_price=100.0,
+        stop_price=99.9,
+        side="BUY",
+        leverage=20,
+        contract_size=1.0,
+        max_trade_risk_pct=10.0,
+        stop_execution_buffer_pct=0.0,
+    )
+    assert sizing.target_margin == pytest.approx(20.0)
+    assert sizing.target_notional == pytest.approx(400.0)
+    assert sizing.margin_required == pytest.approx(20.0)
+    assert sizing.final_notional == pytest.approx(400.0)
+
+
+def test_sniper_v2_risk_gate_can_still_reduce_target_position():
+    from ggp_position_sizing import calculate_position_size
+
+    sizing = calculate_position_size(
+        classification="SNIPER_V2",
+        available_balance=100.0,
+        entry_price=100.0,
+        stop_price=95.0,
+        side="BUY",
+        leverage=20,
+        contract_size=1.0,
+        max_trade_risk_pct=10.0,
+        stop_execution_buffer_pct=0.0,
+    )
+    assert sizing.target_margin == pytest.approx(20.0)
+    assert sizing.binding_constraint == "RISK_GATE"
+    assert sizing.margin_required < sizing.target_margin
