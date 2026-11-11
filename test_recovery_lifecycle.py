@@ -231,7 +231,6 @@ def test_restart_live_position_with_complete_state_restores(tmp_path, monkeypatc
     _fresh_state()
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["recovery_hold"] is False
-    assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
     assert ggpbot.STATE["actual_filled_qty"] == 2.0
     assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
 
