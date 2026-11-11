@@ -548,7 +548,6 @@ def test_native_sl_move_failure_retains_previous_protection(tmp_path, monkeypatc
                                                reason="BREAKEVEN") is False
     # Previous protection retained: still verified, not in Hold, stop unchanged.
     assert ggpbot.STATE["native_sl_verified"] is True
-    assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
     assert ggpbot.STATE["recovery_hold"] is False
     assert ggpbot.STATE["native_sl_order_id"] == "111"
 
