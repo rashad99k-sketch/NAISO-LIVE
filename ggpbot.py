@@ -8875,20 +8875,29 @@ except Exception as _resource_init_error:
     log_execution(f"[INTEGRATION] resource manager unavailable: {_resource_init_error}", "WARN")
 
 try:
-    from roro_trade_journal import TradeJournal
-    _journal_configured_path = str(os.getenv("TRADE_JOURNAL_PATH", "data/ggp_trade_journal.sqlite3")).strip()
-    if not _journal_configured_path:
-        raise RuntimeError("TRADE_JOURNAL_PATH is empty")
-    # Resolve relative paths against the source directory, never the process CWD.
-    # This prevents silent creation of a second empty SQLite DB after a run-command
-    # or working-directory change. App Platform local storage is still ephemeral.
-    _journal_absolute_path = (
-        _journal_configured_path if os.path.isabs(_journal_configured_path)
-        else os.path.join(ENV_DIR, _journal_configured_path)
-    )
-    _journal_absolute_path = os.path.abspath(_journal_absolute_path)
-    INSTITUTIONAL_TRADE_JOURNAL = TradeJournal(_journal_absolute_path)
-    log_execution(f"[JOURNAL] initialized path={_journal_absolute_path}", "SUCCESS")
+    _journal_backend = str(os.getenv("TRADE_JOURNAL_BACKEND", "sqlite")).strip().lower()
+    if _journal_backend == "postgres":
+        from roro_postgres_trade_journal import PostgresTradeJournal
+        INSTITUTIONAL_TRADE_JOURNAL = PostgresTradeJournal()
+        _journal_health = INSTITUTIONAL_TRADE_JOURNAL.health_check()
+        if not _journal_health.get("ok") or int(_journal_health.get("schema_version", 0)) < 1:
+            raise RuntimeError("PostgreSQL journal readiness check failed")
+        log_execution(f"[JOURNAL] PostgreSQL initialized schema={_journal_health.get('schema_version')}", "SUCCESS")
+    elif _journal_backend == "sqlite":
+        from roro_trade_journal import TradeJournal
+        _journal_configured_path = str(os.getenv("TRADE_JOURNAL_PATH", "data/ggp_trade_journal.sqlite3")).strip()
+        if not _journal_configured_path:
+            raise RuntimeError("TRADE_JOURNAL_PATH is empty")
+        # Resolve relative paths against source directory, not process CWD.
+        _journal_absolute_path = (
+            _journal_configured_path if os.path.isabs(_journal_configured_path)
+            else os.path.join(ENV_DIR, _journal_configured_path)
+        )
+        _journal_absolute_path = os.path.abspath(_journal_absolute_path)
+        INSTITUTIONAL_TRADE_JOURNAL = TradeJournal(_journal_absolute_path)
+        log_execution(f"[JOURNAL] SQLite initialized path={_journal_absolute_path}", "SUCCESS")
+    else:
+        raise RuntimeError(f"unsupported TRADE_JOURNAL_BACKEND={_journal_backend!r}")
 except Exception as _journal_init_error:
     INSTITUTIONAL_TRADE_JOURNAL = None
     log_execution(f"[JOURNAL] initialization FAILED: {type(_journal_init_error).__name__}: {_journal_init_error}", "ERROR")
