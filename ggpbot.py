@@ -12089,6 +12089,9 @@ def _hosted_runtime_monitor():
             with RUNTIME_STATUS_LOCK:
                 RUNTIME_STATUS.update({
                     "ready": False,
+                    "ticker_read_ok": False,
+                    "account_read_ok": False if MODE_LIVE else True,
+                    "position_read_status": "UNKNOWN" if MODE_LIVE else "NOT_REQUIRED_PAPER",
                     "last_check_ts": now,
                     "last_error": safe_error,
                 })
