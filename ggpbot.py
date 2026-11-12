@@ -5679,6 +5679,20 @@ def record_entry_data_rejection(symbol, side, diagnostic, *, stage="INSTITUTIONA
     )
 
 
+def _precision_adjusted_structural_stop(symbol, stop_price):
+    """Return the exact exchange-precision stop trigger used by sizing and entry."""
+    formatter = getattr(ex, "price_to_precision", None)
+    if not callable(formatter):
+        raise ValueError("exchange price precision formatter unavailable for structural SL")
+    try:
+        rounded = float(formatter(normalize_symbol(symbol), float(stop_price)))
+    except Exception as exc:
+        raise ValueError(f"structural SL precision conversion failed: {type(exc).__name__}: {exc}") from exc
+    if not math.isfinite(rounded) or rounded <= 0:
+        raise ValueError("exchange-precision structural SL is invalid")
+    return rounded
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     # Canonicalize once at the strategy/execution boundary so every downstream
     # risk, position, SL/TP and management branch sees the same direction token.
@@ -5761,6 +5775,18 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             if balance <= 0:
                 raise ValueError("available USDT balance is zero or unreadable")
         sym = normalize_symbol(symbol)
+        raw_structural_stop = structural_stop
+        structural_stop = _precision_adjusted_structural_stop(sym, structural_stop)
+        sl = structural_stop
+        validate_trade_geometry(
+            side=side, entry_price=reference_price, stop_price=structural_stop,
+            tp1_price=tp1, tp2_price=tp2,
+        )
+        log_execution(
+            f"[STRUCTURAL_SL_PRECISION] symbol={sym} raw_sl={raw_structural_stop:.10f} "
+            f"exchange_sl={structural_stop:.10f} entry_reference={reference_price:.10f}",
+            "INFO",
+        )
         try:
             market = ex.market(sym)
             contract_size = safe_float(market.get("contractSize"), 0.0)
