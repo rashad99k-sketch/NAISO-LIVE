@@ -6024,15 +6024,25 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         margin = (qty * contract_size * price) / LEVERAGE
         notional = qty * contract_size * price
         post_fill_stop_distance = abs(price - structural_stop) + price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
+        post_fill_stop_distance_pct = (post_fill_stop_distance / price * 100.0) if price > 0 else 0.0
         post_fill_stop_risk = qty * contract_size * post_fill_stop_distance
         post_fill_risk_pct = (post_fill_stop_risk / sizing.target_margin * 100.0) if sizing.target_margin > 0 else 0.0
-        post_fill_risk_status = "PASS" if post_fill_stop_risk <= sizing.max_risk_usdt * 1.000001 else "OVER_CAP"
+        stop_geometry_valid = (
+            structural_stop < price if side == "BUY" else structural_stop > price
+        )
+        if not stop_geometry_valid:
+            post_fill_risk_status = "INVALID_GEOMETRY"
+        elif post_fill_stop_risk > sizing.max_risk_usdt * 1.000001:
+            post_fill_risk_status = "OVER_CAP"
+        else:
+            post_fill_risk_status = "PASS"
         log_execution(
             "[POST_FILL_RISK_RECONCILIATION] "
             f"symbol={sym} target_margin={sizing.target_margin:.4f} actual_margin={margin:.4f} "
             f"fill_qty={qty:.10f} fill_price={price:.10f} structural_sl={structural_stop:.10f} "
-            f"actual_stop_distance={post_fill_stop_distance:.10f} estimated_stop_risk={post_fill_stop_risk:.4f} "
-            f"risk_budget={sizing.max_risk_usdt:.4f} risk_pct={post_fill_risk_pct:.3f}% status={post_fill_risk_status}",
+            f"actual_stop_distance={post_fill_stop_distance:.10f} actual_stop_distance_pct={post_fill_stop_distance_pct:.5f}% "
+            f"estimated_stop_risk={post_fill_stop_risk:.4f} risk_budget={sizing.max_risk_usdt:.4f} "
+            f"risk_pct={post_fill_risk_pct:.3f}% geometry_valid={stop_geometry_valid} status={post_fill_risk_status}",
             "WARN" if post_fill_risk_status != "PASS" else "INFO",
         )
         STATE.update({
