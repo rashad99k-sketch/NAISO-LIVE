@@ -323,3 +323,62 @@ def test_entry_data_rejection_populates_dashboard_why_no_entry():
     assert item["stage"] == "INSTITUTIONAL_ENTRY_GATE"
     assert "OHLCV_RATE_LIMITED" in item["reason"]
     assert ggpbot.MEMORY["entry_rejection_metrics"]["OHLCV_RATE_LIMITED"] >= 1
+
+
+
+def test_compute_sl_tp_sell_keeps_tp2_below_tp1_when_atr_floor_pushes_tp1_outward(monkeypatch):
+    frame = pd.DataFrame({"close": [100.0] * 60})
+    monkeypatch.setattr(
+        ggpbot, "build_liquidity_pools",
+        lambda _df: {"low_pools": [95.0], "high_pools": [102.0]},
+    )
+    monkeypatch.setattr(ggpbot.PrecisionSafety, "normalize_price",
+                        lambda _symbol, value: round(float(value), 2))
+    monkeypatch.setattr(ggpbot, "_market_price_tick_size", lambda _symbol, _price: 0.01)
+
+    entry = 100.0
+    # ATR=4 makes the legacy 0.5*ATR minimum push TP1 to 98.00,
+    # while the fixed 1% TP2 would have remained at 99.00 (the bug).
+    sl, tp1, tp2 = ggpbot.compute_sl_tp(
+        entry, "SELL", "REVERSAL", 4.0, frame, symbol="TEST/USDT:USDT"
+    )
+    assert tp2 < tp1 < entry < sl
+    assert tp1 == pytest.approx(98.0)
+    assert tp2 < tp1
+
+
+def test_compute_sl_tp_buy_keeps_tp2_above_tp1_when_atr_floor_pushes_tp1_outward(monkeypatch):
+    frame = pd.DataFrame({"close": [100.0] * 60})
+    monkeypatch.setattr(
+        ggpbot, "build_liquidity_pools",
+        lambda _df: {"low_pools": [98.0], "high_pools": [105.0]},
+    )
+    monkeypatch.setattr(ggpbot.PrecisionSafety, "normalize_price",
+                        lambda _symbol, value: round(float(value), 2))
+    monkeypatch.setattr(ggpbot, "_market_price_tick_size", lambda _symbol, _price: 0.01)
+
+    entry = 100.0
+    sl, tp1, tp2 = ggpbot.compute_sl_tp(
+        entry, "BUY", "REVERSAL", 4.0, frame, symbol="TEST/USDT:USDT"
+    )
+    assert sl < entry < tp1 < tp2
+    assert tp1 == pytest.approx(102.0)
+    assert tp2 > tp1
+
+
+def test_compute_sl_tp_preserves_two_stage_target_order_for_normal_atr(monkeypatch):
+    frame = pd.DataFrame({"close": [100.0] * 60})
+    monkeypatch.setattr(
+        ggpbot, "build_liquidity_pools",
+        lambda _df: {"low_pools": [95.0], "high_pools": [105.0]},
+    )
+    monkeypatch.setattr(ggpbot.PrecisionSafety, "normalize_price",
+                        lambda _symbol, value: round(float(value), 4))
+    monkeypatch.setattr(ggpbot, "_market_price_tick_size", lambda _symbol, _price: 0.0001)
+
+    sl, tp1, tp2 = ggpbot.compute_sl_tp(
+        100.0, "SELL", "REVERSAL", 0.5, frame, symbol="TEST/USDT:USDT"
+    )
+    assert tp2 < tp1 < 100.0 < sl
+    assert tp1 == pytest.approx(99.5)
+    assert tp2 == pytest.approx(99.0)

@@ -4729,7 +4729,62 @@ def council_decision(context):
     final_score = max(0, min(12, score))
     return final_score, reasons
 
-def compute_sl_tp(entry_price, side, classification, atr, df):
+def _market_price_tick_size(symbol, reference_price):
+    """Return one exchange price increment for strict TP ordering."""
+    try:
+        market = ex.market(normalize_symbol(symbol))
+        precision = (market.get("precision") or {}).get("price")
+        if precision is not None:
+            precision = float(precision)
+            if math.isfinite(precision) and precision > 0:
+                mode = getattr(ex, "precisionMode", None)
+                if mode == getattr(ccxt, "TICK_SIZE", object()):
+                    return precision
+                if mode == getattr(ccxt, "DECIMAL_PLACES", object()):
+                    return 10.0 ** (-int(precision))
+                if mode == getattr(ccxt, "SIGNIFICANT_DIGITS", object()):
+                    magnitude = math.floor(math.log10(abs(float(reference_price))))
+                    return 10.0 ** (magnitude - int(precision) + 1)
+    except Exception:
+        pass
+    # Conservative numerical fallback for PAPER/mocked markets without metadata.
+    return max(abs(float(reference_price)) * 1e-8, 1e-12)
+
+
+def _order_take_profit_levels(entry_price, side, tp1_price, tp2_price, tick_size):
+    """Keep TP1 nearest and TP2 strictly farther from entry after rounding."""
+    entry = float(entry_price)
+    tp1 = float(tp1_price)
+    tp2 = float(tp2_price)
+    tick = max(float(tick_size), max(abs(entry) * 1e-12, 1e-12))
+    direction = str(side or "").strip().upper()
+    if direction == "BUY":
+        tp1 = max(tp1, entry + tick)
+        tp2_distance = max(abs(entry - tp2), abs(tp1 - entry) + tick)
+        tp2 = entry + tp2_distance
+        if tp2 <= tp1:
+            tp2 = tp1 + tick
+    elif direction == "SELL":
+        tp1 = min(tp1, entry - tick)
+        tp2_distance = max(abs(entry - tp2), abs(entry - tp1) + tick)
+        tp2 = entry - tp2_distance
+        if tp2 >= tp1:
+            tp2 = tp1 - tick
+    else:
+        raise ValueError("side must be BUY or SELL when ordering TP levels")
+    return tp1, tp2
+
+
+def compute_sl_tp(entry_price, side, classification, atr, df, symbol=None):
+    """Build directional SL/TP levels; TP2 must remain beyond TP1 after min-distance adjustment."""
+    side = str(side or "").strip().upper()
+    entry_price = float(entry_price)
+    atr = float(atr)
+    if side not in {"BUY", "SELL"} or not math.isfinite(entry_price) or entry_price <= 0:
+        raise ValueError("invalid entry price or side for SL/TP calculation")
+    if not math.isfinite(atr) or atr <= 0:
+        raise ValueError("ATR must be finite and positive for SL/TP calculation")
+    pricing_symbol = symbol or getattr(df, "symbol", None) or DEFAULT_SYMBOL
     if classification == "REVERSAL":
         pools = build_liquidity_pools(df)
         if side == "BUY":
@@ -4750,8 +4805,30 @@ def compute_sl_tp(entry_price, side, classification, atr, df):
         sl = entry_price - atr * 1.6 if side == "BUY" else entry_price + atr * 1.6
         tp1 = entry_price * (1 + 0.008) if side == "BUY" else entry_price * (1 - 0.008)
         tp2 = entry_price * (1 + 0.02) if side == "BUY" else entry_price * (1 - 0.02)
-    sl, tp1 = PrecisionSafety.adjust_sl_tp(df.symbol if hasattr(df, 'symbol') else DEFAULT_SYMBOL, entry_price, sl, tp1, side, atr)
-    return sl, tp1, tp2
+
+    # Adjust SL and the near target using the existing volatility floor.
+    sl, tp1 = PrecisionSafety.adjust_sl_tp(
+        pricing_symbol, entry_price, sl, tp1, side, atr
+    )
+    # The legacy adjustment only moved TP1; when ATR was wide it could push
+    # TP1 beyond the fixed-percentage TP2. Move TP2 outward, never TP1 inward.
+    tick_size = _market_price_tick_size(pricing_symbol, entry_price)
+    tp2 = PrecisionSafety.normalize_price(pricing_symbol, tp2)
+    tp1, tp2 = _order_take_profit_levels(entry_price, side, tp1, tp2, tick_size)
+    # Re-normalize, then enforce strict ordering once more to account for rounding
+    # collapsing adjacent levels to the same exchange tick.
+    tp1 = PrecisionSafety.normalize_price(pricing_symbol, tp1)
+    tp2 = PrecisionSafety.normalize_price(pricing_symbol, tp2)
+    tp1, tp2 = _order_take_profit_levels(entry_price, side, tp1, tp2, tick_size)
+    if side == "BUY" and not (entry_price < tp1 < tp2):
+        raise ValueError(
+            f"TP_PRECISION_ORDER_INVALID BUY entry={entry_price} tp1={tp1} tp2={tp2} tick={tick_size}"
+        )
+    if side == "SELL" and not (tp2 < tp1 < entry_price):
+        raise ValueError(
+            f"TP_PRECISION_ORDER_INVALID SELL entry={entry_price} tp1={tp1} tp2={tp2} tick={tick_size}"
+        )
+    return float(sl), float(tp1), float(tp2)
 
 # ========== EXECUTION LAYER ==========
 STATE = {
@@ -5371,10 +5448,16 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             raise ValueError("entry price must be finite and positive")
         if not math.isfinite(structural_stop) or structural_stop <= 0:
             raise ValueError("structural stop must be finite and positive")
-        validate_trade_geometry(
-            side=side, entry_price=reference_price, stop_price=structural_stop,
-            tp1_price=tp1, tp2_price=tp2,
-        )
+        try:
+            validate_trade_geometry(
+                side=side, entry_price=reference_price, stop_price=structural_stop,
+                tp1_price=tp1, tp2_price=tp2,
+            )
+        except ValueError as geometry_exc:
+            raise ValueError(
+                f"{geometry_exc}; side={side} entry={reference_price:.12g} "
+                f"SL={structural_stop:.12g} TP1={float(tp1):.12g} TP2={float(tp2):.12g}"
+            ) from geometry_exc
         # Real available balance from BingX Futures ("free" USDT), with source and
         # fetch timestamp so freshness is provable. A stale/unreadable balance must
         # block the entry rather than silently produce a tiny position.
@@ -9902,7 +9985,9 @@ def smart_opportunity_selection():
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "structural_stop_missing"
                 continue
-            _, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
+            _, tp1, tp2 = compute_sl_tp(
+                price, side, classification, float(atr_value), closed_df, symbol=exchange_sym
+            )
             if not (tp1 and tp2 and np.isfinite(float(tp1)) and np.isfinite(float(tp2))):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "profit_targets_invalid"
