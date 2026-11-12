@@ -143,6 +143,20 @@ class BingXApiReliability:
                 f"new entry blocked by BingX API cooldown ({remaining:.2f}s remaining; reason={reason})"
             )
 
+    def observe_error(self, exc: BaseException, method_name: str = "write") -> str:
+        """Record rate-control errors from single-shot writes without retrying them."""
+        kind = self.classify(exc)
+        retry_after = self._retry_after(exc)
+        if kind == "BAN":
+            self._set_cooldown(max(self.ban_cooldown, retry_after or 0.0), f"HTTP_418_BAN:{method_name}")
+        elif kind == "RATE_LIMIT":
+            self._set_cooldown(max(self.rate_limit_cooldown, retry_after or 0.0), f"BINGX_RATE_LIMIT:{method_name}")
+        elif kind == "SYSTEM_BUSY":
+            self._set_cooldown(max(self.system_busy_cooldown, retry_after or 0.0), f"BINGX_109500:{method_name}")
+        elif kind == "RISK_CONTROL":
+            self._set_cooldown(max(self.risk_control_cooldown, retry_after or 0.0), f"BINGX_RISK_CONTROL:{method_name}")
+        return kind
+
     def _set_cooldown(self, seconds: float, reason: str) -> None:
         until = self._clock() + max(0.0, seconds)
         with self._lock:
