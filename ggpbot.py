@@ -7437,6 +7437,13 @@ def finalize_trade_with_reality(symbol, close_reason=None):
         except Exception:
             pass
 
+    # Snapshot unresolved safety gates BEFORE local close-state cleanup.
+    # A verified exchange close does not automatically resolve recovery work.
+    unresolved_execution = bool(STATE.get("execution_unresolved"))
+    close_reconciliation_required = bool(STATE.get("close_reconciliation_required"))
+    recovery_hold_active = bool(STATE.get("recovery_hold"))
+    recovery_block_entries = bool(globals().get("RECOVERY_BLOCK_ENTRIES", False))
+
     preserved = {"last_close_diagnostic": STATE.get("last_close_diagnostic"),
                  "last_close_reason": reason, "last_close_fill_price": close_price,
                  "last_close_pnl_source": pnl_source,
@@ -7446,8 +7453,9 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                   "current_symbol": None, "trade_id": None, "tp1_hit": False, "tp2_hit": False,
                   "tp1_done": False, "partial_closed": False, "trail_activated": False,
                   "trail_stop": 0.0, "be_done": False, "close_verified": False,
-                  "execution_unresolved": False, "close_reconciliation_required": False,
-                  "recovery_hold": False, "profit_mode": None, "range_target_price": 0.0,
+                  "execution_unresolved": unresolved_execution,
+                  "close_reconciliation_required": close_reconciliation_required,
+                  "recovery_hold": recovery_hold_active, "profit_mode": None, "range_target_price": 0.0,
                   "range_target_move_pct": 0.0, "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0,
                   "last_close_verified": False, "last_close_order_id": None,
                   "last_close_filled_qty": 0.0, "last_close_realized_pnl": 0.0,
@@ -7465,13 +7473,13 @@ def finalize_trade_with_reality(symbol, close_reason=None):
         release_reasons.append("STATE_OPEN")
     if TRADE_STATE.get("in_position"):
         release_reasons.append("TRADE_STATE_OPEN")
-    if STATE.get("execution_unresolved"):
+    if unresolved_execution:
         release_reasons.append("EXECUTION_UNRESOLVED")
-    if STATE.get("close_reconciliation_required"):
+    if close_reconciliation_required:
         release_reasons.append("CLOSE_RECONCILIATION_REQUIRED")
-    if STATE.get("recovery_hold"):
+    if recovery_hold_active:
         release_reasons.append("RECOVERY_HOLD")
-    if globals().get("RECOVERY_BLOCK_ENTRIES", False):
+    if recovery_block_entries:
         release_reasons.append("RECOVERY_BLOCK_ENTRIES")
     global _ACTIVE_TRADE
     with _TRADE_LOCK:
