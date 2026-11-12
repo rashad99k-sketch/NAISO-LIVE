@@ -11991,6 +11991,7 @@ RUNTIME_STATUS = {
     "ready": not HOSTED_RUNTIME_REQUIRED,
     "markets_loaded": False,
     "account_read_ok": False if MODE_LIVE else True,
+    "ticker_read_ok": False,
     "position_read_status": "NOT_CHECKED",
     "recovery_complete": False,
     "last_check_ts": None,
@@ -12027,6 +12028,12 @@ def _hosted_runtime_probe_once():
         with RUNTIME_STATUS_LOCK:
             RUNTIME_STATUS["markets_loaded"] = True
 
+    ticker = safe_api_call(ex.fetch_ticker, normalize_symbol(DEFAULT_SYMBOL))
+    if not isinstance(ticker, dict) or safe_float(ticker.get("last"), 0.0) <= 0:
+        raise RuntimeError("BingX public ticker read is missing or invalid")
+    with RUNTIME_STATUS_LOCK:
+        RUNTIME_STATUS["ticker_read_ok"] = True
+
     if MODE_LIVE:
         if not API_KEY or not API_SECRET:
             raise RuntimeError("LIVE selected but BingX API key/secret are missing")
@@ -12044,9 +12051,6 @@ def _hosted_runtime_probe_once():
             RUNTIME_STATUS["account_read_ok"] = True
             RUNTIME_STATUS["position_read_status"] = position_status
     else:
-        ticker = safe_api_call(ex.fetch_ticker, normalize_symbol(DEFAULT_SYMBOL))
-        if not isinstance(ticker, dict) or safe_float(ticker.get("last"), 0.0) <= 0:
-            raise RuntimeError("BingX public ticker read is missing or invalid")
         with RUNTIME_STATUS_LOCK:
             RUNTIME_STATUS["account_read_ok"] = True
             RUNTIME_STATUS["position_read_status"] = "NOT_REQUIRED_PAPER"
