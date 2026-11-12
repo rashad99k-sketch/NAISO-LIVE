@@ -61,6 +61,7 @@ class BingXApiReliability:
         self._lock = threading.RLock()
         self._cooldown_until = 0.0
         self._cooldown_reason = ""
+        self._recovery_probe_required = False
         self._stats = {
             "read_calls": 0, "read_retries": 0, "rate_limited": 0,
             "banned": 0, "transient_failures": 0, "fatal_failures": 0,
@@ -136,11 +137,13 @@ class BingXApiReliability:
     def assert_new_entry_allowed(self) -> None:
         """Block only new entries during an API circuit cooldown; exits/protection bypass this gate."""
         remaining = self._cooldown_remaining()
-        if remaining > 0:
-            with self._lock:
-                reason = self._cooldown_reason
+        with self._lock:
+            reason = self._cooldown_reason
+            recovery_probe_required = self._recovery_probe_required
+        if remaining > 0 or recovery_probe_required:
             raise ApiCooldownError(
-                f"new entry blocked by BingX API cooldown ({remaining:.2f}s remaining; reason={reason})"
+                f"new entry blocked by BingX API circuit (cooldown={remaining:.2f}s; "
+                f"recovery_probe_required={recovery_probe_required}; reason={reason})"
             )
 
     def observe_error(self, exc: BaseException, method_name: str = "write") -> str:
@@ -221,7 +224,9 @@ class BingXApiReliability:
                 with self._lock:
                     self._stats["read_calls"] += 1
                 try:
-                    return func(*args, **kwargs)
+                    result = func(*args, **kwargs)
+                    self._mark_recovery_probe_success()
+                    return result
                 except Exception as exc:
                     kind = self.classify(exc)
                     if kind == "BAN":
