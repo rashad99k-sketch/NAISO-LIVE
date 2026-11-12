@@ -231,7 +231,7 @@ class BingXApiReliability:
                         cooldown = max(self.system_busy_cooldown, retry_after or 0.0)
                         self._set_cooldown(cooldown, "BINGX_109500_SYSTEM_BUSY")
                         self._logger(
-                            f"[BINGX_API] 109500 system busy; reads paused for {min(cooldown, 3600.0):.0f}s"
+                            f"[BINGX_API] 109500 system busy; reads paused for {cooldown:.0f}s"
                         )
                         raise
                     if kind == "RISK_CONTROL":
