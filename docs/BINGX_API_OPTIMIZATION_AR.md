@@ -62,3 +62,8 @@ The post-fill reconciliation is diagnostic only: it reports whether the actual f
 - Use one process/replica and persistent storage for the trade journal.
 - Validate in PAPER, then BingX Demo/VST. GitHub Actions mocks do not prove network quality, API permissions, exchange-native SL behavior, or 24/7 provider stability.
 - Before LIVE, record REST request counts by method, WS feed age/reconnects, 429/418/109500 counts, entry preflight latency, and Native SL verification latency during a sustained soak test.
+
+
+## Deployment boundary
+
+The API scheduler, caches, single-flight locks and WebSocket subscriptions are process-local. Run one NAISO worker/replica per BingX egress IP. If the service is horizontally scaled, a shared distributed rate limiter and shared state are required; this PR does not claim cross-process coordination.
