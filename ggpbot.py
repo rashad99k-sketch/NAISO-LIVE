@@ -815,6 +815,12 @@ BINGX_MARKET_DATA = BingXBookTickerFeed(
         if callable(globals().get("log_execution")) else None
     ),
 )
+# Scanner liquidity reads use the WS depth snapshots. REST depth fallback is
+# opt-in because BingX documents a 1 request/second/IP limit for the REST depth endpoint.
+BINGX_REST_DEPTH_FALLBACK_ENABLED = (
+    str(os.getenv("BINGX_REST_DEPTH_FALLBACK_ENABLED", "false")).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 def normalize_symbol(symbol):
     if not symbol.endswith(":USDT"):
@@ -1039,7 +1045,7 @@ def get_spread_bps(symbol):
             "WARN", debounce_key=f"bookticker_{symbol}", debounce_sec=30,
         )
     try:
-        ob = get_orderbook_cached(symbol, 5)
+        ob = get_orderbook_cached(symbol, 5, rest_fallback=True)
         if ob and ob.get("asks") and ob.get("bids"):
             ask = safe_float(ob["asks"][0][0], 0.0)
             bid = safe_float(ob["bids"][0][0], 0.0)
@@ -1163,7 +1169,7 @@ def get_available_balance_snapshot(max_age_sec=15.0):
 _ORDERBOOK_FETCH_LOCKS = {}
 _ORDERBOOK_FETCH_LOCKS_LOCK = threading.RLock()
 
-def get_orderbook_cached(symbol, limit=20):
+def get_orderbook_cached(symbol, limit=20, *, rest_fallback=None):
     key = f"ob_{symbol}_{limit}"
     if STATE.get("open") or TRADE_STATE["in_position"]:
         cached = cache_get(key, 60)
@@ -1177,8 +1183,30 @@ def get_orderbook_cached(symbol, limit=20):
         cached = cache_get(key, 1)
         if cached is not None:
             return cached
+        # Full limited-depth snapshots arrive over WS; no local incremental-book
+        # merge is performed, so a reconnect cannot leave a falsely synchronized book.
+        feed = globals().get("BINGX_MARKET_DATA")
+        depth = feed.get_depth(symbol, int(limit)) if feed is not None else None
+        if depth:
+            ob = {
+                "bids": depth.get("bids", []),
+                "asks": depth.get("asks", []),
+                "timestamp": depth.get("server_ts_ms"),
+                "received_mono": depth.get("received_mono"),
+                "source": "BINGX_WS_DEPTH",
+            }
+            cache_set(key, ob)
+            return ob
+        allow_rest = (
+            BINGX_REST_DEPTH_FALLBACK_ENABLED
+            if rest_fallback is None else bool(rest_fallback)
+        )
+        if not allow_rest:
+            return None
         ob = fetch_orderbook(symbol, limit)
         if ob:
+            ob = dict(ob)
+            ob.setdefault("source", "BINGX_REST_DEPTH")
             cache_set(key, ob)
         return ob
 
