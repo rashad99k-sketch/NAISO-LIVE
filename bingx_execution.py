@@ -84,6 +84,7 @@ class ExecutionResult:
     raw_position: Any = None
     order_terminal: bool = False
     submission_attempted: bool = False
+    position_status: str = "UNKNOWN"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -195,9 +196,14 @@ def _weighted_trade_average(trades: Iterable[Dict[str, Any]]) -> Optional[float]
 class BingXPositionModeAdapter:
     """Read-only account-mode adapter; it never calls set_position_mode."""
 
-    def __init__(self, exchange: Any, logger: Optional[Callable[[str], None]] = None):
+    def __init__(self, exchange: Any, logger: Optional[Callable[[str], None]] = None,
+                 api_call: Optional[Callable[..., Any]] = None):
         self.exchange = exchange
         self.logger = logger or (lambda _message: None)
+        self.api_call = api_call
+
+    def _read(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        return self.api_call(method, *args, **kwargs) if self.api_call else method(*args, **kwargs)
 
     def read(self, symbol: Optional[str] = None) -> ModeResult:
         method = getattr(self.exchange, "fetch_position_mode", None)
@@ -205,9 +211,9 @@ class BingXPositionModeAdapter:
             return ModeResult(PositionMode.UNKNOWN, "fetch_position_mode unavailable")
         try:
             try:
-                raw = method(symbol) if symbol is not None else method()
+                raw = self._read(method, symbol) if symbol is not None else self._read(method)
             except TypeError:
-                raw = method()
+                raw = self._read(method)
         except Exception as exc:
             return ModeResult(PositionMode.UNKNOWN, f"position mode query failed: {type(exc).__name__}: {exc}")
         values = []
@@ -260,103 +266,171 @@ def leverage_params(mode: PositionMode, position_side: str) -> Dict[str, str]:
 class TradeExecutionService:
     """Single order gateway with no blind MARKET retries and fail-closed verification."""
 
-    def __init__(self, exchange: Any, journal: Any = None, logger: Optional[Callable[[str], None]] = None):
+    def __init__(self, exchange: Any, journal: Any = None, logger: Optional[Callable[[str], None]] = None,
+                 api_call: Optional[Callable[..., Any]] = None):
         self.exchange = exchange
         self.journal = journal
         self.logger = logger or (lambda _message: None)
-        self.mode_adapter = BingXPositionModeAdapter(exchange, logger=self.logger)
+        self.api_call = api_call
+        self.mode_adapter = BingXPositionModeAdapter(exchange, logger=self.logger, api_call=api_call)
+
+    def _read(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        return self.api_call(method, *args, **kwargs) if self.api_call else method(*args, **kwargs)
 
     def _persist_pending(self, **fields: Any) -> None:
         if self.journal is not None and hasattr(self.journal, "persist_entry_pending"):
             self.journal.persist_entry_pending(**fields)
 
     def _find_order(self, symbol: str, order_id: Optional[str], client_order_id: str) -> Any:
+        """Read back an existing order by exchange id, then client id; never creates an order."""
         fetch = getattr(self.exchange, "fetch_order", None)
-        if not callable(fetch):
-            return None
-        try:
-            return fetch(order_id or client_order_id, symbol, {"clientOrderId": client_order_id})
-        except TypeError:
-            try:
-                return fetch(order_id or client_order_id, symbol)
-            except Exception:
-                return None
-        except Exception:
-            return None
+        lookup_ids = [value for value in (order_id, client_order_id) if value]
+        if callable(fetch):
+            for candidate in lookup_ids:
+                try:
+                    try:
+                        found = self._read(fetch, candidate, symbol, {"clientOrderId": client_order_id})
+                    except TypeError:
+                        found = self._read(fetch, candidate, symbol)
+                    if isinstance(found, dict) and (_order_id(found) or found.get("clientOrderId")):
+                        return found
+                except Exception:
+                    continue
 
-    def _position(self, symbol: str, position_side: str, expected_side: str) -> Any:
+        # Some adapters cannot look up by clientOrderId through fetch_order.
+        # An open-order query is a read-only fallback; it is never an excuse to
+        # re-submit the original MARKET order.
+        fetch_open = getattr(self.exchange, "fetch_open_orders", None)
+        if callable(fetch_open) and client_order_id:
+            try:
+                rows = self._read(fetch_open, symbol)
+            except TypeError:
+                try:
+                    rows = self._read(fetch_open, symbol, None, None, {"clientOrderId": client_order_id})
+                except Exception:
+                    rows = None
+            except Exception:
+                rows = None
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                info = _nested_info(row)
+                client = row.get("clientOrderId") or info.get("clientOrderId") or info.get("clientOrderID")
+                if str(client or "") == str(client_order_id):
+                    return row
+        return None
+
+    @staticmethod
+    def _symbol_key(value: Any) -> str:
+        return str(value or "").upper().replace(":USDT", "").replace("/", "").replace("-", "").replace("_", "")
+
+    def _position(self, symbol: str, position_side: str, expected_side: str):
+        """Return (OPEN|FLAT|UNKNOWN|OTHER_SIDE, row, reason).
+
+        An unavailable or malformed positions response is UNKNOWN, never FLAT.
+        """
         fetch = getattr(self.exchange, "fetch_positions", None)
         if not callable(fetch):
-            return None
+            return "UNKNOWN", None, "fetch_positions unavailable"
         try:
-            rows = fetch([symbol])
-        except TypeError:
             try:
-                rows = fetch([symbol], {})
-            except Exception:
-                return None
-        except Exception:
-            return None
+                rows = self._read(fetch, [symbol])
+            except TypeError:
+                rows = self._read(fetch, [symbol], {})
+        except Exception as exc:
+            return "UNKNOWN", None, f"fetch_positions failed: {type(exc).__name__}: {exc}"
+        if not isinstance(rows, (list, tuple)):
+            return "UNKNOWN", None, "fetch_positions returned a non-list response"
+
+        requested_key = self._symbol_key(symbol)
+        target_rows = []
+        ambiguous_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            info = _nested_info(row)
+            raw_symbol = row.get("symbol") or info.get("symbol")
+            if not raw_symbol:
+                # A non-zero row without identity cannot safely be ignored.
+                raw_qty = _position_quantity(row)
+                if raw_qty > 0:
+                    ambiguous_rows.append(row)
+                continue
+            if self._symbol_key(raw_symbol) != requested_key:
+                continue
+            qty = _position_quantity(row)
+            if qty > 0:
+                target_rows.append(row)
+
+        if ambiguous_rows:
+            return "UNKNOWN", None, "an open position row had no verifiable symbol"
+        if not target_rows:
+            return "FLAT", None, "no open position for requested symbol"
 
         expected = str(expected_side or "").upper()
         if expected not in {"BUY", "SELL"}:
-            return None
+            return "UNKNOWN", None, f"invalid expected side: {expected!r}"
         expected_direction = "LONG" if expected == "BUY" else "SHORT"
+        matching = []
+        opposite = []
 
-        def signed_amount(*values: Any) -> Optional[float]:
-            for value in values:
+        def signed_amount(row: Dict[str, Any]) -> Optional[float]:
+            info = _nested_info(row)
+            for value in (row.get("positionAmt"), info.get("positionAmt"), info.get("positionSize")):
                 try:
                     number = float(value)
-                    if math.isfinite(number) and number != 0:
+                    if math.isfinite(number) and abs(number) > 0:
                         return number
                 except (TypeError, ValueError, OverflowError):
                     continue
             return None
 
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
+        for row in target_rows:
             info = _nested_info(row)
-            raw_position_side = str(
-                row.get("positionSide") or row.get("posSide") or
-                info.get("positionSide") or info.get("posSide") or ""
-            ).upper()
+            raw_position_side = str(row.get("positionSide") or row.get("posSide")
+                                    or info.get("positionSide") or info.get("posSide") or "").upper()
             raw_side = str(row.get("side") or info.get("side") or "").upper()
+            signed = signed_amount(row)
             direction = raw_position_side if raw_position_side in {"LONG", "SHORT"} else (
-                raw_side if raw_side in {"LONG", "SHORT"} else ""
+                raw_side if raw_side in {"LONG", "SHORT"} else
+                ("LONG" if signed > 0 else "SHORT" if signed < 0 else
+                 "LONG" if raw_side == "BUY" else "SHORT" if raw_side == "SELL" else "")
             )
             if not direction:
-                signed_value = signed_amount(row.get("positionAmt"), info.get("positionAmt"))
-                if signed_value is not None:
-                    direction = "LONG" if signed_value > 0 else "SHORT"
+                return "UNKNOWN", None, "open position direction cannot be verified"
+            if position_side in {"LONG", "SHORT"} and raw_position_side in {"LONG", "SHORT"}:
+                if raw_position_side != position_side:
+                    opposite.append(row)
+                    continue
+            if direction == expected_direction:
+                matching.append(row)
+            else:
+                opposite.append(row)
 
-            contracts = _first_number(row.get("contracts"), row.get("contractSize"))
-            if contracts is None:
-                signed_value = signed_amount(row.get("positionAmt"), info.get("positionAmt"))
-                contracts = abs(signed_value) if signed_value is not None else 0.0
-            if contracts <= 0:
-                continue
-            if position_side not in {"BOTH", "LONG", "SHORT"}:
-                continue
-            if position_side in {"LONG", "SHORT"} and raw_position_side and raw_position_side != position_side:
-                continue
-            # Never treat "some position on this symbol" as proof that the
-            # requested direction filled. One-Way mode must also prove LONG/SHORT.
-            if direction != expected_direction:
-                continue
-            if raw_side in {"LONG", "SHORT"} and raw_side != expected_direction:
-                continue
-            return row
-        return None
+        if len(matching) == 1 and not opposite:
+            return "OPEN", matching[0], "matching exchange position confirmed"
+        if matching or opposite:
+            if not matching and len(opposite) == 1:
+                return "OTHER_SIDE", opposite[0], f"exchange position side is not {expected_direction}"
+            return "UNKNOWN", None, "multiple or conflicting position-side rows returned"
+        return "UNKNOWN", None, "position rows could not be reconciled"
 
     def submit_market_entry(self, *, symbol: str, side: str, quantity: float, leverage: int = 20,
                             structural_stop: Optional[float] = None, trade_id: Optional[str] = None,
                             client_order_id: Optional[str] = None,
                             management_state: Optional[Dict[str, Any]] = None) -> ExecutionResult:
-        side = str(side).upper()
+        side = str(side or "").upper()
         trade_id = str(trade_id or uuid.uuid4().hex)
         client_order_id = str(client_order_id or f"GGP-{trade_id[:20]}")[:32]
-        requested = float(quantity)
+        try:
+            requested = float(quantity)
+        except (TypeError, ValueError, OverflowError):
+            requested = 0.0
+        if side not in {"BUY", "SELL"} or not math.isfinite(requested) or requested <= 0:
+            return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
+                                   requested_qty=max(0.0, requested) if math.isfinite(requested) else 0.0,
+                                   reason="entry not submitted: invalid side or quantity")
+
         mode_result = self.mode_adapter.read(symbol)
         if mode_result.mode is PositionMode.UNKNOWN:
             # No market-order request has been sent at this point, so this is a
@@ -364,35 +438,51 @@ class TradeExecutionService:
             return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
                                    requested_qty=requested, position_mode=PositionMode.UNKNOWN.value,
                                    reason=f"entry not submitted: {mode_result.reason}")
+
         position_side = "LONG" if side == "BUY" else "SHORT"
         params = build_position_order_params(mode_result.mode, side, opening=True, closing=False)
+
+        # Leverage is configured manually in BingX. This service is deliberately
+        # read-only: it must never modify an account-level leverage setting.
+        fetch_lev = getattr(self.exchange, "fetch_leverage", None)
+        if not callable(fetch_lev):
+            return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
+                                   requested_qty=requested, position_mode=mode_result.mode.value,
+                                   position_side=params["positionSide"],
+                                   reason="entry not submitted: fetch_leverage unavailable; configured leverage cannot be verified")
         try:
-            if not callable(getattr(self.exchange, "set_leverage", None)):
-                raise RuntimeError("set_leverage unavailable")
-            self.exchange.set_leverage(int(leverage), symbol, leverage_params(mode_result.mode, position_side))
-            fetch_lev = getattr(self.exchange, "fetch_leverage", None)
-            if not callable(fetch_lev):
-                raise RuntimeError("fetch_leverage unavailable; leverage cannot be verified")
+            lev_params = leverage_params(mode_result.mode, position_side)
             try:
-                lev_raw = fetch_lev(symbol, leverage_params(mode_result.mode, position_side))
+                lev_raw = self._read(fetch_lev, symbol, lev_params)
             except TypeError:
-                lev_raw = fetch_lev(symbol)
+                lev_raw = self._read(fetch_lev, symbol)
             observed = extract_leverage_value(
                 lev_raw,
                 position_side=(position_side if mode_result.mode is PositionMode.HEDGE else None),
             )
             if observed is None or abs(observed - float(leverage)) > 1e-9:
-                raise RuntimeError(f"leverage read-back mismatch: {observed!r}")
+                raise RuntimeError(f"configured leverage mismatch: expected={leverage} observed={observed!r}")
         except Exception as exc:
             return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
                                    requested_qty=requested, position_mode=mode_result.mode.value,
-                                   position_side=params["positionSide"], reason=f"leverage validation failed: {exc}")
+                                   position_side=params["positionSide"],
+                                   reason=f"entry not submitted: leverage read-only verification failed: {type(exc).__name__}: {exc}")
+
         params["clientOrderId"] = client_order_id
-        self._persist_pending(trade_id=trade_id, client_order_id=client_order_id, symbol=symbol,
-                              side=side, position_mode=mode_result.mode.value,
-                              position_side=params["positionSide"], leverage=leverage,
-                              requested_qty=requested, entry_ts=time.time(), status="ENTRY_PENDING",
-                              structural_stop=structural_stop, management_state=management_state)
+        try:
+            self._persist_pending(trade_id=trade_id, client_order_id=client_order_id, symbol=symbol,
+                                  side=side, position_mode=mode_result.mode.value,
+                                  position_side=params["positionSide"], leverage=leverage,
+                                  requested_qty=requested, entry_ts=time.time(), status="ENTRY_PENDING",
+                                  structural_stop=structural_stop, management_state=management_state)
+        except Exception as exc:
+            return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
+                                   requested_qty=requested, position_mode=mode_result.mode.value,
+                                   position_side=params["positionSide"],
+                                   reason=f"entry not submitted: ENTRY_PENDING journal write failed: {type(exc).__name__}: {exc}")
+
+        # A MARKET submission is non-idempotent. Exactly one create_order call is
+        # allowed for this attempt; any timeout is reconciled by clientOrderId.
         try:
             order = self.exchange.create_order(symbol, "market", side.lower(), requested, None, params)
         except Exception as exc:
@@ -400,21 +490,23 @@ class TradeExecutionService:
             if reconciled is None:
                 return ExecutionResult(ExecutionState.EXECUTION_UNCERTAIN, trade_id, client_order_id,
                                        requested_qty=requested, position_mode=mode_result.mode.value,
-                                       position_side=params["positionSide"], reason=f"submission outcome uncertain: {exc}",
+                                       position_side=params["positionSide"],
+                                       reason=f"submission outcome uncertain; order read-back unavailable: {type(exc).__name__}: {exc}",
                                        submission_attempted=True)
             order = reconciled
+
         order_id = _order_id(order)
         observed_order = self._find_order(symbol, order_id, client_order_id) or order
         filled = _extract_filled(observed_order)
         remaining = _extract_remaining(observed_order, requested, filled)
         average = _extract_average(observed_order)
+        if average is not None and average <= 0:
+            average = None
         order_status = _status(observed_order)
         order_terminal = order_status in _TERMINAL_ENTRY_ORDER_STATES
 
-        # A MARKET order that remains non-terminal is not safe to abandon, even
-        # when it has not filled yet. Cancel only its existing remainder; never
-        # issue a second MARKET order. A cancellation acknowledgement is not
-        # evidence: the terminal order must be read back from BingX.
+        # If BingX still reports a live remainder, cancel that same remainder only.
+        # The cancel acknowledgement is not authority; read the original order back.
         if not order_terminal:
             cancel = getattr(self.exchange, "cancel_order", None)
             cancel_id = order_id or client_order_id
@@ -422,8 +514,6 @@ class TradeExecutionService:
                 try:
                     cancel(cancel_id, symbol)
                 except Exception:
-                    # A timeout can happen after the cancel was accepted. The
-                    # fresh order read below is the only authority.
                     pass
                 refreshed = self._find_order(symbol, order_id, client_order_id)
                 if refreshed is not None:
@@ -433,41 +523,49 @@ class TradeExecutionService:
                     filled = _extract_filled(observed_order)
                     remaining = _extract_remaining(observed_order, requested, filled)
                     average = _extract_average(observed_order)
+                    if average is not None and average <= 0:
+                        average = None
 
-        position = self._position(symbol, params["positionSide"], side)
-        position_query_available = callable(getattr(self.exchange, "fetch_positions", None))
-
+        position_status, position, position_reason = self._position(
+            symbol, params["positionSide"], side)
         if average is None and filled > 0:
             trades = []
             fetch_trades = getattr(self.exchange, "fetch_my_trades", None)
             if callable(fetch_trades):
                 try:
-                    trades = fetch_trades(symbol, None, 100, {"orderId": order_id})
+                    trades = self._read(fetch_trades, symbol, None, 100, {"orderId": order_id})
                 except Exception:
                     pass
             average = _weighted_trade_average(trades)
-        if average is None and position is not None:
+        if average is None and filled > 0 and position is not None:
             average = _position_entry_price(position)
+            if average is not None and average <= 0:
+                average = None
 
+        reason = ""
         if not order_terminal:
             state = ExecutionState.EXECUTION_UNCERTAIN
             reason = f"entry order is not terminal after cancel/read-back; status={order_status}"
-        elif order_status in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} and filled <= 0:
-            state = ExecutionState.REJECTED
-            reason = f"order_status={order_status}"
-        elif position_query_available and position is None:
+        elif filled <= 0:
+            if position_status == "FLAT":
+                state = ExecutionState.REJECTED
+                reason = f"terminal zero-fill order confirmed FLAT; status={order_status}"
+            else:
+                state = ExecutionState.EXECUTION_UNCERTAIN
+                reason = f"terminal zero-fill order conflicts with position state={position_status}: {position_reason}"
+        elif position_status == "OTHER_SIDE":
             state = ExecutionState.EXECUTION_UNCERTAIN
-            reason = f"terminal entry order has no matching {side} exchange position; status={order_status}"
-        elif filled <= 0 and position is None:
+            reason = f"exchange position side mismatch for requested {side}: {position_reason}"
+        elif position_status != "OPEN" or position is None:
             state = ExecutionState.EXECUTION_UNCERTAIN
-            reason = f"no fill or matching position evidence; status={order_status}"
-        elif position is None or _position_quantity(position) <= 0:
-            state = ExecutionState.EXECUTION_UNCERTAIN
-            reason = "exchange position quantity is unavailable"
+            reason = f"exchange position read-back {position_status}: {position_reason}"
         else:
             position_qty = _position_quantity(position)
             quantity_tolerance = max(requested * 0.002, 1e-10)
-            if abs(position_qty - filled) > quantity_tolerance:
+            if position_qty <= 0:
+                state = ExecutionState.EXECUTION_UNCERTAIN
+                reason = "exchange position quantity is unavailable"
+            elif abs(position_qty - filled) > quantity_tolerance:
                 state = ExecutionState.EXECUTION_UNCERTAIN
                 reason = (
                     f"order/position quantity mismatch: order_filled={filled:.12g} "
@@ -476,24 +574,22 @@ class TradeExecutionService:
             elif average is None:
                 state = ExecutionState.ENTRY_PRICE_UNKNOWN
                 reason = f"order_status={order_status}; exchange entry price unavailable"
-            elif order_status in {"CANCELED", "CANCELLED", "EXPIRED"} and filled > 0:
+            elif filled + quantity_tolerance < requested or order_status in {"CANCELED", "CANCELLED", "EXPIRED"}:
                 state = ExecutionState.PARTIAL_FILL
-                reason = f"order_status={order_status}; remaining order quantity canceled"
-            elif filled + quantity_tolerance < requested:
-                state = ExecutionState.PARTIAL_FILL
-                reason = f"order_status={order_status}; confirmed partial position"
-            elif remaining > 0 and order_status not in {"CLOSED", "FILLED"}:
+                reason = f"order_status={order_status}; terminal partial fill and exchange position confirmed"
+            elif remaining > quantity_tolerance and order_status not in {"CLOSED", "FILLED"}:
                 state = ExecutionState.EXECUTION_UNCERTAIN
                 reason = f"terminal order has an unresolved remainder; status={order_status}"
             else:
                 state = ExecutionState.FILLED
-                reason = f"order_status={order_status}"
+                reason = f"order_status={order_status}; exchange position confirmed"
 
         result = ExecutionResult(
             state, trade_id, client_order_id, order_id, requested, filled, remaining,
             average, average, mode_result.mode.value, params["positionSide"],
             reason=reason, raw_order=observed_order, raw_position=position,
             order_terminal=order_terminal, submission_attempted=True,
+            position_status=position_status,
         )
         if self.journal is not None and hasattr(self.journal, "record_execution"):
             try:
@@ -507,9 +603,8 @@ class TradeExecutionService:
                     } else ""),
                 )
             except Exception as exc:
-                # The exchange result may already represent live exposure. A
-                # failed durable checkpoint must never turn that into a retryable
-                # rejection or let the caller unlock the entry path.
+                # The exchange may already represent exposure. A failed durable
+                # checkpoint must never unlock or make this attempt retryable.
                 return ExecutionResult(
                     ExecutionState.EXECUTION_UNCERTAIN, trade_id, client_order_id,
                     order_id, requested, filled, remaining, average, average,
@@ -517,6 +612,7 @@ class TradeExecutionService:
                     reason=f"execution journal persistence failed after exchange response: {type(exc).__name__}: {exc}",
                     raw_order=observed_order, raw_position=position,
                     order_terminal=order_terminal, submission_attempted=True,
+                    position_status=position_status,
                 )
         return result
 
@@ -528,20 +624,20 @@ class TradeExecutionService:
                                              opening=False, closing=True,
                                              reduce_only_required=(mode is PositionMode.ONE_WAY))
         params.update({"stopPrice": float(trigger_price), "workingType": "MARK_PRICE"})
-        order = self.exchange.create_order(symbol, "STOP_MARKET", close_side, float(quantity), None, params)
-        order_id = _order_id(order)
-        if not order_id:
-            return None
-        # BingX exposes conditional STOP_MARKET orders through the Swap openOrders
-        # endpoint. Try CCXT's unified route first, then its generated implicit route
-        # with an explicit STOP_MARKET filter. Never infer protection from create_order
-        # acknowledgement alone.
+        submitted_id = None
+        try:
+            # Non-idempotent protection write: send once. On timeout, read back
+            # the exact expected stop before deciding that protection is absent.
+            order = self.exchange.create_order(symbol, "STOP_MARKET", close_side, float(quantity), None, params)
+            submitted_id = _order_id(order)
+        except Exception as exc:
+            self.logger(f"native stop submission response ambiguous for {symbol}: {type(exc).__name__}: {exc}; read-back only")
         verified = self._read_back_native_stop(
             symbol=symbol, close_side=close_side, position_side=params["positionSide"],
             trigger_price=float(trigger_price), quantity=float(quantity))
         if verified:
-            return order_id
-        self.logger(f"native stop verification exhausted read-back attempts for order_id={order_id}")
+            return verified
+        self.logger(f"native stop could not be verified for {symbol}; submitted_order_id={submitted_id!r}")
         return None
 
     def _read_back_native_stop(self, *, symbol: str, close_side: str, position_side: str,
@@ -561,7 +657,7 @@ class TradeExecutionService:
             if callable(fetch_open):
                 for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                     try:
-                        candidate = fetch_open(*args)
+                        candidate = self._read(fetch_open, *args)
                         if isinstance(candidate, list):
                             rows.extend(candidate)
                     except TypeError:
@@ -616,7 +712,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self._read(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                 except Exception:
