@@ -76,7 +76,7 @@ def test_http_429_retries_once_only_when_retry_after_is_small():
 
     exchange = Exchange()
     waits = []
-    policy = BingXApiReliability(sleep=waits.append)
+    policy = BingXApiReliability(endpoint_min_intervals={}, sleep=waits.append)
     assert policy.call_read(exchange.fetch_ticker) == {"last": 100.0}
     assert exchange.calls == 2
     assert waits == [0.2]
