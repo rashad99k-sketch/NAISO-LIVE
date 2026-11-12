@@ -9570,8 +9570,10 @@ def get_realized_pnl(symbol, limit=100, *, force=False):
         return 0.0, 0.0
 
     cache_key = (_position_fetch_cache_key(symbol), int(limit))
-    now_mono = time.monotonic()
     with _REALIZED_PNL_CACHE_LOCK:
+        # Start the age calculation only after acquiring the lock; the lock is
+        # held across the exchange read to coalesce concurrent accounting calls.
+        now_mono = time.monotonic()
         cached = _REALIZED_PNL_CACHE.get(cache_key)
         if not force and cached:
             retry_after = safe_float(cached.get("retry_after"), 0.0)
@@ -10387,9 +10389,11 @@ def fetch_position_tri_state(symbol=None, *, force=True):
         return status, None
 
     cache_key = _position_fetch_cache_key(symbol)
-    now_mono = time.monotonic()
 
     with _POSITION_FETCH_CACHE_LOCK:
+        # Measure age after acquiring the lock; a slow prior fetch must not make
+        # its newly stored snapshot appear artificially fresh to this waiter.
+        now_mono = time.monotonic()
         cached = _POSITION_FETCH_CACHE.get(cache_key)
         if not force and cached:
             ttl = (POSITION_FETCH_UNKNOWN_CACHE_TTL_SEC
@@ -10600,6 +10604,9 @@ def _fetch_external_close_diagnostic(symbol, side, entry_time=None, stop_order_i
 def _clear_confirmed_flat_unlocked(symbol, reason="EXCHANGE_FLAT_CONFIRMED"):
     """Clear exposure only after BingX FLAT; classify close cause from exchange evidence."""
     global RECOVERY_BLOCK_ENTRIES, _ACTIVE_TRADE
+    # Native SL/manual exchange closes do not pass through the bot's close-order
+    # wrapper. A confirmed FLAT must also refresh the dashboard PnL history.
+    _invalidate_realized_pnl_cache(symbol)
     if not STATE.get("open"):
         MEMORY["position_status"] = "FLAT"
         MEMORY["current_position"] = None
