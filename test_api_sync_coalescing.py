@@ -14,7 +14,7 @@ import ggpbot
 @pytest.fixture(autouse=True)
 def _reset_api_caches(monkeypatch):
     monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
-    monkeypatch.setattr(ggpbot, "safe_api_call", lambda func, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setattr(ggpbot, "rate_limit", lambda: None)
     with ggpbot._POSITION_FETCH_CACHE_LOCK:
         ggpbot._POSITION_FETCH_CACHE.clear()
     with ggpbot._REALIZED_PNL_CACHE_LOCK:
