@@ -1189,6 +1189,8 @@ def get_orderbook_cached(symbol, limit=20, *, rest_fallback=None):
                 "asks": depth.get("asks", []),
                 "timestamp": depth.get("server_ts_ms"),
                 "received_mono": depth.get("received_mono"),
+                "local_receive_age_sec": depth.get("age_sec"),
+                "source_age_verified": False,
                 "source": "BINGX_WS_DEPTH",
             }
         cached = cache_get(key, 1)
