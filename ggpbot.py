@@ -1162,8 +1162,11 @@ def resolve_position_sizing_balance(snapshot):
     return max(0.0, safe_float(snapshot.get(field), 0.0)), basis
 
 
+_WALLET_BALANCE_FETCH_LOCK = threading.Lock()
+
+
 def get_wallet_balance_snapshot(max_age_sec=15.0):
-    """Return total/free Futures USDT from one timestamped balance snapshot."""
+    """Return total/free Futures USDT from one timestamped, single-flight snapshot."""
     now = time.time()
     if PAPER_MODE:
         value = safe_float(paper.get("balance"), 0.0)
@@ -1178,18 +1181,27 @@ def get_wallet_balance_snapshot(max_age_sec=15.0):
         if total >= 0 and free >= 0 and stamp > 0:
             return {"total": total, "free": free, "timestamp": stamp,
                     "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE")}
-    # One balance request populates both total and free; no second REST read.
-    get_free_balance()
-    cached = cache_get("wallet_balance_snapshot", max_age_sec)
-    if not isinstance(cached, dict):
-        return {"total": 0.0, "free": 0.0, "timestamp": time.time(),
-                "source": "UNAVAILABLE"}
-    return {
-        "total": safe_float(cached.get("total"), 0.0),
-        "free": safe_float(cached.get("free"), 0.0),
-        "timestamp": safe_float(cached.get("timestamp"), time.time()),
-        "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE"),
-    }
+    with _WALLET_BALANCE_FETCH_LOCK:
+        cached = cache_get("wallet_balance_snapshot", max_age_sec)
+        if isinstance(cached, dict):
+            return {
+                "total": safe_float(cached.get("total"), 0.0),
+                "free": safe_float(cached.get("free"), 0.0),
+                "timestamp": safe_float(cached.get("timestamp"), time.time()),
+                "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE"),
+            }
+        # One balance request populates both total and free; no second REST read.
+        get_free_balance()
+        cached = cache_get("wallet_balance_snapshot", max_age_sec)
+        if not isinstance(cached, dict):
+            return {"total": 0.0, "free": 0.0, "timestamp": time.time(),
+                    "source": "UNAVAILABLE"}
+        return {
+            "total": safe_float(cached.get("total"), 0.0),
+            "free": safe_float(cached.get("free"), 0.0),
+            "timestamp": safe_float(cached.get("timestamp"), time.time()),
+            "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE"),
+        }
 
 
 def get_available_balance_snapshot(max_age_sec=15.0):
