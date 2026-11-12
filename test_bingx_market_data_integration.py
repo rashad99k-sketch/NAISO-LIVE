@@ -80,6 +80,7 @@ def test_scanner_does_not_fall_back_to_rest_depth_by_default(monkeypatch):
     )
     monkeypatch.setitem(ggpbot.STATE, "open", False)
     monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
+    ggpbot.CACHE.pop("ob_ADA/USDT:USDT_10", None)
 
     assert ggpbot.get_orderbook_cached("ADA/USDT:USDT", 10) is None
 
@@ -92,6 +93,7 @@ def test_explicit_execution_fallback_can_use_rate_limited_rest_depth(monkeypatch
     book = {"bids": [[100.0, 1.0]], "asks": [[100.1, 1.0]]}
     monkeypatch.setattr(ggpbot, "BINGX_MARKET_DATA", Feed())
     monkeypatch.setattr(ggpbot, "fetch_orderbook", lambda *_args, **_kwargs: dict(book))
+    ggpbot.CACHE.pop("ob_XRP/USDT:USDT_5", None)
     monkeypatch.setitem(ggpbot.STATE, "open", False)
     monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
 
