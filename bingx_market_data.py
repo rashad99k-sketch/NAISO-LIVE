@@ -27,7 +27,9 @@ BINGX_SWAP_MARKET_WS = "wss://open-api-swap.bingx.com/swap-market"
 def _canonical_symbol(symbol: str) -> str:
     value = str(symbol or "").strip().upper()
     if ":" in value:
-        value = value.split(":", 1)[0]
+        value, settlement = value.split(":", 1)
+        if settlement != "USDT":
+            raise ValueError("only USDT-settled perpetual symbols are supported")
     value = value.replace("/", "-").replace("_", "-")
     if not value or any(ch in value for ch in "&=?#\r\n"):
         raise ValueError("invalid BingX market symbol")
