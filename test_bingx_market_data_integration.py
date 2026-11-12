@@ -17,7 +17,7 @@ def test_spread_gate_prefers_fresh_bookticker_over_rest_depth(monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("REST depth must not be called")),
     )
 
-    assert ggpbot.get_spread_bps("BTC/USDT:USDT") == 0.05
+    assert ggpbot.get_spread_bps("BTC/USDT:USDT") == pytest.approx(0.05)
 
 
 def test_dynamic_spread_tolerance_uses_validated_management_candle_count(monkeypatch):
