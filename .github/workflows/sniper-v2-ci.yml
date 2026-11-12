@@ -1,0 +1,47 @@
+name: Sniper V2 integration CI
+
+on:
+  push:
+    branches:
+      - feature/sniper-v2-safe-integration
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Static compile
+        run: python -m compileall -q .
+
+      - name: Runtime preflight
+        env:
+          PAPER_MODE: "true"
+          ENABLE_LIVE_TRADING: "false"
+        run: python preflight.py
+
+      - name: Test suite
+        env:
+          PAPER_MODE: "true"
+          ENABLE_LIVE_TRADING: "false"
+        run: python -m pytest -q

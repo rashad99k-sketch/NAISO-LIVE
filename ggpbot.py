@@ -526,6 +526,7 @@ CACHE = {
 _last_api_call = 0.0
 MIN_API_INTERVAL = _env_float_range("MIN_API_INTERVAL", 0.35, 0.20, 2.0)
 _API_RATE_LOCK = threading.Lock()
+_LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
 def rate_limit():
     """Serialize request-start scheduling across scanner and management threads."""
@@ -589,6 +590,11 @@ def safe_api_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             if "rate limit" in str(e).lower() or "100410" in str(e):
+                _LAST_API_RATE_LIMIT.update({
+                    "ts": time.time(),
+                    "method": getattr(func, "__name__", "exchange_call"),
+                    "message": str(e)[:180],
+                })
                 wait = min(8, 2 ** attempt)
                 try:
                     log_execution(
@@ -868,25 +874,71 @@ def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.D
     return df
 
 # ========== DATA FETCHING (OPTIMIZED CACHE) ==========
+OHLCV_FETCH_DIAGNOSTICS = {}
+
+def _record_ohlcv_fetch_diagnostic(symbol, reason, *, received=0, detail=""):
+    key = str(symbol or "")
+    OHLCV_FETCH_DIAGNOSTICS[key] = {
+        "reason": str(reason),
+        "received_candles": int(received or 0),
+        "detail": str(detail or "")[:180],
+        "timestamp": time.time(),
+        "timeframe": str(INTERVAL),
+    }
+
+
 def fetch_ohlcv(symbol, limit=150):
+    started_at = time.time()
+    sym = str(symbol or "")
     try:
         sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
-        if not data or len(data) < 100:
+        if not data:
+            rate = _LAST_API_RATE_LIMIT
+            reason = (
+                "OHLCV_RATE_LIMITED"
+                if rate.get("method") == "fetch_ohlcv" and float(rate.get("ts", 0.0)) >= started_at
+                else "OHLCV_EMPTY"
+            )
+            _record_ohlcv_fetch_diagnostic(sym, reason, detail="exchange returned no OHLCV rows")
+            return None
+        if len(data) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(data),
+                detail=f"fetcher minimum is 100 rows; received {len(data)}",
+            )
             return None
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
-        df = df.dropna()
+        for col in ["timestamp", "open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
         if len(df) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
+                detail=f"only {len(df)} complete OHLCV rows remained after validation",
+            )
             return None
-        if (df['close'] == 0).any() or (df['high'] == 0).any() or (df['low'] == 0).any():
+        if (df[["close", "high", "low"]] <= 0).any().any():
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_EMPTY", received=len(df), detail="non-positive OHLC value",
+            )
             return None
-        df = df.sort_index().drop_duplicates(subset=['timestamp']).ffill().bfill()
+        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
         if len(df) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
+                detail=f"only {len(df)} unique OHLCV rows remained",
+            )
             return None
+        _record_ohlcv_fetch_diagnostic(sym, "OK", received=len(df))
         return df
     except Exception as e:
+        rate_limited = "rate limit" in str(e).lower() or "100410" in str(e)
+        _record_ohlcv_fetch_diagnostic(
+            sym,
+            "OHLCV_RATE_LIMITED" if rate_limited else "OHLCV_EMPTY",
+            detail=f"{type(e).__name__}: {e}",
+        )
         print(color_text(f"fetch_ohlcv error for {symbol}: {e}", YELLOW))
         return None
 
@@ -4677,7 +4729,62 @@ def council_decision(context):
     final_score = max(0, min(12, score))
     return final_score, reasons
 
-def compute_sl_tp(entry_price, side, classification, atr, df):
+def _market_price_tick_size(symbol, reference_price):
+    """Return one exchange price increment for strict TP ordering."""
+    try:
+        market = ex.market(normalize_symbol(symbol))
+        precision = (market.get("precision") or {}).get("price")
+        if precision is not None:
+            precision = float(precision)
+            if math.isfinite(precision) and precision > 0:
+                mode = getattr(ex, "precisionMode", None)
+                if mode == getattr(ccxt, "TICK_SIZE", object()):
+                    return precision
+                if mode == getattr(ccxt, "DECIMAL_PLACES", object()):
+                    return 10.0 ** (-int(precision))
+                if mode == getattr(ccxt, "SIGNIFICANT_DIGITS", object()):
+                    magnitude = math.floor(math.log10(abs(float(reference_price))))
+                    return 10.0 ** (magnitude - int(precision) + 1)
+    except Exception:
+        pass
+    # Conservative numerical fallback for PAPER/mocked markets without metadata.
+    return max(abs(float(reference_price)) * 1e-8, 1e-12)
+
+
+def _order_take_profit_levels(entry_price, side, tp1_price, tp2_price, tick_size):
+    """Keep TP1 nearest and TP2 strictly farther from entry after rounding."""
+    entry = float(entry_price)
+    tp1 = float(tp1_price)
+    tp2 = float(tp2_price)
+    tick = max(float(tick_size), max(abs(entry) * 1e-12, 1e-12))
+    direction = str(side or "").strip().upper()
+    if direction == "BUY":
+        tp1 = max(tp1, entry + tick)
+        tp2_distance = max(abs(entry - tp2), abs(tp1 - entry) + tick)
+        tp2 = entry + tp2_distance
+        if tp2 <= tp1:
+            tp2 = tp1 + tick
+    elif direction == "SELL":
+        tp1 = min(tp1, entry - tick)
+        tp2_distance = max(abs(entry - tp2), abs(entry - tp1) + tick)
+        tp2 = entry - tp2_distance
+        if tp2 >= tp1:
+            tp2 = tp1 - tick
+    else:
+        raise ValueError("side must be BUY or SELL when ordering TP levels")
+    return tp1, tp2
+
+
+def compute_sl_tp(entry_price, side, classification, atr, df, symbol=None):
+    """Build directional SL/TP levels; TP2 must remain beyond TP1 after min-distance adjustment."""
+    side = str(side or "").strip().upper()
+    entry_price = float(entry_price)
+    atr = float(atr)
+    if side not in {"BUY", "SELL"} or not math.isfinite(entry_price) or entry_price <= 0:
+        raise ValueError("invalid entry price or side for SL/TP calculation")
+    if not math.isfinite(atr) or atr <= 0:
+        raise ValueError("ATR must be finite and positive for SL/TP calculation")
+    pricing_symbol = symbol or getattr(df, "symbol", None) or DEFAULT_SYMBOL
     if classification == "REVERSAL":
         pools = build_liquidity_pools(df)
         if side == "BUY":
@@ -4698,8 +4805,30 @@ def compute_sl_tp(entry_price, side, classification, atr, df):
         sl = entry_price - atr * 1.6 if side == "BUY" else entry_price + atr * 1.6
         tp1 = entry_price * (1 + 0.008) if side == "BUY" else entry_price * (1 - 0.008)
         tp2 = entry_price * (1 + 0.02) if side == "BUY" else entry_price * (1 - 0.02)
-    sl, tp1 = PrecisionSafety.adjust_sl_tp(df.symbol if hasattr(df, 'symbol') else DEFAULT_SYMBOL, entry_price, sl, tp1, side, atr)
-    return sl, tp1, tp2
+
+    # Adjust SL and the near target using the existing volatility floor.
+    sl, tp1 = PrecisionSafety.adjust_sl_tp(
+        pricing_symbol, entry_price, sl, tp1, side, atr
+    )
+    # The legacy adjustment only moved TP1; when ATR was wide it could push
+    # TP1 beyond the fixed-percentage TP2. Move TP2 outward, never TP1 inward.
+    tick_size = _market_price_tick_size(pricing_symbol, entry_price)
+    tp2 = PrecisionSafety.normalize_price(pricing_symbol, tp2)
+    tp1, tp2 = _order_take_profit_levels(entry_price, side, tp1, tp2, tick_size)
+    # Re-normalize, then enforce strict ordering once more to account for rounding
+    # collapsing adjacent levels to the same exchange tick.
+    tp1 = PrecisionSafety.normalize_price(pricing_symbol, tp1)
+    tp2 = PrecisionSafety.normalize_price(pricing_symbol, tp2)
+    tp1, tp2 = _order_take_profit_levels(entry_price, side, tp1, tp2, tick_size)
+    if side == "BUY" and not (entry_price < tp1 < tp2):
+        raise ValueError(
+            f"TP_PRECISION_ORDER_INVALID BUY entry={entry_price} tp1={tp1} tp2={tp2} tick={tick_size}"
+        )
+    if side == "SELL" and not (tp2 < tp1 < entry_price):
+        raise ValueError(
+            f"TP_PRECISION_ORDER_INVALID SELL entry={entry_price} tp1={tp1} tp2={tp2} tick={tick_size}"
+        )
+    return float(sl), float(tp1), float(tp2)
 
 # ========== EXECUTION LAYER ==========
 STATE = {
@@ -5003,6 +5132,303 @@ def close_partial(ratio):
     # This is kept for backward compatibility; use safe_close_partial now
     return safe_close_partial(STATE["current_symbol"], ratio)
 
+
+# ========== INSTITUTIONAL ENTRY CLOSED-CANDLE GATE ==========
+ENTRY_CLOSED_CANDLE_MIN_BARS = 80
+ENTRY_CLOSED_CANDLE_MAX_AGE_INTERVALS = 2.0
+ENTRY_CANDLE_RETRY_DELAY_SEC = 0.35
+_ENTRY_TIME_LOCK = threading.Lock()
+_ENTRY_TIME_SNAPSHOT = {"monotonic": 0.0, "epoch_ms": 0, "source": "LOCAL_UTC_EPOCH"}
+
+
+def _entry_exchange_time_ms():
+    """Use cached BingX server time where available; otherwise use UTC epoch time."""
+    now_mono = time.monotonic()
+    with _ENTRY_TIME_LOCK:
+        snap = dict(_ENTRY_TIME_SNAPSHOT)
+        if snap["epoch_ms"] > 0 and now_mono - snap["monotonic"] <= 15.0:
+            return int(snap["epoch_ms"] + (now_mono - snap["monotonic"]) * 1000.0), snap["source"]
+
+        epoch_ms = None
+        source = "LOCAL_UTC_EPOCH"
+        exchange_obj = globals().get("ex")
+        has = getattr(exchange_obj, "has", {}) if exchange_obj is not None else {}
+        fetch_time = getattr(exchange_obj, "fetch_time", None) if exchange_obj is not None else None
+        if callable(fetch_time) and isinstance(has, dict) and has.get("fetchTime"):
+            try:
+                value = safe_api_call(fetch_time)
+                if value is not None:
+                    candidate = int(float(value))
+                    epoch_ms = candidate if candidate > 10**12 else candidate * 1000
+                    if epoch_ms > 0:
+                        source = "BINGX_SERVER_TIME"
+            except Exception as exc:
+                logger = globals().get("log_execution")
+                if logger:
+                    logger(
+                        f"[ENTRY_TIME] exchange time unavailable; UTC epoch fallback ({type(exc).__name__})",
+                        "WARN", debounce_key="entry_exchange_time_fallback", debounce_sec=60,
+                    )
+        if epoch_ms is None:
+            epoch_ms = int(time.time() * 1000)
+
+        _ENTRY_TIME_SNAPSHOT.update({
+            "monotonic": now_mono, "epoch_ms": epoch_ms, "source": source,
+        })
+        return int(epoch_ms), source
+
+
+def _entry_symbol_key(symbol):
+    canonical = globals().get("roro_canonical_symbol")
+    try:
+        return str(canonical(symbol)) if callable(canonical) else str(symbol).strip().upper()
+    except Exception:
+        return str(symbol).strip().upper()
+
+
+def _validate_entry_closed_frame(symbol, frame, context=None, *, now_ms=None, time_source=""):
+    """Validate symbol/timeframe, closed-bar status, age and minimum history."""
+    context = context if isinstance(context, dict) else {}
+    expected_symbol = context.get("exchange_symbol") or context.get("symbol")
+    if expected_symbol and _entry_symbol_key(expected_symbol) != _entry_symbol_key(symbol):
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": f"context_symbol={expected_symbol} requested_symbol={symbol}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    expected_tf = str(INTERVAL)
+    context_tf = str(context.get("candle_timeframe") or expected_tf)
+    if context_tf != expected_tf:
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": f"context_timeframe={context_tf} expected_timeframe={expected_tf}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        fetch_diag = OHLCV_FETCH_DIAGNOSTICS.get(str(normalize_symbol(symbol)), {})
+        last_rate = _LAST_API_RATE_LIMIT
+        rate_recent = (
+            last_rate.get("method") == "fetch_ohlcv"
+            and time.time() - float(last_rate.get("ts", 0.0)) <= 15.0
+        )
+        reason = fetch_diag.get("reason")
+        if reason not in {"OHLCV_RATE_LIMITED", "INSUFFICIENT_CLOSED_BARS"}:
+            reason = "OHLCV_RATE_LIMITED" if rate_recent else "OHLCV_EMPTY"
+        return None, {
+            "reason": reason,
+            "detail": fetch_diag.get("detail") or "no usable OHLCV frame was available",
+            "received_candles": int(fetch_diag.get("received_candles", 0) or 0),
+            "source": context.get("closed_candle_source", "EXCHANGE_FETCH"),
+        }
+
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    if not required.issubset(set(frame.columns)):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": f"missing_columns={sorted(required - set(frame.columns))}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    timestamps = pd.to_numeric(frame["timestamp"], errors="coerce").dropna()
+    if timestamps.empty or float(timestamps.max()) < 10**12:
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": "timestamps are missing or not Unix milliseconds",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+    timeframe_s = int(_roro_timeframe_seconds(expected_tf))
+    expected_interval_ms = timeframe_s * 1000
+    diffs = timestamps.sort_values().diff().dropna()
+    positive_diffs = diffs[diffs > 0]
+    if len(positive_diffs) >= 5:
+        median_interval_ms = float(positive_diffs.median())
+        ratio = median_interval_ms / float(expected_interval_ms)
+        if not 0.80 <= ratio <= 1.20:
+            return None, {
+                "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+                "detail": (
+                    f"median_bar_interval_ms={median_interval_ms:.0f} "
+                    f"expected_interval_ms={expected_interval_ms}"
+                ),
+                "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+            }
+
+    if now_ms is None:
+        now_ms, time_source = _entry_exchange_time_ms()
+    validator = globals().get("roro_validate_closed_frame")
+    if not callable(validator):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": "closed-candle validator is unavailable",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+    try:
+        closed = validator(
+            frame.copy(), now_ms=int(now_ms), timeframe_s=timeframe_s,
+        )
+    except Exception as exc:
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": f"validator_error={type(exc).__name__}:{exc}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    source = context.get("closed_candle_source", "ENTRY_CONTEXT")
+    received = int(len(frame))
+    closed_count = int(len(closed)) if isinstance(closed, pd.DataFrame) else 0
+    if closed_count == 0:
+        return None, {
+            "reason": "ONLY_FORMING_CANDLE",
+            "detail": "OHLCV rows exist but none has a confirmed close time",
+            "received_candles": received,
+            "closed_candles": 0,
+            "time_source": time_source,
+            "source": source,
+        }
+    if closed_count < ENTRY_CLOSED_CANDLE_MIN_BARS:
+        return None, {
+            "reason": "INSUFFICIENT_CLOSED_BARS",
+            "detail": (
+                f"closed_candles={closed_count} "
+                f"required={ENTRY_CLOSED_CANDLE_MIN_BARS}"
+            ),
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+
+    last_open_ms = int(float(closed["timestamp"].iloc[-1]))
+    close_time_ms = last_open_ms + expected_interval_ms
+    age_ms = int(now_ms) - close_time_ms
+    if age_ms < -2000:
+        return None, {
+            "reason": "ONLY_FORMING_CANDLE",
+            "detail": f"latest_bar_not_closed_yet_by_exchange_time age_ms={age_ms}",
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+    max_age_ms = int(expected_interval_ms * ENTRY_CLOSED_CANDLE_MAX_AGE_INTERVALS)
+    if age_ms > max_age_ms:
+        return None, {
+            "reason": "CLOSED_CANDLE_STALE",
+            "detail": (
+                f"last_closed_ts={last_open_ms} age_sec={age_ms / 1000.0:.1f} "
+                f"max_age_sec={max_age_ms / 1000.0:.1f}"
+            ),
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+    if not validate_dataframe(closed, ENTRY_CLOSED_CANDLE_MIN_BARS):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": "closed OHLCV frame failed structural/finite data validation",
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+
+    return closed.reset_index(drop=True), {
+        "reason": "VALID",
+        "received_candles": received,
+        "closed_candles": closed_count,
+        "last_closed_candle_ts": last_open_ms,
+        "closed_candle_age_sec": round(max(0.0, age_ms / 1000.0), 3),
+        "time_source": time_source,
+        "source": source,
+        "timeframe": expected_tf,
+    }
+
+
+def resolve_entry_closed_candles(symbol, context=None):
+    """Reuse the exact authorized frame; perform at most one short fresh retry."""
+    context = context if isinstance(context, dict) else {}
+    shared_frame = context.get("closed_candle_frame")
+    if isinstance(shared_frame, pd.DataFrame):
+        frame = shared_frame.copy()
+        source = str(context.get("closed_candle_source") or "SHARED_AUTHORIZATION_FRAME")
+    else:
+        frame = get_ohlcv_safe(symbol, 150)
+        source = "SCANNER_CACHE_OR_EXCHANGE"
+
+    local_context = dict(context)
+    local_context.setdefault("exchange_symbol", symbol)
+    local_context.setdefault("candle_timeframe", str(INTERVAL))
+    local_context["closed_candle_source"] = source
+
+    final_frame = None
+    final_diag = None
+    for attempt in range(2):
+        if attempt == 1:
+            # Only one bounded retry. It bypasses the generic 30/90s frame cache.
+            time.sleep(ENTRY_CANDLE_RETRY_DELAY_SEC)
+            frame = fetch_ohlcv(symbol, 150)
+            source = "FRESH_EXCHANGE_RETRY"
+            local_context["closed_candle_source"] = source
+        now_ms, time_source = _entry_exchange_time_ms()
+        checked, diagnostic = _validate_entry_closed_frame(
+            symbol, frame, local_context, now_ms=now_ms, time_source=time_source,
+        )
+        if checked is not None:
+            final_frame, final_diag = checked, diagnostic
+            break
+        final_diag = diagnostic
+        reason = str(diagnostic.get("reason", "OHLCV_EMPTY"))
+        if reason in {"OHLCV_RATE_LIMITED", "SYMBOL_TIMEFRAME_MISMATCH"}:
+            break
+
+    MEMORY.setdefault("last_closed_candle_validation", {}).update({
+        "symbol": str(symbol),
+        **(final_diag or {"reason": "OHLCV_EMPTY"}),
+        "checked_at": time.time(),
+    })
+    if final_frame is not None:
+        log_execution(
+            f"[ENTRY_CANDLE_VALID] {symbol} timeframe={final_diag.get('timeframe')} "
+            f"closed={final_diag.get('closed_candles')} "
+            f"last_closed_ts={final_diag.get('last_closed_candle_ts')} "
+            f"age_sec={final_diag.get('closed_candle_age_sec')} "
+            f"time_source={final_diag.get('time_source')} source={final_diag.get('source')}",
+            "INFO",
+        )
+    return final_frame, (final_diag or {"reason": "OHLCV_EMPTY"})
+
+
+def record_entry_data_rejection(symbol, side, diagnostic, *, stage="INSTITUTIONAL_ENTRY_GATE"):
+    """Feed structured candle-data rejections into the Dashboard WHY NO ENTRY panel."""
+    diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+    reason_code = str(diagnostic.get("reason") or "OHLCV_EMPTY")
+    detail = str(diagnostic.get("detail") or "closed-candle validation failed")
+    now = time.time()
+    metrics = MEMORY.setdefault("entry_rejection_metrics", {})
+    metrics[reason_code] = int(metrics.get(reason_code, 0) or 0) + 1
+    MEMORY["last_closed_candle_validation"] = {
+        "symbol": str(symbol), "side": str(side), "reason": reason_code,
+        "detail": detail, "stage": stage, "checked_at": now,
+        **{k: v for k, v in diagnostic.items() if k not in {"reason", "detail"}},
+    }
+    feed = MEMORY.setdefault("no_entry_feed", [])
+    feed.append({
+        "time": now, "symbol": str(symbol), "side": str(side),
+        "reason": f"{reason_code}: {detail}", "score": None,
+        "category": reason_code, "stage": stage,
+    })
+    MEMORY["no_entry_feed"] = feed[-100:]
+    log_execution(
+        f"[ENTRY_DATA_REJECT] {symbol} {side} stage={stage} reason={reason_code} detail={detail}",
+        "ERROR",
+        debounce_key=f"entry_data_reject:{symbol}:{reason_code}",
+        debounce_sec=5,
+    )
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     # Canonicalize once at the strategy/execution boundary so every downstream
     # risk, position, SL/TP and management branch sees the same direction token.
@@ -5022,17 +5448,51 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             raise ValueError("entry price must be finite and positive")
         if not math.isfinite(structural_stop) or structural_stop <= 0:
             raise ValueError("structural stop must be finite and positive")
-        validate_trade_geometry(
-            side=side, entry_price=reference_price, stop_price=structural_stop,
-            tp1_price=tp1, tp2_price=tp2,
-        )
+        try:
+            validate_trade_geometry(
+                side=side, entry_price=reference_price, stop_price=structural_stop,
+                tp1_price=tp1, tp2_price=tp2,
+            )
+        except ValueError as geometry_exc:
+            raise ValueError(
+                f"{geometry_exc}; side={side} entry={reference_price:.12g} "
+                f"SL={structural_stop:.12g} TP1={float(tp1):.12g} TP2={float(tp2):.12g}"
+            ) from geometry_exc
         # Real available balance from BingX Futures ("free" USDT), with source and
         # fetch timestamp so freshness is provable. A stale/unreadable balance must
         # block the entry rather than silently produce a tiny position.
-        free_bal, balance_source, balance_ts = get_available_balance_snapshot()
-        balance = max(0.0, free_bal * BALANCE_SAFETY_FACTOR)
-        if balance <= 0:
-            raise ValueError("available USDT balance is zero or unreadable")
+        # Sniper V2 targets 20% of TOTAL wallet balance. Free balance is
+        # checked separately as an exchange feasibility gate. Other strategies
+        # keep their existing free-margin sizing path unchanged.
+        if institutional_entry_ctx.get("sniper_v2") is True:
+            if institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
+                raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
+            wallet_snapshot = None if PAPER_MODE else safe_api_call(ex.fetch_balance)
+            wallet_balance, free_balance, balance_source = _sniper_v2_wallet_balances(
+                wallet_snapshot=wallet_snapshot,
+                paper_wallet_balance=paper.get("balance", 0.0),
+                paper_mode=PAPER_MODE,
+            )
+            balance_ts = time.time()
+            target_margin = wallet_balance * 0.20
+            if wallet_balance <= 0 or target_margin <= 0:
+                raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
+            if free_balance <= 0:
+                raise ValueError(
+                    f"SNIPER_FREE_MARGIN_UNAVAILABLE: wallet_total={wallet_balance:.4f} "
+                    f"free={free_balance:.4f}"
+                )
+            balance = wallet_balance
+            log_execution(
+                f"[SNIPER_SIZING_BASIS] wallet_total={wallet_balance:.4f} "
+                f"target_margin_20pct={target_margin:.4f} free_margin={free_balance:.4f}",
+                "INFO",
+            )
+        else:
+            free_bal, balance_source, balance_ts = get_available_balance_snapshot()
+            balance = max(0.0, free_bal * BALANCE_SAFETY_FACTOR)
+            if balance <= 0:
+                raise ValueError("available USDT balance is zero or unreadable")
         sym = normalize_symbol(symbol)
         try:
             market = ex.market(sym)
@@ -5047,10 +5507,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
         # A caller-supplied label such as SNIPER is not proof of setup quality.
         # Only the unified institutional Watchlist may authorize the strong 30% tier.
-        strong_tier_authorized = bool(
-            institutional_entry_ctx.get("capital_allocation_tier") == "STRONG_30_PERCENT"
-            and institutional_entry_ctx.get("sizing_eligible_strong") is True
-        )
+        if institutional_entry_ctx.get("sniper_v2") is True:
+            if classification != "SNIPER_V2" or institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
+                raise ValueError("SNIPER_V2_SIZING_POLICY_CONTEXT_INVALID")
+            strong_tier_authorized = False
+        else:
+            strong_tier_authorized = bool(
+                institutional_entry_ctx.get("capital_allocation_tier") == "STRONG_30_PERCENT"
+                and institutional_entry_ctx.get("sizing_eligible_strong") is True
+            )
         sizing_classification = effective_sizing_classification(
             classification, strong_tier_authorized=strong_tier_authorized
         )
@@ -5075,6 +5540,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
         actual_notional = qty * contract_size * reference_price
         margin = actual_notional / LEVERAGE
+        if institutional_entry_ctx.get("sniper_v2") is True:
+            required_free_margin = margin * 1.01
+            if free_balance + 1e-9 < required_free_margin:
+                raise ValueError(
+                    f"SNIPER_FREE_MARGIN_INSUFFICIENT_AFTER_RISK_GATE: "
+                    f"wallet_total={wallet_balance:.4f} target_margin={target_margin:.4f} "
+                    f"actual_margin={margin:.4f} required_with_buffer={required_free_margin:.4f} "
+                    f"free={free_balance:.4f}"
+                )
         effective_stop_distance = abs(reference_price - structural_stop) + reference_price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
         estimated_stop_loss = qty * contract_size * effective_stop_distance
         max_stop_loss = sizing.max_risk_usdt
@@ -5104,7 +5578,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "[POSITION_SIZING_AUDIT]\n"
             f"  Symbol: {sym}\n"
             f"  Direction: {side}\n"
-            f"  BingX Available Balance: {balance:.4f} USDT\n"
+            f"  Sizing Balance Basis: {'WALLET_TOTAL' if institutional_entry_ctx.get('sniper_v2') is True else 'AVAILABLE_FREE'}\n"
+            f"  Sizing Balance: {balance:.4f} USDT\n"
             f"  Balance Source: {balance_source}\n"
             f"  Balance Timestamp: {balance_ts:.3f}\n"
             f"  Allocation Percentage: {margin_percent*100:.0f}%\n"
@@ -5142,7 +5617,21 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
-    df = get_ohlcv_safe(symbol, 100)
+    institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
+    if not PAPER_MODE and MODE_LIVE and institutional_ctx:
+        df, candle_diagnostic = resolve_entry_closed_candles(symbol, institutional_ctx)
+        if df is None:
+            record_entry_data_rejection(symbol, side, candle_diagnostic)
+            log_execution(
+                f"[ENTRY] {candle_diagnostic.get('reason', 'OHLCV_EMPTY')} for authorized "
+                f"institutional setup; LIVE blocked",
+                "ERROR",
+            )
+            return False
+    else:
+        # Preserve the existing PAPER and legacy/manual data path.
+        df = get_ohlcv_safe(symbol, 100)
+
     adx_series = compute_adx(df) if df is not None else None
     adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else 20.0
 
@@ -5167,9 +5656,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 valid = False
             if not valid:
                 log_execution(f"[ENTRY] Institutional authorization incomplete for {setup}; LIVE blocked", "ERROR")
-                return False
-            if df is None:
-                log_execution("[ENTRY] No closed-candle data for authorized institutional setup; LIVE blocked", "ERROR")
                 return False
             # ADX, EMA and VWAP remain contextual evidence. They are not universal entry gates.
             log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f} treated as context, not a hard cross gate", "INFO")
@@ -8157,6 +8643,8 @@ def data():
             "ema9_vwap_proximity_scanner_meta": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}),
             "watchlist": watchlist_data,
             "no_entry_feed": no_entry_feed,
+            "entry_rejection_metrics": MEMORY.get("entry_rejection_metrics", {}),
+            "last_closed_candle_validation": MEMORY.get("last_closed_candle_validation", {}),
             "continuation_probability": STATE.get("continuation_probability", 0.5),
             "hold_quality": STATE.get("hold_quality", "UNKNOWN"),
             "counter_pressure": STATE.get("counter_pressure", 0.0),
@@ -8382,184 +8870,554 @@ def run_scanner_v2(symbols=None):
 # ========== SNIPER V2 ==========
 SNIPER_ZONES = {}
 
-def is_pivot_high(df, lookback=3):
-    if len(df) < lookback * 2 + 1:
-        return False
-    current_high = df['high'].iloc[-1]
-    left_highs = df['high'].iloc[-(lookback+1):-1]
-    if any(current_high <= h for h in left_highs):
-        return False
-    return True
+# ========== SNIPER V2 — CLOSED-CANDLE, RORO-AUTHORIZED ==========
+# Stateful zone watcher. It is a signal provider only: actual orders still pass
+# through execute_entry(), which remains the only entry gateway.
+SNIPER_ZONES = {}
+SNIPER_V2_LAST_PIVOT_TS = {}
+SNIPER_V2_ENABLED = _env_bool("SNIPER_V2_ENABLED", True)
+SNIPER_V2_SCAN_INTERVAL = _env_int_range("SNIPER_V2_SCAN_INTERVAL", 15, 5, 120)
+SNIPER_V2_MAX_SYMBOLS = _env_int_range("SNIPER_V2_MAX_SYMBOLS", 8, 1, 20)
+SNIPER_V2_PIVOT_LOOKBACK = _env_int_range("SNIPER_V2_PIVOT_LOOKBACK", 3, 2, 8)
+SNIPER_V2_ZONE_ATR_WIDTH = _env_float_range("SNIPER_V2_ZONE_ATR_WIDTH", 0.50, 0.15, 1.50)
+SNIPER_V2_SL_ATR_BUFFER = _env_float_range("SNIPER_V2_SL_ATR_BUFFER", 0.40, 0.10, 1.00)
+SNIPER_V2_TP1_MOVE_PCT = 0.40
+SNIPER_V2_TP2_MOVE_PCT = 1.00
+SNIPER_V2_ZONE_MAX_AGE_SEC = _env_int_range("SNIPER_V2_ZONE_MAX_AGE_SEC", 14400, 900, 86400)
+SNIPER_V2_CONFIRMATION_WINDOW_BARS = _env_int_range("SNIPER_V2_CONFIRMATION_WINDOW_BARS", 3, 1, 10)
+SNIPER_V2_MAX_ENTRY_DISTANCE_ATR = _env_float_range("SNIPER_V2_MAX_ENTRY_DISTANCE_ATR", 0.75, 0.20, 2.00)
+_SNIPER_V2_LAST_SCAN = 0.0
+_SNIPER_V2_LOCK = threading.Lock()
+SNIPER_V2_METRICS = {
+    "state": "DISABLED" if not SNIPER_V2_ENABLED else "IDLE",
+    "symbols_scanned": 0, "zones_waiting": 0, "zones_ready": 0,
+    "entries": 0, "last_scan": 0.0, "last_error": None,
+}
 
-def is_pivot_low(df, lookback=3):
-    if len(df) < lookback * 2 + 1:
+
+def _sniper_v2_wallet_balances(*, wallet_snapshot=None, paper_wallet_balance=0.0, paper_mode=False):
+    """Return (total wallet USDT, free USDT, source); total sizes, free only gates execution."""
+    if paper_mode:
+        total = safe_float(paper_wallet_balance, 0.0)
+        free = total
+        source = "PAPER_WALLET_TOTAL"
+    else:
+        if not isinstance(wallet_snapshot, dict):
+            raise ValueError("SNIPER_WALLET_BALANCE_UNAVAILABLE")
+        total = safe_float((wallet_snapshot.get("total") or {}).get("USDT"), 0.0)
+        free = safe_float((wallet_snapshot.get("free") or {}).get("USDT"), 0.0)
+        source = "BINGX_WALLET_TOTAL_USDT"
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
+    if not math.isfinite(free) or free < 0:
+        raise ValueError("SNIPER_FREE_MARGIN_INVALID")
+    return total, free, source
+
+
+def is_pivot_high(df, lookback=None):
+    """A pivot high is valid only after configured right-side candles are closed."""
+    n = int(lookback or SNIPER_V2_PIVOT_LOOKBACK)
+    if df is None or len(df) < (2 * n + 1):
         return False
-    current_low = df['low'].iloc[-1]
-    left_lows = df['low'].iloc[-(lookback+1):-1]
-    if any(current_low >= l for l in left_lows):
+    idx = len(df) - n - 1
+    pivot = float(df["high"].iloc[idx])
+    left = df["high"].iloc[idx - n:idx]
+    right = df["high"].iloc[idx + 1:idx + n + 1]
+    return bool(pivot > float(left.max()) and pivot >= float(right.max()))
+
+
+def is_pivot_low(df, lookback=None):
+    """A pivot low is valid only after configured right-side candles are closed."""
+    n = int(lookback or SNIPER_V2_PIVOT_LOOKBACK)
+    if df is None or len(df) < (2 * n + 1):
         return False
-    return True
+    idx = len(df) - n - 1
+    pivot = float(df["low"].iloc[idx])
+    left = df["low"].iloc[idx - n:idx]
+    right = df["low"].iloc[idx + 1:idx + n + 1]
+    return bool(pivot < float(left.min()) and pivot <= float(right.min()))
+
 
 def detect_strong_pivot(df, side, atr):
-    if len(df) < 20:
+    """Confirm displacement/rejection/extension using closed candles."""
+    if df is None or len(df) < 55 or not np.isfinite(float(atr)) or float(atr) <= 0:
         return False, []
-    reasons = []
-    strong = False
-    if side == "TOP":
-        move_up = df['high'].iloc[-1] - df['low'].iloc[-6] if len(df) >= 6 else 0
-        if move_up > atr * 1.5:
-            reasons.append("strong_move_up")
-            strong = True
-        last = df.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        upper_wick = last['high'] - max(last['open'], last['close'])
-        if upper_wick > body:
-            reasons.append("rejection_wick")
-            strong = True
-        ema50 = ema(df['close'], 50).iloc[-1]
-        distance = abs(last['close'] - ema50) / ema50 if ema50 > 0 else 0
-        if distance > atr / last['close']:
-            reasons.append("overextended")
-            strong = True
-    else:
-        move_down = df['high'].iloc[-6] - df['low'].iloc[-1] if len(df) >= 6 else 0
-        if move_down > atr * 1.5:
-            reasons.append("strong_move_down")
-            strong = True
-        last = df.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        lower_wick = min(last['open'], last['close']) - last['low']
-        if lower_wick > body:
-            reasons.append("rejection_wick")
-            strong = True
-        ema50 = ema(df['close'], 50).iloc[-1]
-        distance = abs(last['close'] - ema50) / ema50 if ema50 > 0 else 0
-        if distance > atr / last['close']:
-            reasons.append("overextended")
-            strong = True
-    return strong, reasons
-
-def check_sniper_confirmation(df, zone_type):
-    if len(df) < 2:
-        return False, 0
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    body = abs(last['close'] - last['open'])
-    range_ = last['high'] - last['low']
-    confirm = 0
-    if zone_type == 'TOP':
-        upper_wick = last['high'] - max(last['open'], last['close'])
-        if range_ > 0 and upper_wick > body * 0.5:
-            confirm += 1
+    body = abs(float(last["close"]) - float(last["open"]))
+    reasons = []
+    if str(side).upper() == "TOP":
+        move = float(last["high"]) - float(df["low"].iloc[-6])
+        wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
+        if move > atr * 1.5:
+            reasons.append("strong_move_up")
     else:
-        lower_wick = min(last['open'], last['close']) - last['low']
-        if range_ > 0 and lower_wick > body * 0.5:
-            confirm += 1
-    if zone_type == 'TOP':
-        zone_high = SNIPER_ZONES.get(df.symbol if hasattr(df, 'symbol') else '', {}).get('high', last['high']+1)
-        if last['high'] > zone_high and last['close'] < zone_high:
-            confirm += 1
+        move = float(df["high"].iloc[-6]) - float(last["low"])
+        wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
+        if move > atr * 1.5:
+            reasons.append("strong_move_down")
+    if body > 0 and wick > body:
+        reasons.append("rejection_wick")
+    ema50 = ema(df["close"], 50).iloc[-1]
+    if np.isfinite(ema50) and ema50 > 0 and abs(float(last["close"]) - float(ema50)) > atr:
+        reasons.append("overextended")
+    return len(set(reasons)) >= 2, reasons
+
+
+def check_sniper_confirmation(df, zone_type, zone=None):
+    """Closed-candle rejection and reclaim; no forming-candle confirmation."""
+    if df is None or len(df) < 2 or not isinstance(zone, dict):
+        return False, 0
+    last, prev = df.iloc[-1], df.iloc[-2]
+    body = abs(float(last["close"]) - float(last["open"]))
+    candle_range = float(last["high"]) - float(last["low"])
+    if candle_range <= 0:
+        return False, 0
+    checks = 0
+    if str(zone_type).upper() == "TOP":
+        wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
+        if wick >= max(body * 0.5, candle_range * 0.20):
+            checks += 1
+        if float(last["high"]) > float(zone["high"]) and float(last["close"]) < float(zone["high"]):
+            checks += 1
+        if float(last["close"]) < float(last["open"]) and float(prev["close"]) >= float(prev["open"]):
+            checks += 1
     else:
-        zone_low = SNIPER_ZONES.get(df.symbol if hasattr(df, 'symbol') else '', {}).get('low', last['low']-1)
-        if last['low'] < zone_low and last['close'] > zone_low:
-            confirm += 1
-    if zone_type == 'TOP':
-        if last['close'] < last['open'] and prev['close'] > prev['open']:
-            confirm += 1
-    else:
-        if last['close'] > last['open'] and prev['close'] < prev['open']:
-            confirm += 1
-    return confirm >= 2, confirm
+        wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
+        if wick >= max(body * 0.5, candle_range * 0.20):
+            checks += 1
+        if float(last["low"]) < float(zone["low"]) and float(last["close"]) > float(zone["low"]):
+            checks += 1
+        if float(last["close"]) > float(last["open"]) and float(prev["close"]) <= float(prev["open"]):
+            checks += 1
+    return checks >= 2, checks
+
+
+_SNIPER_V2_SYMBOL_CURSOR = 0
+
+
+def _sniper_v2_symbols():
+    """Build a rotating bounded batch from the live unified Watchlist.
+
+    Legacy Radar and scanner feeds are fallbacks only. The current unified
+    Watchlist is the primary universe, so Sniper observes the same symbols
+    already enriched by the production discovery pipeline.
+    """
+    global _SNIPER_V2_SYMBOL_CURSOR
+    now = time.time()
+    candidates = {}
+
+    def add_candidate(raw_symbol, score=0.0):
+        if not raw_symbol:
+            return
+        exchange_symbol = roro_exchange_symbol(raw_symbol)
+        key = roro_canonical_symbol(exchange_symbol)
+        if not key:
+            return
+        try:
+            rank = float(score or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            rank = 0.0
+        current = candidates.get(key)
+        if current is None or rank > current[0]:
+            candidates[key] = (rank, exchange_symbol)
+
+    # Primary: active unified institutional Watchlist entries.
+    watchlist = MEMORY.get("watchlist", {})
+    if isinstance(watchlist, dict):
+        terminal_states = {
+            "REJECTED", "HARD_REJECT", "INVALIDATED", "EXPIRED",
+            "NO_DATA", "STALE", "ENTRY_WINDOW_MISSED",
+        }
+        for canonical, item in watchlist.items():
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("decision_state") or item.get("state") or "").upper()
+            if state in terminal_states:
+                continue
+            updated = safe_float(
+                item.get("last_update", item.get("last_updated", item.get("updated_at", 0.0))),
+                0.0,
+            )
+            # Ignore old residual Watchlist rows; fresh discovery refreshes these.
+            if updated > 0 and now - updated > 1800:
+                continue
+            raw = item.get("exchange_symbol") or item.get("symbol") or canonical
+            add_candidate(raw, item.get("score", item.get("discovery_score", 0.0)))
+
+    # Fallbacks keep the feature useful during Watchlist warm-up without
+    # introducing a new broad-market scan or extra exchange API fan-out.
+    fallback_feeds = (
+        MEMORY.get("radar_top5") or [],
+        MEMORY.get("radar_watchlist") or [],
+        MEMORY.get("scanner_v2_buy") or [],
+        MEMORY.get("scanner_v2_sell") or [],
+        MEMORY.get("rf_watchlist") or [],
+    )
+    if not candidates:
+        for feed in fallback_feeds:
+            for row in feed:
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get("exchange_symbol") or row.get("symbol")
+                add_candidate(raw, row.get("score", row.get("discovery_score", 0.0)))
+
+    ranked = [value[1] for _, value in sorted(
+        candidates.items(), key=lambda pair: pair[1][0], reverse=True
+    )]
+    if not ranked:
+        return []
+    batch_size = min(SNIPER_V2_MAX_SYMBOLS, len(ranked))
+    start = _SNIPER_V2_SYMBOL_CURSOR % len(ranked)
+    selected = [ranked[(start + offset) % len(ranked)] for offset in range(batch_size)]
+    _SNIPER_V2_SYMBOL_CURSOR = (start + batch_size) % len(ranked)
+    return selected
+
+
+def _sniper_v2_update_zone(symbol, closed):
+    """Create/update a persistent zone from closed candles; never places an order.
+
+    Lifecycle is deliberately explicit:
+      PIVOT_CONFIRMED -> WAIT_FOR_DEPARTURE -> WAIT_FOR_RETEST -> READY.
+    A candle that created/confirmed the pivot cannot also count as its retest.
+    """
+    key = roro_canonical_symbol(symbol)
+    if not key or closed is None or len(closed) < 80:
+        return None
+    try:
+        candle_ts = int(closed.timestamp.iloc[-1])
+        price = float(closed.close.iloc[-1])
+        previous_close = float(closed.close.iloc[-2])
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    if candle_ts <= 0 or not np.isfinite(price) or price <= 0:
+        return None
+    atr_series = compute_atr(closed, 14)
+    atr_value = float(atr_series.iloc[-1]) if len(atr_series) else float("nan")
+    if not np.isfinite(atr_value) or atr_value <= 0:
+        return None
+
+    zone = SNIPER_ZONES.get(key)
+    if isinstance(zone, dict):
+        # One transition pass per confirmed closed candle, not every 15-second scan.
+        last_processed_ts = int(zone.get("last_candle_ts", 0) or 0)
+        if candle_ts <= last_processed_ts:
+            return zone
+
+        zone["last_candle_ts"] = candle_ts
+        age = time.time() - float(zone.get("created_at", time.time()))
+        if age > SNIPER_V2_ZONE_MAX_AGE_SEC:
+            zone["state"] = "EXPIRED"
+
+        zone_type = str(zone.get("type", "")).upper()
+        zone_low = float(zone.get("low", 0.0))
+        zone_high = float(zone.get("high", 0.0))
+        if zone_type not in {"TOP", "BOTTOM"} or zone_low <= 0 or zone_high <= zone_low:
+            zone["state"] = "INVALIDATED"
+
+        if zone.get("state") == "WAIT":
+            if zone_type == "TOP":
+                if price > zone_high + atr_value * 0.20:
+                    zone["state"] = "INVALIDATED"
+                elif not zone.get("departed") and price < zone_low - atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} TOP departure confirmed; waiting for retest", "INFO")
+                elif (
+                    zone.get("departed")
+                    and int(zone.get("departure_candle_ts", 0)) < candle_ts
+                    and previous_close < zone_low
+                    and float(closed.high.iloc[-1]) >= zone_low
+                    and zone_low <= price <= zone_high
+                ):
+                    zone["state"] = "READY"
+                    zone["retest_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} TOP retest confirmed; state=READY", "INFO")
+            else:
+                if price < zone_low - atr_value * 0.20:
+                    zone["state"] = "INVALIDATED"
+                elif not zone.get("departed") and price > zone_high + atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} BOTTOM departure confirmed; waiting for retest", "INFO")
+                elif (
+                    zone.get("departed")
+                    and int(zone.get("departure_candle_ts", 0)) < candle_ts
+                    and previous_close > zone_high
+                    and float(closed.low.iloc[-1]) <= zone_high
+                    and zone_low <= price <= zone_high
+                ):
+                    zone["state"] = "READY"
+                    zone["retest_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} BOTTOM retest confirmed; state=READY", "INFO")
+
+        elif zone.get("state") == "READY":
+            # Do not keep a stale retest authorization indefinitely.
+            retest_ts = int(zone.get("retest_candle_ts", 0) or 0)
+            max_age_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000 * SNIPER_V2_CONFIRMATION_WINDOW_BARS)
+            if retest_ts <= 0 or candle_ts - retest_ts > max_age_ms:
+                zone["state"] = "EXPIRED"
+            elif zone_type == "TOP" and price > zone_high + atr_value * 0.20:
+                zone["state"] = "INVALIDATED"
+            elif zone_type == "BOTTOM" and price < zone_low - atr_value * 0.20:
+                zone["state"] = "INVALIDATED"
+
+        if zone.get("state") in {"EXPIRED", "INVALIDATED", "USED", "NO_CHASE"}:
+            SNIPER_ZONES.pop(key, None)
+            zone = None
+        else:
+            return zone
+
+    if zone is None:
+        n = SNIPER_V2_PIVOT_LOOKBACK
+        if is_pivot_high(closed, n):
+            pivot_idx = len(closed) - n - 1
+            pivot_ts = int(closed.timestamp.iloc[pivot_idx])
+            if int(SNIPER_V2_LAST_PIVOT_TS.get(key, 0)) == pivot_ts:
+                return None
+            pivot_frame = closed.iloc[:pivot_idx + 1]
+            pivot_atr_series = compute_atr(pivot_frame, 14)
+            pivot_atr = float(pivot_atr_series.iloc[-1]) if len(pivot_atr_series) else float("nan")
+            strong, reasons = detect_strong_pivot(pivot_frame, "TOP", pivot_atr)
+            if strong and np.isfinite(pivot_atr) and pivot_atr > 0:
+                pivot_high = float(closed.high.iloc[pivot_idx])
+                zone = {
+                    "symbol": symbol, "canonical_symbol": key, "type": "TOP",
+                    "high": pivot_high, "low": pivot_high - pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH,
+                    "pivot_timestamp": pivot_ts,
+                    "created_at": time.time(), "last_candle_ts": candle_ts,
+                    "state": "WAIT", "departed": False, "reasons": reasons,
+                }
+                # Right-side closed candles may already have moved price away.
+                # Record the departure, but never mark READY on this same candle.
+                if price < float(zone["low"]) - atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+        elif is_pivot_low(closed, n):
+            pivot_idx = len(closed) - n - 1
+            pivot_ts = int(closed.timestamp.iloc[pivot_idx])
+            if int(SNIPER_V2_LAST_PIVOT_TS.get(key, 0)) == pivot_ts:
+                return None
+            pivot_frame = closed.iloc[:pivot_idx + 1]
+            pivot_atr_series = compute_atr(pivot_frame, 14)
+            pivot_atr = float(pivot_atr_series.iloc[-1]) if len(pivot_atr_series) else float("nan")
+            strong, reasons = detect_strong_pivot(pivot_frame, "BOTTOM", pivot_atr)
+            if strong and np.isfinite(pivot_atr) and pivot_atr > 0:
+                pivot_low = float(closed.low.iloc[pivot_idx])
+                zone = {
+                    "symbol": symbol, "canonical_symbol": key, "type": "BOTTOM",
+                    "high": pivot_low + pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH, "low": pivot_low,
+                    "pivot_timestamp": pivot_ts,
+                    "created_at": time.time(), "last_candle_ts": candle_ts,
+                    "state": "WAIT", "departed": False, "reasons": reasons,
+                }
+                if price > float(zone["high"]) + atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+
+        if zone:
+            SNIPER_V2_LAST_PIVOT_TS[key] = int(zone["pivot_timestamp"])
+            SNIPER_ZONES[key] = zone
+            log_execution(
+                f"[SNIPER_V2] {key} {zone['type']} zone created "
+                f"pivot_ts={zone['pivot_timestamp']} bounds={zone['low']:.12g}-{zone['high']:.12g} "
+                f"departed={bool(zone.get('departed'))}",
+                "INFO",
+            )
+    return zone
+
+
+def _sniper_v2_confirmation_due(zone, candle_ts):
+    """Require a later closed candle after the retest candle for confirmation."""
+    if not isinstance(zone, dict) or str(zone.get("state", "")).upper() != "READY":
+        return False
+    retest_ts = int(zone.get("retest_candle_ts", 0) or 0)
+    current_ts = int(candle_ts or 0)
+    if retest_ts <= 0 or current_ts <= retest_ts:
+        return False
+    max_age_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000 * SNIPER_V2_CONFIRMATION_WINDOW_BARS)
+    return (current_ts - retest_ts) <= max_age_ms
+
+
+def _sniper_v2_structural_stop(side, zone, atr_value, roro_stop):
+    """Keep the RORO stop at least as far beyond the pivot zone as configured."""
+    direction = str(side or "").strip().upper()
+    if direction not in {"BUY", "SELL"} or not isinstance(zone, dict):
+        raise ValueError("invalid Sniper V2 stop inputs")
+    atr = float(atr_value)
+    authority_stop = float(roro_stop)
+    zone_low = float(zone.get("low"))
+    zone_high = float(zone.get("high"))
+    if not all(np.isfinite(v) and v > 0 for v in (atr, authority_stop, zone_low, zone_high)):
+        raise ValueError("Sniper V2 stop inputs must be finite and positive")
+    if zone_high <= zone_low:
+        raise ValueError("Sniper V2 zone geometry is invalid")
+    buffer = atr * SNIPER_V2_SL_ATR_BUFFER
+    if direction == "SELL":
+        return max(authority_stop, zone_high + buffer)
+    return min(authority_stop, zone_low - buffer)
+
 
 def sniper_engine_v2():
-    symbols = [c["symbol"] for c in MEMORY.get("radar_top5", [])] if MEMORY.get("radar_top5") else get_usdt_perp_symbols()[:20]
-    for sym in symbols:
-        df = get_ohlcv_safe(sym, 150)
-        if df is None or not validate_dataframe(df, 100):
-            continue
-        price = df['close'].iloc[-1]
-        atr_val = compute_atr(df).iloc[-1]
-        df.symbol = sym
-        if sym not in SNIPER_ZONES or SNIPER_ZONES[sym]["state"] in ("IDLE", "EXPIRED"):
-            if is_pivot_high(df, lookback=3):
-                strong_top, reasons_top = detect_strong_pivot(df, "TOP", atr_val)
-                if strong_top:
-                    zone = {
-                        "type": "TOP",
-                        "price": df['high'].iloc[-1],
-                        "high": df['high'].iloc[-1],
-                        "low": df['high'].iloc[-1] - atr_val * 0.5,
-                        "time": time.time(),
-                        "state": "WAIT",
-                        "confirm_count": 0,
-                        "reasons": reasons_top
-                    }
-                    SNIPER_ZONES[sym] = zone
-                    log_execution(f"[SNIPER_V2] {sym} TOP zone created at {zone['price']:.4f} reasons={reasons_top}", "INFO")
-                    continue
-            if is_pivot_low(df, lookback=3):
-                strong_bottom, reasons_bottom = detect_strong_pivot(df, "BOTTOM", atr_val)
-                if strong_bottom:
-                    zone = {
-                        "type": "BOTTOM",
-                        "price": df['low'].iloc[-1],
-                        "low": df['low'].iloc[-1],
-                        "high": df['low'].iloc[-1] + atr_val * 0.5,
-                        "time": time.time(),
-                        "state": "WAIT",
-                        "confirm_count": 0,
-                        "reasons": reasons_bottom
-                    }
-                    SNIPER_ZONES[sym] = zone
-                    log_execution(f"[SNIPER_V2] {sym} BOTTOM zone created at {zone['price']:.4f} reasons={reasons_bottom}", "INFO")
-                    continue
-        if sym in SNIPER_ZONES:
-            zone = SNIPER_ZONES[sym]
-            if zone["state"] == "WAIT":
-                if zone["type"] == "TOP":
-                    if zone["low"] <= price <= zone["high"]:
-                        zone["state"] = "READY"
-                        log_execution(f"[SNIPER_V2] {sym} price returned to TOP zone, state -> READY", "INFO")
-                    elif price > zone["high"] + atr_val * 0.2:
-                        zone["state"] = "EXPIRED"
-                        log_execution(f"[SNIPER_V2] {sym} TOP zone expired (price too high)", "WARN")
-                else:
-                    if zone["low"] <= price <= zone["high"]:
-                        zone["state"] = "READY"
-                        log_execution(f"[SNIPER_V2] {sym} price returned to BOTTOM zone, state -> READY", "INFO")
-                    elif price < zone["low"] - atr_val * 0.2:
-                        zone["state"] = "EXPIRED"
-                        log_execution(f"[SNIPER_V2] {sym} BOTTOM zone expired (price too low)", "WARN")
+    """One bounded scan cycle; execution stays on the unified GGP/RORO path."""
+    if not SNIPER_V2_ENABLED:
+        SNIPER_V2_METRICS["state"] = "DISABLED"
+        return False
+    if (STATE.get("open") or TRADE_STATE.get("in_position")
+            or globals().get("RECOVERY_BLOCK_ENTRIES", False)
+            or MEMORY.get("position_status") == "UNKNOWN"):
+        SNIPER_V2_METRICS["state"] = "PAUSED_FOR_POSITION_OR_RECOVERY"
+        return False
+    if not _SNIPER_V2_LOCK.acquire(blocking=False):
+        return False
+    try:
+        symbols = _sniper_v2_symbols()
+        SNIPER_V2_METRICS.update({
+            "state": "RUNNING", "last_scan": time.time(), "symbols_scanned": 0,
+            "zones_waiting": 0, "zones_ready": 0, "last_error": None,
+        })
+        for symbol in symbols:
+            if STATE.get("open") or TRADE_STATE.get("in_position"):
+                break
+            raw_frame = _get_scanner_frame(symbol, 150)
+            if raw_frame is None or not validate_dataframe(raw_frame, 80):
                 continue
-            if zone["state"] == "READY":
-                confirmed, conf_count = check_sniper_confirmation(df, zone["type"])
-                if confirmed:
-                    side = "SELL" if zone["type"] == "TOP" else "BUY"
-                    ob = get_orderbook_cached(sym, limit=10)
-                    should_enter, classification, narrative = evaluate_with_narrative(sym, side, price, atr_val, df, ob, side)
-                    if not should_enter:
-                        continue
-                    sl = zone["high"] + atr_val * 0.4 if side == "SELL" else zone["low"] - atr_val * 0.4
-                    tp1 = price * (1 - 0.004) if side == "SELL" else price * (1 + 0.004)
-                    tp2 = price * (1 - 0.01) if side == "SELL" else price * (1 + 0.01)
-                    reason_str = f"SNIPER_V2 {zone['type']} conf={conf_count} reasons={zone.get('reasons', [])} | NARR={narrative['classification']}"
-                    ok = execute_entry(side, sym, price, sl, tp1, tp2, 9, reason_str, atr_val,
-                                       trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification)
-                    if ok:
-                        log_execution(f"[SNIPER_V2] {sym} {side} entry executed", "SUCCESS")
-                        zone["state"] = "USED"
-                        SNIPER_ZONES.pop(sym, None)
-                        return True
-                elif conf_count >= 1:
-                    continue
-                else:
-                    if time.time() - zone["time"] > 3600:
-                        zone["state"] = "EXPIRED"
-                        log_execution(f"[SNIPER_V2] {sym} zone expired after 1 hour", "WARN")
-                    continue
-            if zone["state"] == "EXPIRED":
-                SNIPER_ZONES.pop(sym, None)
-    return False
+            closed = roro_validate_closed_frame(
+                raw_frame, now_ms=int(time.time() * 1000),
+                timeframe_s=_roro_timeframe_seconds(INTERVAL),
+            )
+            if closed is None or len(closed) < 80:
+                continue
+            key = roro_canonical_symbol(symbol)
+            zone = _sniper_v2_update_zone(symbol, closed)
+            SNIPER_V2_METRICS["symbols_scanned"] += 1
+            if not isinstance(zone, dict):
+                continue
+            zone_state = str(zone.get("state", ""))
+            if zone_state == "WAIT":
+                SNIPER_V2_METRICS["zones_waiting"] += 1
+                continue
+            if zone_state != "READY":
+                continue
+            SNIPER_V2_METRICS["zones_ready"] += 1
+            candle_ts = int(closed.timestamp.iloc[-1])
+            if not _sniper_v2_confirmation_due(zone, candle_ts):
+                continue
+            if int(zone.get("confirmation_candle_ts", 0)) == candle_ts:
+                continue
+            # Mark before evaluation so a closed candle is evaluated once only.
+            zone["confirmation_candle_ts"] = candle_ts
+            confirmed, count = check_sniper_confirmation(closed, zone["type"], zone)
+            zone["confirmation_count"] = count
+            if not confirmed:
+                continue
+            side = "SELL" if zone["type"] == "TOP" else "BUY"
+            live_price = get_ticker_safe(symbol)
+            if not live_price or not np.isfinite(float(live_price)) or float(live_price) <= 0:
+                log_execution(f"[SNIPER_V2] {key} rejected: live_price_unavailable", "WARN")
+                continue
+            price = float(live_price)
+            atr_value = float(compute_atr(closed, 14).iloc[-1])
+            if not np.isfinite(atr_value) or atr_value <= 0:
+                continue
+            distance_atr = abs(price - float(closed.close.iloc[-1])) / atr_value
+            if distance_atr > SNIPER_V2_MAX_ENTRY_DISTANCE_ATR:
+                zone["state"] = "NO_CHASE"
+                zone["no_chase_reason"] = "live_price_too_far_from_closed_confirmation"
+                log_execution(f"[SNIPER_V2] {key} NO_CHASE distance_atr={distance_atr:.3f}", "WARN")
+                continue
+            authority = roro_analyze_symbol_both(
+                symbol, closed, now_ms=int(time.time() * 1000), side_hints=[side]
+            )
+            if authority.get("decision_state") != "ENTRY_READY" or str(authority.get("side")).upper() != side:
+                log_execution(
+                    f"[SNIPER_V2] {key} blocked by RORO authority: "
+                    f"{authority.get('decision_reason') or authority.get('rejection_reasons')}",
+                    "INFO",
+                )
+                continue
+            event_id = str(authority.get("event_id") or "")
+            evidence = list(authority.get("evidence") or [])
+            setup = str(authority.get("decision_setup_type") or authority.get("setup_type") or "").upper()
+            if not event_id or not setup or not evidence:
+                log_execution(f"[SNIPER_V2] {key} blocked: incomplete_RORO_authorization", "WARN")
+                continue
+            if INSTITUTIONAL_TRADE_JOURNAL and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(event_id):
+                log_execution(f"[SNIPER_V2] {key} blocked: duplicate_RORO_event={event_id}", "WARN")
+                continue
+            if "REVERSAL" not in setup and setup != "FAILED_AUCTION_REVERSAL":
+                log_execution(f"[SNIPER_V2] {key} blocked: RORO_setup_not_reversal ({setup})", "INFO")
+                continue
+            structural_stop = authority.get("structural_stop")
+            if structural_stop is None or not np.isfinite(float(structural_stop)):
+                log_execution(f"[SNIPER_V2] {key} blocked: structural_stop_missing", "WARN")
+                continue
+            structural_stop = _sniper_v2_structural_stop(side, zone, atr_value, float(structural_stop))
+            if (side == "SELL" and structural_stop <= price) or (side == "BUY" and structural_stop >= price):
+                log_execution(f"[SNIPER_V2] {key} blocked: invalid_RORO_stop_geometry", "WARN")
+                continue
+            tp1_move, tp2_move = SNIPER_V2_TP1_MOVE_PCT / 100.0, SNIPER_V2_TP2_MOVE_PCT / 100.0
+            tp1 = price * (1.0 - tp1_move if side == "SELL" else 1.0 + tp1_move)
+            tp2 = price * (1.0 - tp2_move if side == "SELL" else 1.0 + tp2_move)
+            _INSTITUTIONAL_ENTRY_CONTEXT = {
+                "setup_type": setup, "event_id": event_id, "evidence": evidence,
+                "structural_stop": structural_stop, "pullback_type": "SNIPER_ZONE_RETEST",
+                "exchange_symbol": symbol, "sniper_v2": True,
+                "capital_allocation_tier": "STANDARD_20_PERCENT",
+                "sizing_eligible_strong": False, "sizing_balance_basis": "WALLET_TOTAL",
+                "candle_timeframe": str(INTERVAL),
+                "closed_candle_frame": closed.copy(),
+                "closed_candle_source": "SNIPER_V2_CONFIRMED_FRAME",
+                "closed_candle_timestamp": int(closed["timestamp"].iloc[-1]),
+            }
+            try:
+                ok = execute_entry(
+                    side, symbol, price, structural_stop, float(tp1), float(tp2), 9.0,
+                    f"SNIPER_V2 {zone['type']} PIVOT_RETEST confirmation={count} "
+                    f"zone={zone['low']:.12g}-{zone['high']:.12g} RORO={setup}",
+                    atr_value, trade_type="SNIPER_V2", entry_type="SNIPER_V2",
+                    classification="SNIPER_V2",
+                )
+            finally:
+                _INSTITUTIONAL_ENTRY_CONTEXT = None
+            if ok:
+                zone["state"] = "USED"
+                SNIPER_ZONES.pop(key, None)
+                SNIPER_V2_METRICS["entries"] += 1
+                if INSTITUTIONAL_TRADE_JOURNAL:
+                    _persist_trade_journal_start(setup, authority)
+                    trade_id = str(STATE.get("trade_id") or "")
+                    if trade_id:
+                        INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
+                RORO_ENTRY_AUTHORITY.consume(event_id)
+                log_execution(
+                    f"[SNIPER_V2] EXECUTED {side} {symbol} event={event_id} "
+                    f"margin_target=20% wallet leverage={LEVERAGE}x TP1=0.4% TP2=1.0%",
+                    "SUCCESS",
+                )
+                return True
+        SNIPER_V2_METRICS["state"] = "IDLE"
+        return False
+    except Exception as exc:
+        SNIPER_V2_METRICS.update({
+            "state": "ERROR", "last_error": f"{type(exc).__name__}: {str(exc)[:180]}",
+        })
+        log_execution(f"[SNIPER_V2] scan failed: {type(exc).__name__}: {exc}", "ERROR")
+        return False
+    finally:
+        _SNIPER_V2_LOCK.release()
+
+
+def _run_sniper_scan_if_due():
+    """Run synchronously inside the supervisor; avoid racing the other entry path."""
+    global _SNIPER_V2_LAST_SCAN
+    if not SNIPER_V2_ENABLED:
+        return False
+    now = time.time()
+    if now - _SNIPER_V2_LAST_SCAN < SNIPER_V2_SCAN_INTERVAL:
+        return False
+    _SNIPER_V2_LAST_SCAN = now
+    return sniper_engine_v2()
+
 
 # ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
 def update_institutional_flow_scanner():
@@ -8806,6 +9664,9 @@ def main_loop_sniper():
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
                         smart_opportunity_selection()
                         last_candidate_scan = now
+                    # Sniper is an entry-only candidate engine; it never runs while
+                    # a position is open and uses the same bounded scanner cache.
+                    _run_sniper_scan_if_due()
                     time.sleep(1)
                 else:
                     time.sleep(1)
@@ -8875,7 +9736,7 @@ except Exception as _integration_init_error:
     log_execution(f"[INTEGRATION] optional persistence unavailable: {_integration_init_error}", "WARN")
 
 def _integration_fetch_frame(symbol):
-    return get_ohlcv_safe(roro_exchange_symbol(symbol), 150)
+    return _get_scanner_frame(roro_exchange_symbol(symbol), 150)
 
 # Per-symbol stateful trend/context engines. Keeping these instances separate avoids
 # one asset's trend state leaking into another asset's Watchlist decision.
@@ -9124,7 +9985,9 @@ def smart_opportunity_selection():
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "structural_stop_missing"
                 continue
-            _, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
+            _, tp1, tp2 = compute_sl_tp(
+                price, side, classification, float(atr_value), closed_df, symbol=exchange_sym
+            )
             if not (tp1 and tp2 and np.isfinite(float(tp1)) and np.isfinite(float(tp2))):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "profit_targets_invalid"
@@ -9138,6 +10001,10 @@ def smart_opportunity_selection():
                 "pullback_type": next((x.split(":", 1)[0] for x in evidence
                                         if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,
+                "candle_timeframe": str(INTERVAL),
+                "closed_candle_frame": closed_df.copy(),
+                "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
+                "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
             try:
