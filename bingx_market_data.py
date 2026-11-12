@@ -53,6 +53,7 @@ class BingXBookTickerFeed:
         *,
         url: str = BINGX_SWAP_MARKET_WS,
         stale_after_sec: float = 1.5,
+        depth_stale_after_sec: float = 3.0,
         reconnect_max_sec: float = 30.0,
         logger: Optional[Callable[[str], None]] = None,
         ws_app_factory: Optional[Callable[..., Any]] = None,
@@ -64,6 +65,7 @@ class BingXBookTickerFeed:
     ):
         self.url = url
         self.stale_after_sec = max(0.2, float(stale_after_sec))
+        self.depth_stale_after_sec = max(0.5, float(depth_stale_after_sec))
         self.reconnect_max_sec = max(1.0, float(reconnect_max_sec))
         self.logger = logger or (lambda _message: None)
         self._factory = ws_app_factory
@@ -176,7 +178,7 @@ class BingXBookTickerFeed:
         channel = self._depth_channel(symbol, level)
         canonical = channel.split("@", 1)[0]
         self.subscribe_depth(canonical, level)
-        limit = self.stale_after_sec if max_age_sec is None else max(0.0, float(max_age_sec))
+        limit = self.depth_stale_after_sec if max_age_sec is None else max(0.0, float(max_age_sec))
         with self._lock:
             item = self._depths.get((canonical, int(level)))
             if not item:
