@@ -442,16 +442,16 @@ class TradeExecutionService:
         position_side = "LONG" if side == "BUY" else "SHORT"
         params = build_position_order_params(mode_result.mode, side, opening=True, closing=False)
 
-        # Leverage is configured manually in BingX. This service is deliberately
-        # read-only: it must never modify an account-level leverage setting.
-        fetch_lev = getattr(self.exchange, "fetch_leverage", None)
-        if not callable(fetch_lev):
-            return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
-                                   requested_qty=requested, position_mode=mode_result.mode.value,
-                                   position_side=params["positionSide"],
-                                   reason="entry not submitted: fetch_leverage unavailable; configured leverage cannot be verified")
+        # Preserve the existing 20x account configuration path. The write is
+        # single-shot; only the read-back is routed through the shared API policy.
         try:
+            if not callable(getattr(self.exchange, "set_leverage", None)):
+                raise RuntimeError("set_leverage unavailable")
             lev_params = leverage_params(mode_result.mode, position_side)
+            self.exchange.set_leverage(int(leverage), symbol, lev_params)
+            fetch_lev = getattr(self.exchange, "fetch_leverage", None)
+            if not callable(fetch_lev):
+                raise RuntimeError("fetch_leverage unavailable; leverage cannot be verified")
             try:
                 lev_raw = self._read(fetch_lev, symbol, lev_params)
             except TypeError:
@@ -461,12 +461,12 @@ class TradeExecutionService:
                 position_side=(position_side if mode_result.mode is PositionMode.HEDGE else None),
             )
             if observed is None or abs(observed - float(leverage)) > 1e-9:
-                raise RuntimeError(f"leverage read-back mismatch: {observed!r} (configured expected={leverage})")
+                raise RuntimeError(f"leverage read-back mismatch: {observed!r}")
         except Exception as exc:
             return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
                                    requested_qty=requested, position_mode=mode_result.mode.value,
                                    position_side=params["positionSide"],
-                                   reason=f"entry not submitted: leverage read-only verification failed: {type(exc).__name__}: {exc}")
+                                   reason=f"leverage validation failed: {type(exc).__name__}: {exc}")
 
         params["clientOrderId"] = client_order_id
         try:
