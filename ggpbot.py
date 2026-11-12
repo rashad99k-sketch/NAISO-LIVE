@@ -4998,6 +4998,20 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         return None
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
+            # Keep the single-position gate closed, but make the reason visible.
+            # Only verified-flat finalization/reconciliation may release it.
+            log_execution(
+                f"[ENTRY_LOCKED] {sym}: active trade lock is held "
+                f"| state_open={bool(STATE.get('open'))} "
+                f"| trade_state_open={bool(TRADE_STATE.get('in_position'))} "
+                f"| recovery_hold={bool(STATE.get('recovery_hold'))} "
+                f"| execution_unresolved={bool(STATE.get('execution_unresolved'))} "
+                f"| close_reconciliation_required={bool(STATE.get('close_reconciliation_required'))} "
+                f"| recovery_block_entries={bool(globals().get('RECOVERY_BLOCK_ENTRIES', False))}",
+                "WARN",
+                debounce_key=f"entry_locked:{sym}",
+                debounce_sec=10,
+            )
             return None
         _ACTIVE_TRADE = True
     order = None
@@ -7442,6 +7456,42 @@ def finalize_trade_with_reality(symbol, close_reason=None):
     TRADE_STATE.update({"in_position": False, "symbol": None, "side": None, "entry": 0.0,
                         "qty": 0.0, "tp1_hit": False, "tp2_hit": False,
                         "trail_on": False, "zone": None, "location": None, "reason": []})
+
+    # This function is entered only after close_verified=True. Release the
+    # single-trade lock only if every local/recovery gate agrees the account is
+    # flat and no execution uncertainty remains.
+    release_reasons = []
+    if STATE.get("open"):
+        release_reasons.append("STATE_OPEN")
+    if TRADE_STATE.get("in_position"):
+        release_reasons.append("TRADE_STATE_OPEN")
+    if STATE.get("execution_unresolved"):
+        release_reasons.append("EXECUTION_UNRESOLVED")
+    if STATE.get("close_reconciliation_required"):
+        release_reasons.append("CLOSE_RECONCILIATION_REQUIRED")
+    if STATE.get("recovery_hold"):
+        release_reasons.append("RECOVERY_HOLD")
+    if globals().get("RECOVERY_BLOCK_ENTRIES", False):
+        release_reasons.append("RECOVERY_BLOCK_ENTRIES")
+    position_status = MEMORY.get("position_status")
+    if position_status not in (None, "FLAT"):
+        release_reasons.append(f"POSITION_STATUS_{position_status}")
+
+    global _ACTIVE_TRADE
+    with _TRADE_LOCK:
+        if not release_reasons:
+            _ACTIVE_TRADE = False
+            log_execution(
+                f"[ENTRY_LOCK_RELEASED] {symbol}: verified full close finalized; next discovery cycle may authorize an entry",
+                "SUCCESS",
+            )
+        else:
+            _ACTIVE_TRADE = True
+            log_execution(
+                f"[ENTRY_LOCK_RETAINED] {symbol}: unresolved safety gates: {','.join(release_reasons)}",
+                "ERROR",
+            )
+
     _live_manager.lifecycle_state = TradeLifecycleState.CLOSED
     DASHBOARD_STATE["live_trade_mode"] = False
     clear_position_dashboard()
