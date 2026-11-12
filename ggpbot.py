@@ -5235,26 +5235,35 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                     "ERROR",
                 )
                 return None
-            if risk_budget_usdt is None or safe_float(risk_budget_usdt, 0.0) <= 0:
-                log_execution("[LIVE_SAFETY] Missing pre-trade stop-risk budget; refusing LIVE entry", "ERROR")
-                return None
-            actual_stop_distance = abs(price - stop_value) + price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
-            actual_stop_risk = amount * contract_size * actual_stop_distance
-            if actual_stop_risk > safe_float(risk_budget_usdt, 0.0) * 1.000001:
+            if risk_budget_usdt is not None:
+                risk_budget = safe_float(risk_budget_usdt, 0.0)
+                if risk_budget <= 0:
+                    log_execution("[LIVE_SAFETY] Invalid pre-trade stop-risk budget; refusing LIVE entry", "ERROR")
+                    return None
+                actual_stop_distance = abs(price - stop_value) + price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
+                actual_stop_risk = amount * contract_size * actual_stop_distance
+                if actual_stop_risk > risk_budget * 1.000001:
+                    log_execution(
+                        f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} actual_qty={amount:.10f} live_price={price:.10f} "
+                        f"precision_sl={stop_value:.10f} stop_distance={actual_stop_distance:.10f} "
+                        f"stop_distance_pct={actual_stop_distance / price * 100.0:.5f}% "
+                        f"estimated_risk={actual_stop_risk:.4f} risk_budget={risk_budget:.4f}; "
+                        "entry blocked; quantity not force-expanded",
+                        "WARN",
+                    )
+                    return None
                 log_execution(
-                    f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} actual_qty={amount:.10f} live_price={price:.10f} "
-                    f"precision_sl={stop_value:.10f} stop_distance={actual_stop_distance:.10f} "
-                    f"stop_distance_pct={actual_stop_distance / price * 100.0:.5f}% "
-                    f"estimated_risk={actual_stop_risk:.4f} risk_budget={safe_float(risk_budget_usdt, 0.0):.4f}; "
-                    "entry blocked; quantity not force-expanded",
-                    "WARN",
+                    f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} estimated_risk={actual_stop_risk:.4f} "
+                    f"risk_budget={risk_budget:.4f} status=PASS",
+                    "INFO",
                 )
-                return None
-            log_execution(
-                f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} estimated_risk={actual_stop_risk:.4f} "
-                f"risk_budget={safe_float(risk_budget_usdt, 0.0):.4f} status=PASS",
-                "INFO",
-            )
+            else:
+                # Preserve the existing scale-in caller; primary entries always pass a sizing risk budget.
+                log_execution(
+                    f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} no new sizing budget supplied; "
+                    "legacy scale-in path retained without changing its management policy",
+                    "DEBUG", debounce_key=f"scale_in_risk_budget_{sym}", debounce_sec=60,
+                )
 
         required_margin = (amount * contract_size * price) / LEVERAGE
         if usdt < required_margin * 1.01:
