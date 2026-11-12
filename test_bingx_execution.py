@@ -515,3 +515,27 @@ def test_native_sl_does_not_accept_price_beyond_exchange_quantization_delta():
         trigger_price=8.223214285714286, required_qty=1,
         price_tolerance_abs=0.000214285715,
     )
+
+
+def test_entry_write_rate_limit_is_observed_without_replaying_order():
+    class RateLimitedExchange(FakeExchange):
+        def create_order(self, *args, **kwargs):
+            self.create_order_calls += 1
+            raise RuntimeError("HTTP 429 Too Many Requests")
+
+    exchange = RateLimitedExchange()
+    exchange.create_order_calls = 0
+    observed = []
+    service = TradeExecutionService(
+        exchange,
+        api_error_handler=lambda exc, method: observed.append((method, str(exc))),
+    )
+
+    result = service.submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-rate-limited"
+    )
+
+    assert result.state is ExecutionState.EXECUTION_UNCERTAIN
+    assert exchange.create_order_calls == 1
+    assert observed and observed[0][0] == "create_order"
+    assert "429" in observed[0][1]
