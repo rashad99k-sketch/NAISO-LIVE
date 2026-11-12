@@ -264,6 +264,8 @@ def test_expired_cooldown_requires_successful_read_probe_before_new_entry():
     policy._set_cooldown(5.0, "HTTP_418_BAN")
 
     class Exchange:
+        def load_markets(self):
+            return {}
         def fetch_positions(self):
             return []
 
@@ -271,5 +273,9 @@ def test_expired_cooldown_requires_successful_read_probe_before_new_entry():
     with pytest.raises(ApiCooldownError):
         policy.assert_new_entry_allowed()
 
-    assert policy.call_read(Exchange().fetch_positions) == []
+    exchange = Exchange()
+    assert policy.call_read(exchange.load_markets) == {}
+    with pytest.raises(ApiCooldownError):
+        policy.assert_new_entry_allowed()
+    assert policy.call_read(exchange.fetch_positions) == []
     policy.assert_new_entry_allowed()
