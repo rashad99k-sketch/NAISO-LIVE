@@ -1,4 +1,6 @@
 import ggpbot
+import threading
+import time
 
 
 class FakeBalanceExchange:
@@ -53,3 +55,32 @@ def test_normal_strategy_sizing_basis_can_select_free_or_total(monkeypatch):
     total_value, total_basis = ggpbot.resolve_position_sizing_balance(snapshot)
     assert total_value == 33.0
     assert total_basis == "WALLET_TOTAL"
+
+
+def test_concurrent_wallet_balance_snapshots_share_one_exchange_read(monkeypatch):
+    class SlowBalanceExchange:
+        def __init__(self):
+            self.calls = 0
+        def fetch_balance(self):
+            self.calls += 1
+            time.sleep(0.05)
+            return {"total": {"USDT": 33.0}, "free": {"USDT": 7.5}}
+
+    exchange = SlowBalanceExchange()
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "safe_api_call", lambda func, *args, **kwargs: func(*args, **kwargs))
+    ggpbot.CACHE.pop("wallet_balance_snapshot", None)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(ggpbot.get_wallet_balance_snapshot()))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert exchange.calls == 1
+    assert [item["free"] for item in results] == [7.5, 7.5]
