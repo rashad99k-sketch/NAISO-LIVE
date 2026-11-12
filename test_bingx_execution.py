@@ -98,10 +98,11 @@ def test_adapter_normalizes_nested_dual_side_response():
 
 
 def test_filled_entry_verifies_order_and_exchange_position():
-    exchange = FakeExchange()
+    exchange = FakeExchange(leverage=10)
     result = TradeExecutionService(exchange).submit_market_entry(
         symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-filled")
     assert result.state is ExecutionState.FILLED
+    assert exchange.leverage == 20
     assert result.filled_qty == 2
     assert result.average_fill_price == 101.5
     assert exchange.create_calls[0][4]["positionSide"] == "BOTH"
