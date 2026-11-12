@@ -239,3 +239,28 @@ def test_20_percent_of_free_balance_is_not_20_percent_of_total_wallet():
 
     assert total_wallet * 0.20 == pytest.approx(6.60)
     assert result.target_margin == pytest.approx(1.50)
+
+
+def test_structural_stop_uses_exchange_price_precision(monkeypatch):
+    class PrecisionExchange:
+        def price_to_precision(self, symbol, stop):
+            assert symbol == "BTC/USDT:USDT"
+            assert float(stop) == pytest.approx(99.949)
+            return "99.95"
+
+    monkeypatch.setattr(ggpbot, "ex", PrecisionExchange())
+    assert ggpbot._precision_adjusted_structural_stop("BTC/USDT:USDT", 99.949) == pytest.approx(99.95)
+
+
+def test_structural_stop_precision_failure_is_not_silently_rounded():
+    class BrokenPrecisionExchange:
+        def price_to_precision(self, _symbol, _stop):
+            raise RuntimeError("precision unavailable")
+
+    original = ggpbot.ex
+    ggpbot.ex = BrokenPrecisionExchange()
+    try:
+        with pytest.raises(ValueError):
+            ggpbot._precision_adjusted_structural_stop("BTC/USDT:USDT", 99.949)
+    finally:
+        ggpbot.ex = original
