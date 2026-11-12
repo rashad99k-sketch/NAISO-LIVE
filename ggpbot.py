@@ -5853,6 +5853,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         actual_filled_qty = safe_float(order.get("filled"), 0.0)
         actual_entry_price = safe_float(order.get("average"), 0.0)
         if actual_filled_qty <= 0 or actual_entry_price <= 0:
+            # The exchange acknowledged an exposure, even though its fill payload is incomplete.
+            _invalidate_position_fetch_cache(symbol)
             STATE.update({"open": True, "current_symbol": symbol, "side": side,
                           "trade_id": trade_id, "qty": qty, "recovery_hold": True,
                           "execution_unresolved": True})
@@ -5861,6 +5863,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             return False
         qty = actual_filled_qty
         price = actual_entry_price
+        # Discard any cached pre-entry FLAT snapshot before publishing local OPEN state.
+        _invalidate_position_fetch_cache(symbol)
         margin = (qty * contract_size * price) / LEVERAGE
         notional = qty * contract_size * price
         STATE.update({
@@ -5965,7 +5969,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
         time.sleep(1)
-        _invalidate_position_fetch_cache(symbol)
         sync_position_state(symbol)
         return True
     else:
