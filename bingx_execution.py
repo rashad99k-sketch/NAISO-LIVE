@@ -82,6 +82,7 @@ class ExecutionResult:
     reason: str = ""
     raw_order: Any = None
     raw_position: Any = None
+    order_terminal: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -136,6 +137,34 @@ def _status(order: Any) -> str:
         return "UNKNOWN"
     info = _nested_info(order)
     return str(order.get("status") or order.get("state") or info.get("status") or info.get("orderStatus") or "UNKNOWN").upper()
+
+
+_TERMINAL_ENTRY_ORDER_STATES = {
+    "CLOSED", "FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED",
+}
+
+
+def _position_quantity(position: Any) -> float:
+    if not isinstance(position, dict):
+        return 0.0
+    info = _nested_info(position)
+    for value in (position.get("contracts"), position.get("positionAmt"),
+                  info.get("positionAmt"), info.get("contracts")):
+        try:
+            number = abs(float(value))
+            if math.isfinite(number) and number > 0:
+                return number
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return 0.0
+
+
+def _position_entry_price(position: Any) -> Optional[float]:
+    if not isinstance(position, dict):
+        return None
+    info = _nested_info(position)
+    return _first_number(position.get("entryPrice"), position.get("average"),
+                         info.get("avgPrice"), info.get("entryPrice"))
 
 
 def _order_id(order: Any) -> Optional[str]:
@@ -329,9 +358,11 @@ class TradeExecutionService:
         requested = float(quantity)
         mode_result = self.mode_adapter.read(symbol)
         if mode_result.mode is PositionMode.UNKNOWN:
-            return ExecutionResult(ExecutionState.EXECUTION_UNCERTAIN, trade_id, client_order_id,
+            # No market-order request has been sent at this point, so this is a
+            # definitive application-side block, not an ambiguous exchange write.
+            return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
                                    requested_qty=requested, position_mode=PositionMode.UNKNOWN.value,
-                                   reason=mode_result.reason)
+                                   reason=f"entry not submitted: {mode_result.reason}")
         position_side = "LONG" if side == "BUY" else "SHORT"
         params = build_position_order_params(mode_result.mode, side, opening=True, closing=False)
         try:
@@ -375,38 +406,116 @@ class TradeExecutionService:
         filled = _extract_filled(observed_order)
         remaining = _extract_remaining(observed_order, requested, filled)
         average = _extract_average(observed_order)
-        if average is None:
+        order_status = _status(observed_order)
+        order_terminal = order_status in _TERMINAL_ENTRY_ORDER_STATES
+
+        # A MARKET order that remains non-terminal is not safe to abandon, even
+        # when it has not filled yet. Cancel only its existing remainder; never
+        # issue a second MARKET order. A cancellation acknowledgement is not
+        # evidence: the terminal order must be read back from BingX.
+        if not order_terminal:
+            cancel = getattr(self.exchange, "cancel_order", None)
+            cancel_id = order_id or client_order_id
+            if callable(cancel) and cancel_id:
+                try:
+                    cancel(cancel_id, symbol)
+                except Exception:
+                    # A timeout can happen after the cancel was accepted. The
+                    # fresh order read below is the only authority.
+                    pass
+                refreshed = self._find_order(symbol, order_id, client_order_id)
+                if refreshed is not None:
+                    observed_order = refreshed
+                    order_status = _status(observed_order)
+                    order_terminal = order_status in _TERMINAL_ENTRY_ORDER_STATES
+                    filled = _extract_filled(observed_order)
+                    remaining = _extract_remaining(observed_order, requested, filled)
+                    average = _extract_average(observed_order)
+
+        position = self._position(symbol, params["positionSide"], side)
+        position_query_available = callable(getattr(self.exchange, "fetch_positions", None))
+
+        if average is None and filled > 0:
             trades = []
             fetch_trades = getattr(self.exchange, "fetch_my_trades", None)
             if callable(fetch_trades):
-                try: trades = fetch_trades(symbol, None, 100, {"orderId": order_id})
-                except Exception: pass
+                try:
+                    trades = fetch_trades(symbol, None, 100, {"orderId": order_id})
+                except Exception:
+                    pass
             average = _weighted_trade_average(trades)
-        position = self._position(symbol, params["positionSide"], side)
-        position_query_available = callable(getattr(self.exchange, "fetch_positions", None))
-        if _status(observed_order) in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} and filled <= 0:
+        if average is None and position is not None:
+            average = _position_entry_price(position)
+
+        if not order_terminal:
+            state = ExecutionState.EXECUTION_UNCERTAIN
+            reason = f"entry order is not terminal after cancel/read-back; status={order_status}"
+        elif order_status in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} and filled <= 0:
             state = ExecutionState.REJECTED
+            reason = f"order_status={order_status}"
         elif position_query_available and position is None:
             state = ExecutionState.EXECUTION_UNCERTAIN
+            reason = f"terminal entry order has no matching {side} exchange position; status={order_status}"
         elif filled <= 0 and position is None:
-            state = ExecutionState.REJECTED if _status(observed_order) in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} else ExecutionState.EXECUTION_UNCERTAIN
-        elif average is None:
-            state = ExecutionState.ENTRY_PRICE_UNKNOWN
-        elif remaining > 0:
-            state = ExecutionState.PARTIAL_FILL
+            state = ExecutionState.EXECUTION_UNCERTAIN
+            reason = f"no fill or matching position evidence; status={order_status}"
+        elif position is None or _position_quantity(position) <= 0:
+            state = ExecutionState.EXECUTION_UNCERTAIN
+            reason = "exchange position quantity is unavailable"
         else:
-            state = ExecutionState.FILLED
-        result = ExecutionResult(state, trade_id, client_order_id, order_id, requested, filled, remaining,
-                                 average, average, mode_result.mode.value, params["positionSide"],
-                                 reason=f"order_status={_status(observed_order)}", raw_order=observed_order,
-                                 raw_position=position)
+            position_qty = _position_quantity(position)
+            quantity_tolerance = max(requested * 0.002, 1e-10)
+            if abs(position_qty - filled) > quantity_tolerance:
+                state = ExecutionState.EXECUTION_UNCERTAIN
+                reason = (
+                    f"order/position quantity mismatch: order_filled={filled:.12g} "
+                    f"position_qty={position_qty:.12g}"
+                )
+            elif average is None:
+                state = ExecutionState.ENTRY_PRICE_UNKNOWN
+                reason = f"order_status={order_status}; exchange entry price unavailable"
+            elif order_status in {"CANCELED", "CANCELLED", "EXPIRED"} and filled > 0:
+                state = ExecutionState.PARTIAL_FILL
+                reason = f"order_status={order_status}; remaining order quantity canceled"
+            elif filled + quantity_tolerance < requested:
+                state = ExecutionState.PARTIAL_FILL
+                reason = f"order_status={order_status}; confirmed partial position"
+            elif remaining > 0 and order_status not in {"CLOSED", "FILLED"}:
+                state = ExecutionState.EXECUTION_UNCERTAIN
+                reason = f"terminal order has an unresolved remainder; status={order_status}"
+            else:
+                state = ExecutionState.FILLED
+                reason = f"order_status={order_status}"
+
+        result = ExecutionResult(
+            state, trade_id, client_order_id, order_id, requested, filled, remaining,
+            average, average, mode_result.mode.value, params["positionSide"],
+            reason=reason, raw_order=observed_order, raw_position=position,
+            order_terminal=order_terminal,
+        )
         if self.journal is not None and hasattr(self.journal, "record_execution"):
-            self.journal.record_execution(
-                trade_id, exchange_order_id=order_id, filled_qty=filled,
-                remaining_qty=remaining, average_fill_price=average,
-                actual_entry_price=average, status=state.value,
-                recovery_status=("EXECUTION_UNCERTAIN" if state is ExecutionState.EXECUTION_UNCERTAIN else ""),
-            )
+            try:
+                self.journal.record_execution(
+                    trade_id, exchange_order_id=order_id, filled_qty=filled,
+                    remaining_qty=remaining, average_fill_price=average,
+                    actual_entry_price=average, status=state.value,
+                    recovery_status=("EXECUTION_UNCERTAIN" if state in {
+                        ExecutionState.EXECUTION_UNCERTAIN,
+                        ExecutionState.ENTRY_PRICE_UNKNOWN,
+                    } else ""),
+                )
+            except Exception as exc:
+                # The exchange result may already represent live exposure. A
+                # failed durable checkpoint must never turn that into a retryable
+                # rejection or let the caller unlock the entry path.
+                return ExecutionResult(
+                    ExecutionState.EXECUTION_UNCERTAIN, trade_id, client_order_id,
+                    order_id, requested, filled, remaining, average, average,
+                    mode_result.mode.value, params["positionSide"],
+                    reason=f"execution journal persistence failed after exchange response: {type(exc).__name__}: {exc}",
+                    raw_order=observed_order, raw_position=position,
+                    order_terminal=order_terminal,
+                )
         return result
 
     def place_and_verify_native_stop(self, *, symbol: str, side: str, quantity: float,
