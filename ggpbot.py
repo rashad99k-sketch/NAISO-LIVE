@@ -597,6 +597,20 @@ def safe_api_call(func, *args, **kwargs):
     try:
         return func(*args, **kwargs)
     except Exception as exc:
+        kind = BINGX_API_RELIABILITY.observe_error(exc, name or "unknown_write")
+        if kind in {"RATE_LIMIT", "BAN", "SYSTEM_BUSY", "RISK_CONTROL"}:
+            _LAST_API_RATE_LIMIT.update({
+                "ts": time.time(), "method": name, "message": str(exc)[:180],
+            })
+            try:
+                state = BINGX_API_RELIABILITY.snapshot()
+                log_execution(
+                    f"[API_WRITE_BACKOFF] {name} class={kind}; no replay; "
+                    f"cooldown={state['cooldown_remaining']:.2f}s reason={state['cooldown_reason']}",
+                    "WARN", debounce_key=f"api_write_backoff_{name}_{kind}", debounce_sec=30
+                )
+            except Exception:
+                pass
         if is_order_write:
             try:
                 STATE["execution_unresolved"] = True
