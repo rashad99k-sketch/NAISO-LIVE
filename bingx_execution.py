@@ -83,6 +83,7 @@ class ExecutionResult:
     raw_order: Any = None
     raw_position: Any = None
     order_terminal: bool = False
+    submission_attempted: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -399,7 +400,8 @@ class TradeExecutionService:
             if reconciled is None:
                 return ExecutionResult(ExecutionState.EXECUTION_UNCERTAIN, trade_id, client_order_id,
                                        requested_qty=requested, position_mode=mode_result.mode.value,
-                                       position_side=params["positionSide"], reason=f"submission outcome uncertain: {exc}")
+                                       position_side=params["positionSide"], reason=f"submission outcome uncertain: {exc}",
+                                       submission_attempted=True)
             order = reconciled
         order_id = _order_id(order)
         observed_order = self._find_order(symbol, order_id, client_order_id) or order
@@ -491,7 +493,7 @@ class TradeExecutionService:
             state, trade_id, client_order_id, order_id, requested, filled, remaining,
             average, average, mode_result.mode.value, params["positionSide"],
             reason=reason, raw_order=observed_order, raw_position=position,
-            order_terminal=order_terminal,
+            order_terminal=order_terminal, submission_attempted=True,
         )
         if self.journal is not None and hasattr(self.journal, "record_execution"):
             try:
@@ -514,7 +516,7 @@ class TradeExecutionService:
                     mode_result.mode.value, params["positionSide"],
                     reason=f"execution journal persistence failed after exchange response: {type(exc).__name__}: {exc}",
                     raw_order=observed_order, raw_position=position,
-                    order_terminal=order_terminal,
+                    order_terminal=order_terminal, submission_attempted=True,
                 )
         return result
 
