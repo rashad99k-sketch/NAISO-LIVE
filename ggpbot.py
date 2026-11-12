@@ -5775,18 +5775,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             if balance <= 0:
                 raise ValueError("available USDT balance is zero or unreadable")
         sym = normalize_symbol(symbol)
-        raw_structural_stop = structural_stop
-        structural_stop = _precision_adjusted_structural_stop(sym, structural_stop)
-        sl = structural_stop
-        validate_trade_geometry(
-            side=side, entry_price=reference_price, stop_price=structural_stop,
-            tp1_price=tp1, tp2_price=tp2,
-        )
-        log_execution(
-            f"[STRUCTURAL_SL_PRECISION] symbol={sym} raw_sl={raw_structural_stop:.10f} "
-            f"exchange_sl={structural_stop:.10f} entry_reference={reference_price:.10f}",
-            "INFO",
-        )
         try:
             market = ex.market(sym)
             contract_size = safe_float(market.get("contractSize"), 0.0)
@@ -5797,6 +5785,24 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 raise
             market = {}
             contract_size = 1.0  # PAPER fallback only; LIVE must use exchange market metadata.
+
+        raw_structural_stop = structural_stop
+        try:
+            structural_stop = _precision_adjusted_structural_stop(sym, structural_stop)
+        except Exception:
+            if not PAPER_MODE:
+                raise
+            structural_stop = raw_structural_stop
+        sl = structural_stop
+        validate_trade_geometry(
+            side=side, entry_price=reference_price, stop_price=structural_stop,
+            tp1_price=tp1, tp2_price=tp2,
+        )
+        log_execution(
+            f"[STRUCTURAL_SL_PRECISION] symbol={sym} raw_sl={raw_structural_stop:.10f} "
+            f"exchange_sl={structural_stop:.10f} entry_reference={reference_price:.10f}",
+            "INFO",
+        )
 
         # A caller-supplied label such as SNIPER is not proof of setup quality.
         # Only the unified institutional Watchlist may authorize the strong 30% tier.
