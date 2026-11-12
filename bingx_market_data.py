@@ -59,6 +59,8 @@ class BingXBookTickerFeed:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         random_uniform: Callable[[float, float], float] = random.uniform,
+        max_subscriptions: int = 150,
+        subscription_interval_sec: float = 0.12,
     ):
         self.url = url
         self.stale_after_sec = max(0.2, float(stale_after_sec))
@@ -68,7 +70,12 @@ class BingXBookTickerFeed:
         self._clock = clock
         self._sleep = sleep
         self._random_uniform = random_uniform
+        self.max_subscriptions = max(1, min(int(max_subscriptions), 180))
+        self.subscription_interval_sec = max(0.05, min(float(subscription_interval_sec), 1.0))
         self._lock = threading.RLock()
+        self._send_lock = threading.Lock()
+        self._last_subscribe_sent_mono = 0.0
+        self._last_used: Dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._ws = None
@@ -124,24 +131,43 @@ class BingXBookTickerFeed:
         if thread and thread.is_alive():
             thread.join(timeout=max(0.0, float(timeout)))
 
-    def subscribe(self, symbol: str) -> bool:
-        channel = self._channel(symbol)
+    def _register_channel(self, channel: str) -> bool:
         with self._lock:
             is_new = channel not in self._desired
             self._desired.add(channel)
-            ws = self._ws if self._connected and is_new else None
-        if ws is not None:
+            self._last_used[channel] = self._clock()
+            evicted = None
+            if len(self._desired) > self.max_subscriptions:
+                evicted = min(self._last_used, key=self._last_used.get)
+                if evicted == channel and len(self._desired) > 1:
+                    candidates = [key for key in self._desired if key != channel]
+                    evicted = min(candidates, key=lambda key: self._last_used.get(key, 0.0))
+                self._desired.discard(evicted)
+                self._last_used.pop(evicted, None)
+                if "@depth" in evicted:
+                    old_symbol = evicted.split("@", 1)[0]
+                    try:
+                        old_level = int(evicted.split("@depth", 1)[1].split("@", 1)[0])
+                        self._depths.pop((old_symbol, old_level), None)
+                    except (TypeError, ValueError, IndexError):
+                        pass
+                elif evicted.endswith("@bookTicker"):
+                    self._books.pop(evicted.split("@", 1)[0], None)
+            ws = self._ws if self._connected else None
+        if ws is not None and evicted:
+            self._send_unsubscribe(ws, evicted)
+        if ws is not None and is_new:
             self._send_subscribe(ws, channel)
+        return is_new
+
+    def subscribe(self, symbol: str) -> bool:
+        channel = self._channel(symbol)
+        self._register_channel(channel)
         return self.start()
 
     def subscribe_depth(self, symbol: str, level: int = 10) -> bool:
         channel = self._depth_channel(symbol, level)
-        with self._lock:
-            is_new = channel not in self._desired
-            self._desired.add(channel)
-            ws = self._ws if self._connected and is_new else None
-        if ws is not None:
-            self._send_subscribe(ws, channel)
+        self._register_channel(channel)
         return self.start()
 
     def get_depth(
@@ -193,6 +219,7 @@ class BingXBookTickerFeed:
             }
             return {
                 "connected": self._connected,
+                "connection_epoch": getattr(self, "_connection_epoch", 0),
                 "subscriptions": len(self._desired),
                 "symbols": sorted(self._books),
                 "book_ages_sec": ages,
@@ -207,22 +234,40 @@ class BingXBookTickerFeed:
                 "last_error": self._last_error,
             }
 
-    def _send_subscribe(self, ws: Any, channel: str) -> None:
+    def _send_request(self, ws: Any, channel: str, req_type: str) -> None:
         payload = {
             "id": uuid.uuid4().hex,
-            "reqType": "sub",
+            "reqType": req_type,
             "dataType": channel,
         }
         try:
-            ws.send(json.dumps(payload, separators=(",", ":")))
+            with self._send_lock:
+                wait = max(
+                    0.0,
+                    self._last_subscribe_sent_mono + self.subscription_interval_sec - self._clock(),
+                )
+                if wait > 0:
+                    self._sleep(wait)
+                ws.send(json.dumps(payload, separators=(",", ":")))
+                self._last_subscribe_sent_mono = self._clock()
         except Exception as exc:
             with self._lock:
-                self._last_error = f"subscribe failed: {type(exc).__name__}: {exc}"[:240]
+                self._last_error = f"{req_type} failed: {type(exc).__name__}: {exc}"[:240]
+
+    def _send_subscribe(self, ws: Any, channel: str) -> None:
+        self._send_request(ws, channel, "sub")
+
+    def _send_unsubscribe(self, ws: Any, channel: str) -> None:
+        self._send_request(ws, channel, "unsub")
 
     def _on_open(self, ws: Any) -> None:
         with self._lock:
             self._connected = True
             self._last_error = ""
+            # Old connection snapshots are invalid; wait for fresh messages on this socket.
+            self._books.clear()
+            self._depths.clear()
+            self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
             channels = sorted(self._desired)
         for channel in channels:
             self._send_subscribe(ws, channel)
@@ -322,10 +367,15 @@ class BingXBookTickerFeed:
     def _on_error(self, _ws: Any, error: Any) -> None:
         with self._lock:
             self._last_error = f"{type(error).__name__}: {error}"[:240]
+            self._connected = False
+            self._books.clear()
+            self._depths.clear()
 
     def _on_close(self, _ws: Any, _status: Any, _message: Any) -> None:
         with self._lock:
             self._connected = False
+            self._books.clear()
+            self._depths.clear()
 
     def _run(self) -> None:
         backoff = 1.0
@@ -349,6 +399,8 @@ class BingXBookTickerFeed:
                 with self._lock:
                     self._connected = False
                     self._ws = None
+                    self._books.clear()
+                    self._depths.clear()
                     self._reconnects += 1
             if self._stop.is_set():
                 break
