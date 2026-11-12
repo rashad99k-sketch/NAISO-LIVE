@@ -24,7 +24,7 @@ BookTicker snapshots older than `BINGX_BOOK_TICKER_STALE_AFTER_SEC` and depth sn
 CCXT's built-in rate limiter remains enabled. A shared application-level controller adds:
 
 - Bounded concurrency for read requests.
-- Endpoint pacing at 1.05 seconds for the explicitly documented 1 request/second/IP methods: REST depth, klines, recent trades and contract catalogue reads. Other methods retain the shared CCXT/application limiter unless their endpoint-specific rate is documented.
+- Endpoint pacing at 1.05 seconds for the explicitly documented 1 request/second/IP methods: REST depth, ticker, klines, recent trades and contract catalogue reads. Other methods retain the shared CCXT/application limiter unless their endpoint-specific rate is documented.
 - A shared cooldown for HTTP 429, HTTP 418, BingX 100410, 109403, 109429 and 109500 responses.
 - One bounded exponential retry with jitter for safe transient read failures; no automatic retry for order writes or unknown methods.
 - A 418 cooldown defaults to 15 minutes and respects a longer Retry-After header (bounded at one hour). New entries are explicitly blocked during the API circuit cooldown; close/protection writes are not gated by this entry-only check. Do not treat cooldown expiry as proof that an IP ban has been lifted; verify API recovery before enabling new entries.
