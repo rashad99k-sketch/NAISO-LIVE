@@ -9,11 +9,14 @@ The existing 20x leverage configuration and read-back remain in place. MARKET an
 ## Market data: WebSocket first, REST fallback
 
 - USDT-M public market stream: \`wss://open-api-swap.bingx.com/swap-market\`.
-- \`{symbol}@bookTicker\` is used only for best bid/ask and spread checks. This avoids requesting full REST depth merely to calculate spread.
-- The client handles GZIP payloads, Ping/Pong, dynamic subscriptions, reconnect with bounded exponential backoff, and local receive-age validation.
-- Only symbols that reach the execution spread gate are subscribed. The scanner's entire universe is not streamed.
-- A BookTicker older than \`BINGX_BOOK_TICKER_STALE_AFTER_SEC\` is not used. The existing REST depth path is the fallback and remains fail-closed if no valid quote is available.
-- Full \`incrDepth\` is deliberately not used for the spread gate. A full local L2 book requires a separate snapshot/update state machine and must be invalidated on reconnect or any uncertain sequence. A partial or stale L2 book must never be presented as synchronized.
+- `{symbol}@bookTicker` supplies best bid/ask for spread checks.
+- `{symbol}@depth{level}@{interval}` supplies limited-depth snapshots for the existing liquidity and order-book imbalance calculations. The feed uses 200ms for BTC/ETH and 500ms for other USDT-M symbols.
+- Depth snapshots contain complete bid/ask arrays and are replaced atomically on each message. The client does not merge `incrDepth` deltas.
+- The client handles GZIP payloads, Ping/Pong, paced subscriptions, a local 150-topic cap with least-recently-used eviction, reconnect with bounded exponential backoff, and local receive-age validation.
+- Only symbols queried by the existing candidate/watchlist/radar code are subscribed; the full scanner universe is not preloaded.
+- Snapshots older than `BINGX_BOOK_TICKER_STALE_AFTER_SEC` are rejected. On disconnect/reconnect, local books are invalidated until fresh messages arrive.
+- Scanner depth reads do not call REST by default. Set `BINGX_REST_DEPTH_FALLBACK_ENABLED=true` only if REST depth fallback is deliberately preferred; execution spread preflight retains a rate-limited REST fallback.
+- Full `incrDepth` is deliberately not used. Its separate initialization/recovery protocol is unnecessary for the current bounded depth indicators and must not be approximated with an unsynchronized local merge.
 
 ## REST traffic control
 
