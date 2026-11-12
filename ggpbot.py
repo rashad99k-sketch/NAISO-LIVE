@@ -5163,7 +5163,7 @@ def update_stats(pnl_pct):
     total = DASHBOARD_STATE["stats"]["trades"]
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
-def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
+def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None, risk_budget_usdt=None):
     global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
     sym = normalize_symbol(symbol)
     side = str(side or "").upper()
@@ -5198,6 +5198,18 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         amount = float(ex.amount_to_precision(sym, amount))
         if amount <= 0:
             raise ValueError("Order amount rounded to zero")
+        stop_value = None
+        if stop_loss is not None:
+            try:
+                stop_value = _precision_adjusted_structural_stop(sym, stop_loss)
+            except Exception as exc:
+                if not PAPER_MODE:
+                    log_execution(
+                        f"[LIVE_SAFETY] Structural SL precision unavailable for {sym}: {type(exc).__name__}: {exc}",
+                        "ERROR",
+                    )
+                    return None
+                stop_value = safe_float(stop_loss, 0.0)
 
         # Reuse the sizing snapshot only while it is <=2s old; otherwise refresh
         # once at the final order boundary before any non-idempotent write.
@@ -5211,6 +5223,38 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         if price <= 0:
             log_execution(f"[ENTRY_PREFLIGHT] BingX ticker read unavailable for {sym}; blocked before order submission", "ERROR")
             return None
+
+        if not PAPER_MODE:
+            if stop_value is None or stop_value <= 0:
+                log_execution("[LIVE_SAFETY] Refusing LIVE entry without a precision-valid structural SL", "ERROR")
+                return None
+            if (side == "BUY" and stop_value >= price) or (side == "SELL" and stop_value <= price):
+                log_execution(
+                    f"[LIVE_SAFETY] Precision-adjusted structural SL is on the wrong side: "
+                    f"side={side} live_entry={price:.10f} SL={stop_value:.10f}",
+                    "ERROR",
+                )
+                return None
+            if risk_budget_usdt is None or safe_float(risk_budget_usdt, 0.0) <= 0:
+                log_execution("[LIVE_SAFETY] Missing pre-trade stop-risk budget; refusing LIVE entry", "ERROR")
+                return None
+            actual_stop_distance = abs(price - stop_value) + price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
+            actual_stop_risk = amount * contract_size * actual_stop_distance
+            if actual_stop_risk > safe_float(risk_budget_usdt, 0.0) * 1.000001:
+                log_execution(
+                    f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} actual_qty={amount:.10f} live_price={price:.10f} "
+                    f"precision_sl={stop_value:.10f} stop_distance={actual_stop_distance:.10f} "
+                    f"stop_distance_pct={actual_stop_distance / price * 100.0:.5f}% "
+                    f"estimated_risk={actual_stop_risk:.4f} risk_budget={safe_float(risk_budget_usdt, 0.0):.4f}; "
+                    "entry blocked; quantity not force-expanded",
+                    "WARN",
+                )
+                return None
+            log_execution(
+                f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} estimated_risk={actual_stop_risk:.4f} "
+                f"risk_budget={safe_float(risk_budget_usdt, 0.0):.4f} status=PASS",
+                "INFO",
+            )
 
         required_margin = (amount * contract_size * price) / LEVERAGE
         if usdt < required_margin * 1.01:
@@ -5226,17 +5270,9 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             return None
 
         if not PAPER_MODE:
-            if stop_loss is None or not math.isfinite(float(stop_loss)) or float(stop_loss) <= 0:
-                log_execution("[LIVE_SAFETY] Refusing LIVE entry without a valid structural stop", "ERROR")
-                return None
-            stop_value = float(stop_loss)
-            if (side == "BUY" and stop_value >= price) or (side == "SELL" and stop_value <= price):
-                log_execution(f"[LIVE_SAFETY] Structural SL is on the wrong side: side={side} entry={price} SL={stop_value}", "ERROR")
-                return None
-            if not PAPER_MODE:
-                try:
-                    BINGX_API_RELIABILITY.assert_new_entry_allowed()
-                except Exception as exc:
+            try:
+                BINGX_API_RELIABILITY.assert_new_entry_allowed()
+            except Exception as exc:
                     log_execution(
                         f"[ENTRY_API_COOLDOWN] blocked at final pre-submit boundary: {type(exc).__name__}: {exc}",
                         "WARN",
@@ -5252,6 +5288,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
                 structural_stop=stop_value, trade_id=str(trade_id or STATE.get("trade_id") or uuid.uuid4().hex),
                 management_state=management_state,
+                risk_budget_usdt=sizing.max_risk_usdt,
             )
             if result.state not in {ExecutionState.FILLED, ExecutionState.PARTIAL_FILL}:
                 pending = result.submission_attempted and result.state in {
@@ -12365,7 +12402,7 @@ def execute_entry(*args, **kwargs):
 # open_position is the final order-submission boundary. Keep a second hosted-only
 # guard here so an alternate caller cannot bypass the execute_entry readiness gate.
 _original_open_position_hosted = open_position
-def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
+def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None, risk_budget_usdt=None):
     if HOSTED_RUNTIME_REQUIRED and not hosted_runtime_is_ready():
         log_execution(
             "[HOSTED_GATE] Order submission blocked: runtime readiness checks are incomplete",
@@ -12374,7 +12411,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         return None
     return _original_open_position_hosted(
         side, amount, symbol, stop_loss=stop_loss, trade_id=trade_id,
-        management_state=management_state
+        management_state=management_state, risk_budget_usdt=risk_budget_usdt
     )
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
