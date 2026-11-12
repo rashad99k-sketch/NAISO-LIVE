@@ -5193,6 +5193,15 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             if (side == "BUY" and stop_value >= price) or (side == "SELL" and stop_value <= price):
                 log_execution(f"[LIVE_SAFETY] Structural SL is on the wrong side: side={side} entry={price} SL={stop_value}", "ERROR")
                 return None
+            if not PAPER_MODE:
+                try:
+                    BINGX_API_RELIABILITY.assert_new_entry_allowed()
+                except Exception as exc:
+                    log_execution(
+                        f"[ENTRY_API_COOLDOWN] blocked at final pre-submit boundary: {type(exc).__name__}: {exc}",
+                        "WARN",
+                    )
+                    return None
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
