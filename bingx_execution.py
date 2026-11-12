@@ -787,7 +787,7 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self._read(raw_method, {"symbol": market_id, "type": native_type})))
                 except Exception:
                     continue
         seen = set()
@@ -841,7 +841,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self._read(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                         ok = True
@@ -853,7 +853,7 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self._read(raw_method, {"symbol": market_id, "type": native_type})))
                     ok = True
                 except Exception:
                     continue
@@ -1003,7 +1003,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self._read(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                 except Exception:
@@ -1012,7 +1012,7 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self._read(raw_method, {"symbol": market_id, "type": native_type})))
                 except Exception:
                     continue
         count = 0
