@@ -148,12 +148,20 @@ class BingXApiReliability:
         kind = self.classify(exc)
         retry_after = self._retry_after(exc)
         if kind == "BAN":
+            with self._lock:
+                self._stats["banned"] += 1
             self._set_cooldown(max(self.ban_cooldown, retry_after or 0.0), f"HTTP_418_BAN:{method_name}")
         elif kind == "RATE_LIMIT":
+            with self._lock:
+                self._stats["rate_limited"] += 1
             self._set_cooldown(max(self.rate_limit_cooldown, retry_after or 0.0), f"BINGX_RATE_LIMIT:{method_name}")
         elif kind == "SYSTEM_BUSY":
+            with self._lock:
+                self._stats["system_busy"] += 1
             self._set_cooldown(max(self.system_busy_cooldown, retry_after or 0.0), f"BINGX_109500:{method_name}")
         elif kind == "RISK_CONTROL":
+            with self._lock:
+                self._stats["risk_control"] += 1
             self._set_cooldown(max(self.risk_control_cooldown, retry_after or 0.0), f"BINGX_RISK_CONTROL:{method_name}")
         return kind
 
