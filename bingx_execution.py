@@ -267,15 +267,24 @@ class TradeExecutionService:
     """Single order gateway with no blind MARKET retries and fail-closed verification."""
 
     def __init__(self, exchange: Any, journal: Any = None, logger: Optional[Callable[[str], None]] = None,
-                 api_call: Optional[Callable[..., Any]] = None):
+                 api_call: Optional[Callable[..., Any]] = None,
+                 api_error_handler: Optional[Callable[[BaseException, str], Any]] = None):
         self.exchange = exchange
         self.journal = journal
         self.logger = logger or (lambda _message: None)
         self.api_call = api_call
+        self.api_error_handler = api_error_handler
         self.mode_adapter = BingXPositionModeAdapter(exchange, logger=self.logger, api_call=api_call)
 
     def _read(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return self.api_call(method, *args, **kwargs) if self.api_call else method(*args, **kwargs)
+
+    def _observe_api_error(self, exc: BaseException, method_name: str) -> None:
+        if callable(self.api_error_handler):
+            try:
+                self.api_error_handler(exc, method_name)
+            except Exception as handler_exc:
+                self.logger(f"API error observer failed for {method_name}: {type(handler_exc).__name__}: {handler_exc}")
 
     def _persist_pending(self, **fields: Any) -> None:
         if self.journal is not None and hasattr(self.journal, "persist_entry_pending"):
@@ -463,6 +472,7 @@ class TradeExecutionService:
             if observed is None or abs(observed - float(leverage)) > 1e-9:
                 raise RuntimeError(f"leverage read-back mismatch: {observed!r}")
         except Exception as exc:
+            self._observe_api_error(exc, "set_leverage_or_readback")
             return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
                                    requested_qty=requested, position_mode=mode_result.mode.value,
                                    position_side=params["positionSide"],
@@ -486,6 +496,7 @@ class TradeExecutionService:
         try:
             order = self.exchange.create_order(symbol, "market", side.lower(), requested, None, params)
         except Exception as exc:
+            self._observe_api_error(exc, "create_order")
             reconciled = self._find_order(symbol, None, client_order_id)
             if reconciled is None:
                 return ExecutionResult(ExecutionState.EXECUTION_UNCERTAIN, trade_id, client_order_id,
