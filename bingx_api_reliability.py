@@ -131,6 +131,16 @@ class BingXApiReliability:
         with self._lock:
             return max(0.0, self._cooldown_until - self._clock())
 
+    def assert_new_entry_allowed(self) -> None:
+        """Block only new entries during an API circuit cooldown; exits/protection bypass this gate."""
+        remaining = self._cooldown_remaining()
+        if remaining > 0:
+            with self._lock:
+                reason = self._cooldown_reason
+            raise ApiCooldownError(
+                f"new entry blocked by BingX API cooldown ({remaining:.2f}s remaining; reason={reason})"
+            )
+
     def _set_cooldown(self, seconds: float, reason: str) -> None:
         until = self._clock() + max(0.0, seconds)
         with self._lock:
@@ -193,23 +203,29 @@ class BingXApiReliability:
                     if kind == "BAN":
                         with self._lock:
                             self._stats["banned"] += 1
-                        self._set_cooldown(self.ban_cooldown, "HTTP_418_BAN")
-                        self._logger(f"[BINGX_API] HTTP 418 ban detected; read circuit paused for {self.ban_cooldown:.0f}s")
+                        retry_after = self._retry_after(exc)
+                        cooldown = max(self.ban_cooldown, retry_after or 0.0)
+                        self._set_cooldown(min(cooldown, 3600.0), "HTTP_418_BAN")
+                        self._logger(f"[BINGX_API] HTTP 418 ban detected; API circuit paused for {min(cooldown, 3600.0):.0f}s")
                         raise
                     if kind == "SYSTEM_BUSY":
                         with self._lock:
                             self._stats["system_busy"] += 1
-                        self._set_cooldown(self.system_busy_cooldown, "BINGX_109500_SYSTEM_BUSY")
+                        retry_after = self._retry_after(exc)
+                        cooldown = max(self.system_busy_cooldown, retry_after or 0.0)
+                        self._set_cooldown(min(cooldown, 3600.0), "BINGX_109500_SYSTEM_BUSY")
                         self._logger(
-                            f"[BINGX_API] 109500 system busy; reads paused for {self.system_busy_cooldown:.0f}s"
+                            f"[BINGX_API] 109500 system busy; reads paused for {min(cooldown, 3600.0):.0f}s"
                         )
                         raise
                     if kind == "RISK_CONTROL":
                         with self._lock:
                             self._stats["risk_control"] += 1
-                        self._set_cooldown(self.risk_control_cooldown, "BINGX_RISK_CONTROL")
+                        retry_after = self._retry_after(exc)
+                        cooldown = max(self.risk_control_cooldown, retry_after or 0.0)
+                        self._set_cooldown(min(cooldown, 3600.0), "BINGX_RISK_CONTROL")
                         self._logger(
-                            f"[BINGX_API] risk-control response; reads paused for {self.risk_control_cooldown:.0f}s"
+                            f"[BINGX_API] risk-control response; reads paused for {min(cooldown, 3600.0):.0f}s"
                         )
                         raise
                     if kind == "RATE_LIMIT":
