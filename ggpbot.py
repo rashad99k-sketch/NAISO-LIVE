@@ -5002,7 +5002,7 @@ def update_stats(pnl_pct):
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
 def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
-    global _ACTIVE_TRADE
+    global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
     sym = normalize_symbol(symbol)
     side = str(side or "").upper()
     if side not in ("BUY", "SELL"):
@@ -5137,6 +5137,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                               "position_mode": result.position_mode,
                               "position_side": result.position_side,
                               "trade_id": str(trade_id or STATE.get("trade_id") or result.trade_id)})
+                RECOVERY_BLOCK_ENTRIES = True
                 log_execution("[LIVE_SAFETY] Native STOP_MARKET could not be verified; filled exposure retained in RECOVERY_HOLD", "ERROR")
         else:
             order = safe_api_call(ex.create_order, sym, "market", side.lower(), amount, params={})
@@ -11332,7 +11333,8 @@ def _pending_entry_hold(row, *, position_status="UNKNOWN", reason="ENTRY_PENDING
         "entry_execution_state": str(row.get("status") or "ENTRY_PENDING"),
     })
     if not STATE.get("open"):
-        _ACTIVE_TRADE = True
+        with _TRADE_LOCK:
+            _ACTIVE_TRADE = True
         if symbol:
             STATE["current_symbol"] = symbol
     MEMORY["position_status"] = position_status
