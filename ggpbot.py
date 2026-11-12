@@ -29,6 +29,8 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
+from bingx_api_reliability import BingXApiReliability
+
 # Load project-local configuration safely. PAPER mode remains the default.
 ENV_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE_PATH = os.path.join(ENV_DIR, ".env")
@@ -564,51 +566,48 @@ def cache_set(key, value):
                 CACHE.pop(old_key, None)
 
 def safe_api_call(func, *args, **kwargs):
-    # Order creation is non-idempotent. Never automatically retry a timed-out
-    # create_order call: BingX may have accepted the first request already.
-    is_order_write = getattr(func, "__name__", "") in {"create_order", "create_market_order", "create_limit_order"}
-    if is_order_write:
-        rate_limit()
+    """Centralized API policy: bounded retries for reads; all writes are one-shot."""
+    name = str(getattr(func, "__name__", ""))
+    is_order_write = name in {"create_order", "create_market_order", "create_limit_order"}
+    is_read = BINGX_API_RELIABILITY.is_read_method(name)
+
+    if is_read:
         try:
-            return func(*args, **kwargs)
+            return BINGX_API_RELIABILITY.call_read(func, *args, before_call=rate_limit, **kwargs)
         except Exception as exc:
-            try:
-                if "STATE" in globals():
-                    STATE["execution_unresolved"] = True
-                if "MEMORY" in globals():
-                    MEMORY["recovery_status"] = "ORDER_SUBMISSION_UNCERTAIN"
-                if "RECOVERY_BLOCK_ENTRIES" in globals():
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                if "log_execution" in globals():
-                    log_execution(f"[ORDER_UNCERTAIN] {getattr(func, '__name__', 'order')} raised {type(exc).__name__}: {exc}; no automatic retry; exchange reconciliation required", "ERROR")
-            except Exception:
-                pass
-            raise
-    for attempt in range(3):
-        try:
-            rate_limit()
-            return func(*args, **kwargs)
-        except Exception as e:
-            if "rate limit" in str(e).lower() or "100410" in str(e):
+            kind = BingXApiReliability.classify(exc)
+            if kind == "RATE_LIMIT":
                 _LAST_API_RATE_LIMIT.update({
-                    "ts": time.time(),
-                    "method": getattr(func, "__name__", "exchange_call"),
-                    "message": str(e)[:180],
+                    "ts": time.time(), "method": name, "message": str(exc)[:180],
                 })
-                wait = min(8, 2 ** attempt)
                 try:
                     log_execution(
-                        f"[API_BACKOFF] {getattr(func, '__name__', 'exchange_call')} rate-limited; retry in {wait}s",
-                        "WARN", debounce_key=f"api_backoff_{getattr(func, '__name__', 'call')}", debounce_sec=30
+                        f"[API_BACKOFF] {name} rate-limited; no unbounded retry; "
+                        f"cooldown={BINGX_API_RELIABILITY.snapshot()['cooldown_remaining']:.2f}s",
+                        "WARN", debounce_key=f"api_backoff_{name}", debounce_sec=30
                     )
                 except Exception:
                     pass
-                time.sleep(wait)
-                continue
-            if attempt == 2:
-                raise
-            time.sleep(1)
-    return None
+            raise
+
+    # Unknown methods and all write methods are never automatically replayed.
+    rate_limit()
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        if is_order_write:
+            try:
+                STATE["execution_unresolved"] = True
+                MEMORY["recovery_status"] = "ORDER_SUBMISSION_UNCERTAIN"
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                log_execution(
+                    f"[ORDER_UNCERTAIN] {name} raised {type(exc).__name__}: {exc}; "
+                    "no automatic retry; exchange reconciliation required",
+                    "ERROR",
+                )
+            except Exception:
+                pass
+        raise
 
 # ========== TELEGRAM ==========
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -791,6 +790,19 @@ ex = ccxt.bingx({
     "timeout": _env_int_range("EXCHANGE_HTTP_TIMEOUT_MS", 12000, 5000, 60000),
     "options": {"defaultType": "swap"}
 })
+
+# Shared read-side back-pressure. CCXT's own limiter remains enabled as a second layer.
+BINGX_API_RELIABILITY = BingXApiReliability(
+    max_attempts=2,
+    max_concurrent=4,
+    transient_delay=0.25,
+    rate_limit_cooldown=1.0,
+    ban_cooldown=60.0,
+    logger=lambda message: (
+        globals().get("log_execution", lambda *_a, **_k: None)(message, "WARN")
+        if callable(globals().get("log_execution")) else None
+    ),
+)
 
 def normalize_symbol(symbol):
     if not symbol.endswith(":USDT"):
@@ -5045,20 +5057,66 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
+                api_call=safe_api_call,
             )
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
                 structural_stop=stop_value, trade_id=str(trade_id or STATE.get("trade_id") or uuid.uuid4().hex),
                 management_state=management_state,
             )
-            if result.state not in {ExecutionState.FILLED}:
-                STATE.update({"execution_unresolved": result.state is ExecutionState.EXECUTION_UNCERTAIN,
-                              "recovery_hold": result.state is not ExecutionState.FILLED,
-                              "entry_execution_state": result.state.value,
-                              "entry_client_order_id": result.client_order_id,
-                              "entry_exchange_order_id": result.exchange_order_id})
-                log_execution(f"[LIVE_SAFETY] Entry not fully verified: {result.state.value} ({result.reason})", "ERROR")
+            if result.state not in {ExecutionState.FILLED, ExecutionState.PARTIAL_FILL}:
+                pending = result.submission_attempted and result.state in {
+                    ExecutionState.EXECUTION_UNCERTAIN,
+                    ExecutionState.ENTRY_PRICE_UNKNOWN,
+                    ExecutionState.PROTECTION_HOLD,
+                }
+                STATE.update({
+                    "execution_unresolved": bool(pending),
+                    "recovery_hold": bool(pending),
+                    "entry_pending": bool(pending),
+                    "entry_execution_state": result.state.value,
+                    "entry_trade_id": result.trade_id if pending else None,
+                    "entry_symbol": sym if pending else None,
+                    "entry_client_order_id": result.client_order_id if pending else None,
+                    "entry_exchange_order_id": result.exchange_order_id if pending else None,
+                    "current_symbol": sym if pending else STATE.get("current_symbol"),
+                })
+                if pending:
+                    RECOVERY_BLOCK_ENTRIES = True
+                    log_execution(
+                        f"[LIVE_SAFETY] Entry outcome unresolved; lock retained for exchange reconciliation: "
+                        f"{result.state.value} ({result.reason})",
+                        "ERROR",
+                    )
+                elif result.state is ExecutionState.REJECTED and result.order_terminal and result.filled_qty <= 0 and result.position_status == "FLAT":
+                    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+                    if journal and hasattr(journal, "finalize_entry_no_exposure"):
+                        journal.finalize_entry_no_exposure(result.trade_id, result.reason)
+                    log_execution(f"[LIVE_SAFETY] Entry rejected with terminal zero-fill proof: {result.reason}", "WARN")
+                else:
+                    log_execution(f"[LIVE_SAFETY] Entry rejected before exposure: {result.reason}", "ERROR")
                 return None
+            if result.state is ExecutionState.PARTIAL_FILL and not (
+                result.order_terminal and result.position_status == "OPEN" and result.filled_qty > 0
+            ):
+                STATE.update({
+                    "execution_unresolved": True, "recovery_hold": True, "entry_pending": True,
+                    "entry_execution_state": ExecutionState.EXECUTION_UNCERTAIN.value,
+                    "entry_trade_id": result.trade_id, "entry_symbol": sym,
+                    "entry_client_order_id": result.client_order_id,
+                    "entry_exchange_order_id": result.exchange_order_id,
+                    "current_symbol": sym,
+                })
+                RECOVERY_BLOCK_ENTRIES = True
+                log_execution("[LIVE_SAFETY] Partial fill lacks terminal order/position proof; entry lock retained", "ERROR")
+                return None
+            STATE.update({
+                "entry_pending": False, "execution_unresolved": False,
+                "entry_execution_state": result.state.value,
+                "entry_trade_id": result.trade_id, "entry_symbol": sym,
+                "entry_client_order_id": result.client_order_id,
+                "entry_exchange_order_id": result.exchange_order_id,
+            })
             native_sl_id = service.place_and_verify_native_stop(
                 symbol=sym, side=side, quantity=result.filled_qty,
                 trigger_price=stop_value, mode=PositionMode(result.position_mode),
@@ -5095,7 +5153,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         # Keep the entry lock held after a returned order; execute_entry adopts the
         # position state immediately after this function returns. Do not create a
         # concurrency window where a second entry can race the state update.
-        if order is None and not STATE.get("execution_unresolved"):
+        if order is None and not STATE.get("execution_unresolved") and not STATE.get("entry_pending"):
             with _TRADE_LOCK:
                 _ACTIVE_TRADE = False
     return None
@@ -11161,6 +11219,290 @@ def _attempt_runtime_trade_recovery(symbol, position=None, *, force=False):
         return _recovery_hold(f"runtime_recovery_exception:{type(exc).__name__}:{exc}", symbol=symbol)
 
 
+# ========== PENDING ENTRY RECONCILIATION ==========
+_PENDING_ENTRY_STATES = {
+    "ENTRY_PENDING", "EXECUTION_UNCERTAIN", "ENTRY_PRICE_UNKNOWN", "PROTECTION_HOLD",
+}
+_ENTRY_TERMINAL_STATES = {"CLOSED", "FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED", "DONE"}
+
+
+def _is_pending_entry_record(row):
+    if not isinstance(row, dict):
+        return False
+    status = str(row.get("status") or "").upper()
+    saved = row.get("state") if isinstance(row.get("state"), dict) else {}
+    return (
+        status in _PENDING_ENTRY_STATES
+        or bool(saved.get("entry_pending"))
+        or bool(saved.get("execution_unresolved"))
+    )
+
+
+def _entry_order_status(order):
+    if not isinstance(order, dict):
+        return "UNKNOWN"
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    return str(order.get("status") or order.get("state") or info.get("status")
+               or info.get("orderStatus") or "UNKNOWN").upper()
+
+
+def _entry_order_filled(order):
+    if not isinstance(order, dict):
+        return 0.0
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    for value in (order.get("filled"), order.get("executedQty"), order.get("cumExecQty"),
+                  info.get("executedQty"), info.get("cumExecQty"), info.get("filled")):
+        try:
+            qty = abs(float(value))
+            if math.isfinite(qty):
+                return qty
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return 0.0
+
+
+def _entry_order_price(order):
+    if not isinstance(order, dict):
+        return None
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    for value in (order.get("average"), order.get("avgPrice"), info.get("avgPrice")):
+        try:
+            price = float(value)
+            if math.isfinite(price) and price > 0:
+                return price
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
+def _read_pending_entry_order(row):
+    if not isinstance(row, dict):
+        return None
+    fetch = getattr(ex, "fetch_order", None)
+    if callable(fetch):
+        ids = [
+            row.get("exchange_order_id"),
+            STATE.get("entry_exchange_order_id") if str(STATE.get("entry_trade_id") or "") == str(row.get("trade_id") or "") else None,
+            row.get("client_order_id"),
+        ]
+        symbol = normalize_symbol(str(row.get("symbol") or STATE.get("entry_symbol") or DEFAULT_SYMBOL))
+        for order_id in dict.fromkeys(str(value) for value in ids if value not in (None, "")):
+            try:
+                try:
+                    found = safe_api_call(fetch, order_id, symbol, {"clientOrderId": row.get("client_order_id")})
+                except TypeError:
+                    found = safe_api_call(fetch, order_id, symbol)
+                if isinstance(found, dict) and found:
+                    return found
+            except Exception as exc:
+                log_execution(
+                    f"[ENTRY_RECOVERY] Order read-back failed for {row.get('trade_id')}: "
+                    f"{type(exc).__name__}: {exc}",
+                    "WARN", debounce_key=f"entry_order_read_{row.get('trade_id')}", debounce_sec=30
+                )
+    fetch_open = getattr(ex, "fetch_open_orders", None)
+    if callable(fetch_open) and row.get("client_order_id"):
+        try:
+            try:
+                orders = safe_api_call(fetch_open, normalize_symbol(str(row.get("symbol") or DEFAULT_SYMBOL)))
+            except TypeError:
+                orders = safe_api_call(
+                    fetch_open, normalize_symbol(str(row.get("symbol") or DEFAULT_SYMBOL)),
+                    None, None, {"clientOrderId": row.get("client_order_id")}
+                )
+            for order in orders if isinstance(orders, list) else []:
+                info = order.get("info") if isinstance(order.get("info"), dict) else {}
+                client_id = order.get("clientOrderId") or info.get("clientOrderId") or info.get("clientOrderID")
+                if str(client_id or "") == str(row.get("client_order_id")):
+                    return order
+        except Exception as exc:
+            log_execution(f"[ENTRY_RECOVERY] Open-order fallback failed: {exc}", "WARN")
+    return None
+
+
+def _pending_entry_hold(row, *, position_status="UNKNOWN", reason="ENTRY_PENDING_UNRESOLVED"):
+    global RECOVERY_BLOCK_ENTRIES, _ACTIVE_TRADE
+    trade_id = str(row.get("trade_id") or STATE.get("entry_trade_id") or "")
+    symbol = str(row.get("symbol") or STATE.get("entry_symbol") or STATE.get("current_symbol") or "")
+    STATE.update({
+        "entry_pending": True, "execution_unresolved": True, "recovery_hold": True,
+        "entry_trade_id": trade_id or None, "entry_symbol": symbol or None,
+        "entry_client_order_id": row.get("client_order_id") or STATE.get("entry_client_order_id"),
+        "entry_exchange_order_id": row.get("exchange_order_id") or STATE.get("entry_exchange_order_id"),
+        "entry_execution_state": str(row.get("status") or "ENTRY_PENDING"),
+    })
+    if not STATE.get("open"):
+        _ACTIVE_TRADE = True
+        if symbol:
+            STATE["current_symbol"] = symbol
+    MEMORY["position_status"] = position_status
+    MEMORY["recovery_status"] = "ENTRY_PENDING_UNRESOLVED"
+    RECOVERY_BLOCK_ENTRIES = True
+    log_execution(
+        f"[ENTRY_RECOVERY] {trade_id or 'unknown'} remains blocked: {reason}; "
+        f"exchange_position={position_status}",
+        "ERROR", debounce_key=f"pending_entry_{trade_id or 'unknown'}", debounce_sec=15
+    )
+    return "UNRESOLVED"
+
+
+def _finalize_pending_entry_no_exposure(row, reason):
+    global RECOVERY_BLOCK_ENTRIES, _ACTIVE_TRADE
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    trade_id = str(row.get("trade_id") or "")
+    if not journal or not hasattr(journal, "finalize_entry_no_exposure"):
+        return _pending_entry_hold(row, position_status="FLAT", reason="trade journal finalizer unavailable")
+    finalized = journal.finalize_entry_no_exposure(trade_id, reason)
+    if not finalized:
+        current = journal.get(trade_id) if hasattr(journal, "get") else None
+        if not (isinstance(current, dict) and current.get("finalized") and current.get("status") == "REJECTED"):
+            return _pending_entry_hold(row, position_status="FLAT", reason="zero-exposure journal finalization failed")
+    STATE.update({
+        "entry_pending": False, "execution_unresolved": False, "recovery_hold": False,
+        "entry_execution_state": "REJECTED", "entry_trade_id": None,
+        "entry_symbol": None, "entry_client_order_id": None, "entry_exchange_order_id": None,
+    })
+    with _TRADE_LOCK:
+        _ACTIVE_TRADE = False
+    MEMORY["position_status"] = "FLAT"
+    MEMORY["current_position"] = None
+    MEMORY["recovery_status"] = "ENTRY_REJECTED_NO_EXPOSURE"
+    RECOVERY_BLOCK_ENTRIES = False
+    log_execution(
+        f"[ENTRY_RECOVERY] {trade_id} finalized as REJECTED: terminal order and exchange FLAT verified; {reason}",
+        "WARN"
+    )
+    return "NO_EXPOSURE"
+
+
+def _reconcile_pending_entry_record(row, exchange_status, positions):
+    """Resolve a journaled pending entry only from terminal order + exchange evidence."""
+    if exchange_status not in {"OPEN", "FLAT"}:
+        return _pending_entry_hold(row, position_status=exchange_status, reason="exchange position state is not authoritative")
+    order = _read_pending_entry_order(row)
+    if not isinstance(order, dict):
+        return _pending_entry_hold(row, position_status=exchange_status, reason="original order cannot be read back")
+    order_status = _entry_order_status(order)
+    filled = _entry_order_filled(order)
+    if order_status not in _ENTRY_TERMINAL_STATES:
+        return _pending_entry_hold(
+            row, position_status=exchange_status,
+            reason=f"original order remains non-terminal ({order_status}); no replacement MARKET order sent",
+        )
+    requested = safe_float(row.get("requested_qty"), safe_float(row.get("entry_qty"), 0.0))
+    tolerance = max(requested * 0.002, 1e-10)
+    if filled <= tolerance:
+        if exchange_status == "FLAT":
+            return _finalize_pending_entry_no_exposure(row, f"terminal_order={order_status};filled=0")
+        return _pending_entry_hold(row, position_status=exchange_status, reason="zero-fill order conflicts with open exchange exposure")
+
+    if exchange_status != "OPEN" or not isinstance(positions, (list, tuple)):
+        return _pending_entry_hold(row, position_status=exchange_status, reason="filled order has no matching open exchange position")
+    wanted_symbol = roro_canonical_symbol(str(row.get("symbol") or ""))
+    wanted_side = str(row.get("side") or "").upper()
+    matches = []
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        if roro_canonical_symbol(_position_symbol(position)) != wanted_symbol:
+            continue
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        raw_side = str(position.get("side") or info.get("positionSide") or info.get("side") or "").upper()
+        signed = info.get("positionAmt", position.get("positionAmt"))
+        try:
+            signed_value = float(signed) if signed not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            signed_value = 0.0
+        direction = (
+            "BUY" if raw_side in {"LONG", "BUY"} else
+            "SELL" if raw_side in {"SHORT", "SELL"} else
+            "BUY" if signed_value > 0 else "SELL" if signed_value < 0 else ""
+        )
+        if direction == wanted_side:
+            matches.append(position)
+    if len(matches) != 1:
+        return _pending_entry_hold(row, position_status=exchange_status, reason="matching exchange position side is missing or ambiguous")
+
+    position = matches[0]
+    position_qty = _position_contracts(position)
+    if position_qty <= 0 or abs(position_qty - filled) > max(filled * 0.002, 1e-10):
+        return _pending_entry_hold(
+            row, position_status=exchange_status,
+            reason=f"order/position quantity mismatch; order_filled={filled:.12g}; position_qty={position_qty:.12g}",
+        )
+    price = _entry_order_price(order)
+    if price is None:
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        price = safe_float(position.get("entryPrice") or position.get("average") or info.get("avgPrice"), 0.0) or None
+    if price is None or price <= 0:
+        try:
+            journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+            journal.record_execution(
+                str(row.get("trade_id")), exchange_order_id=str(order.get("id") or row.get("exchange_order_id") or ""),
+                filled_qty=filled, remaining_qty=max(0.0, requested-filled),
+                average_fill_price=None, actual_entry_price=None,
+                status="ENTRY_PRICE_UNKNOWN", recovery_status="ENTRY_PRICE_UNKNOWN",
+            )
+        except Exception:
+            pass
+        return _pending_entry_hold(row, position_status="OPEN", reason="filled exposure verified but entry price is unavailable")
+
+    state = "PARTIAL_FILL" if filled + tolerance < requested or order_status in {"CANCELED", "CANCELLED", "EXPIRED"} else "FILLED"
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not journal:
+        return _pending_entry_hold(row, position_status="OPEN", reason="journal unavailable for verified fill adoption")
+    try:
+        journal.record_execution(
+            str(row.get("trade_id")), exchange_order_id=str(order.get("id") or row.get("exchange_order_id") or ""),
+            filled_qty=filled, remaining_qty=max(0.0, requested-filled),
+            average_fill_price=price, actual_entry_price=price,
+            status=state, recovery_status="",
+        )
+    except Exception as exc:
+        return _pending_entry_hold(row, position_status="OPEN", reason=f"cannot persist verified fill: {exc}")
+    STATE.update({
+        "entry_pending": False, "execution_unresolved": False, "recovery_hold": True,
+        "entry_execution_state": state, "entry_trade_id": str(row.get("trade_id")),
+        "entry_symbol": str(row.get("symbol")), "entry_client_order_id": row.get("client_order_id"),
+        "entry_exchange_order_id": order.get("id") or row.get("exchange_order_id"),
+    })
+    MEMORY["position_status"] = "OPEN"
+    MEMORY["recovery_status"] = "ENTRY_FILL_RECONCILED"
+    RECOVERY_BLOCK_ENTRIES = True
+    return "EXPOSURE_READY"
+
+
+def _reconcile_pending_entries_before_releasing(exchange_status, positions):
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    rows = list(journal.open_trades()) if journal and hasattr(journal, "open_trades") else []
+    pending = [row for row in rows if _is_pending_entry_record(row)]
+    if not pending and STATE.get("entry_pending"):
+        synthetic = {
+            "trade_id": STATE.get("entry_trade_id"),
+            "symbol": STATE.get("entry_symbol") or STATE.get("current_symbol"),
+            "side": STATE.get("side"),
+            "client_order_id": STATE.get("entry_client_order_id"),
+            "exchange_order_id": STATE.get("entry_exchange_order_id"),
+            "status": STATE.get("entry_execution_state") or "ENTRY_PENDING",
+        }
+        return _pending_entry_hold(synthetic, position_status=exchange_status, reason="pending entry has no durable journal row")
+    if not pending:
+        return "NO_PENDING"
+    if len(pending) != 1:
+        return _pending_entry_hold(pending[0], position_status=exchange_status, reason=f"{len(pending)} pending entry rows require manual reconciliation")
+    target_id = str(STATE.get("entry_trade_id") or "")
+    target_client = str(STATE.get("entry_client_order_id") or "")
+    row = pending[0]
+    for candidate in pending:
+        if target_id and str(candidate.get("trade_id") or "") == target_id:
+            row = candidate
+            break
+        if target_client and str(candidate.get("client_order_id") or "") == target_client:
+            row = candidate
+            break
+    return _reconcile_pending_entry_record(row, exchange_status, positions)
+
+
 def startup_trade_recovery():
     """Reconcile persisted journal with BingX before any fresh entry is permitted."""
     global RECOVERY_BLOCK_ENTRIES
@@ -11259,6 +11601,20 @@ def startup_trade_recovery():
         return False
     rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
     positions = positions or []
+    pending_rows = [row for row in rows if _is_pending_entry_record(row)]
+    if pending_rows:
+        pending_outcome = _reconcile_pending_entries_before_releasing(status, positions)
+        if pending_outcome == "UNRESOLVED":
+            MEMORY["recovery_status"] = "ENTRY_PENDING_UNRESOLVED"
+            return False
+        if pending_outcome == "EXPOSURE_READY":
+            rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
+        elif pending_outcome == "NO_EXPOSURE":
+            rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
+        else:
+            MEMORY["recovery_status"] = "ENTRY_PENDING_UNRESOLVED"
+            RECOVERY_BLOCK_ENTRIES = True
+            return False
     if status == "FLAT":
         for row in rows:
             try:
@@ -11476,6 +11832,12 @@ def sync_all_states():
         sync_position_state(symbol)
     else:
         status, positions = fetch_position_tri_state(None)
+        pending_outcome = _reconcile_pending_entries_before_releasing(status, positions)
+        if pending_outcome == "UNRESOLVED":
+            return
+        if pending_outcome == "EXPOSURE_READY":
+            startup_trade_recovery()
+            return
         if status == "UNKNOWN":
             MEMORY["position_status"] = "UNKNOWN"
             MEMORY["current_position"] = None
@@ -11484,9 +11846,10 @@ def sync_all_states():
             MEMORY["position_status"] = "FLAT"
             MEMORY["current_position"] = None
             # Confirmed flat resolves an ambiguous order write without fabricating a fill.
-            STATE["execution_unresolved"] = False
-            STATE["recovery_hold"] = False
-            RECOVERY_BLOCK_ENTRIES = False
+            if not STATE.get("entry_pending"):
+                STATE["execution_unresolved"] = False
+                STATE["recovery_hold"] = False
+                RECOVERY_BLOCK_ENTRIES = False
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]

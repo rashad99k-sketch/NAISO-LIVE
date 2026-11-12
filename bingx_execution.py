@@ -461,7 +461,7 @@ class TradeExecutionService:
                 position_side=(position_side if mode_result.mode is PositionMode.HEDGE else None),
             )
             if observed is None or abs(observed - float(leverage)) > 1e-9:
-                raise RuntimeError(f"configured leverage mismatch: expected={leverage} observed={observed!r}")
+                raise RuntimeError(f"leverage read-back mismatch: {observed!r} (configured expected={leverage})")
         except Exception as exc:
             return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
                                    requested_qty=requested, position_mode=mode_result.mode.value,
@@ -668,7 +668,7 @@ class TradeExecutionService:
             if callable(raw_method):
                 for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                     try:
-                        raw = raw_method({"symbol": market_id, "type": native_type})
+                        raw = self._read(raw_method, {"symbol": market_id, "type": native_type})
                         rows.extend(extract_open_order_records(raw))
                     except Exception as exc:
                         self.logger(f"native stop {native_type} read-back attempt={attempt} failed: {type(exc).__name__}: {exc}")
@@ -721,7 +721,7 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self._read(raw_method, {"symbol": market_id, "type": native_type})))
                 except Exception:
                     continue
         want_symbol = str(symbol).upper().replace("/", "-").split(":")[0]
@@ -778,7 +778,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self._read(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                 except Exception:
@@ -925,7 +925,7 @@ class TradeExecutionService:
             return False, "precheck_invalid_new_trigger_price"
         # Position identity must be provable from the exchange.
         try:
-            rows = self.exchange.fetch_positions([symbol])
+            rows = self._read(self.exchange.fetch_positions, [symbol])
         except Exception as exc:
             return False, f"precheck_position_read_failed:{type(exc).__name__}"
         if not isinstance(rows, list):
@@ -964,7 +964,7 @@ class TradeExecutionService:
         # Market price for directional sanity of the new stop.
         mark = 0.0
         try:
-            ticker = self.exchange.fetch_ticker(symbol)
+            ticker = self._read(self.exchange.fetch_ticker, symbol)
             if isinstance(ticker, dict):
                 mark = _first_number(ticker.get("last"), ticker.get("close")) or 0.0
         except Exception:
