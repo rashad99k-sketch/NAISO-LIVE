@@ -744,6 +744,130 @@ def test_entry_pending_without_fill_evidence_still_holds(tmp_path, monkeypatch):
     assert ggpbot.STATE["recovery_hold"] is True
 
 
+
+def _seed_zero_fill_entry_journal(tmp_path, *, trade_id="T-PENDING"):
+    journal = TradeJournal(str(Path(tmp_path) / "pending-entry.sqlite3"))
+    journal.persist_entry_pending(
+        trade_id=trade_id, client_order_id="GGP-PENDING", symbol="BTC/USDT:USDT",
+        side="BUY", position_mode="HEDGE", position_side="LONG", leverage=20,
+        requested_qty=2.0, entry_ts=time.time(), status="ENTRY_PENDING",
+        structural_stop=95.0,
+        management_state={"trade_id": trade_id, "current_symbol": "BTC/USDT:USDT",
+                          "side": "BUY", "sl": 95.0, "synthetic_sl": 95.0,
+                          "native_sl_original_price": 95.0, "tp1_price": 105.0,
+                          "tp2_price": 110.0, "initial_qty": 2.0, "qty": 2.0,
+                          "remaining_qty": 2.0},
+    )
+    return journal, trade_id
+
+
+def _set_pending_entry_state(trade_id="T-PENDING", *, client_order_id="GGP-PENDING",
+                             order_id="E-PENDING"):
+    ggpbot.STATE.update({
+        "open": False, "recovery_hold": True, "execution_unresolved": True,
+        "entry_pending": True, "entry_trade_id": trade_id,
+        "entry_client_order_id": client_order_id, "entry_exchange_order_id": order_id,
+        "entry_execution_state": "EXECUTION_UNCERTAIN",
+        "entry_symbol": "BTC/USDT:USDT", "current_symbol": "BTC/USDT:USDT",
+    })
+    ggpbot._ACTIVE_TRADE = True
+    ggpbot.RECOVERY_BLOCK_ENTRIES = True
+
+
+def test_flat_does_not_release_unresolved_entry_without_terminal_order(tmp_path, monkeypatch):
+    journal, trade_id = _seed_zero_fill_entry_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    ex = MockExchange(position=None, entry_order={
+        "id": "E-PENDING", "clientOrderId": "GGP-PENDING",
+        "status": "open", "filled": 0.0, "remaining": 2.0,
+    })
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    _set_pending_entry_state(trade_id)
+    ggpbot.sync_all_states()
+    assert ggpbot.MEMORY["position_status"] == "FLAT"
+    assert ggpbot.STATE["entry_pending"] is True
+    assert ggpbot.STATE["execution_unresolved"] is True
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot._ACTIVE_TRADE is True
+    assert journal.get(trade_id)["finalized"] == 0
+
+
+def test_flat_terminal_zero_fill_releases_entry_lock_and_finalizes_rejection(tmp_path, monkeypatch):
+    journal, trade_id = _seed_zero_fill_entry_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    ex = MockExchange(position=None, entry_order={
+        "id": "E-PENDING", "clientOrderId": "GGP-PENDING",
+        "status": "canceled", "filled": 0.0, "remaining": 2.0,
+    })
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    _set_pending_entry_state(trade_id)
+    ggpbot.sync_all_states()
+    row = journal.get(trade_id)
+    assert row["finalized"] == 1
+    assert row["status"] == "REJECTED"
+    assert row["close_reason"] == "ENTRY_REJECTED_NO_EXPOSURE"
+    assert ggpbot.STATE["entry_pending"] is False
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["recovery_hold"] is False
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
+    assert ggpbot._ACTIVE_TRADE is False
+
+
+def test_startup_flat_does_not_misclassify_pending_order_as_external_close(tmp_path, monkeypatch):
+    journal, trade_id = _seed_zero_fill_entry_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    ex = MockExchange(position=None, entry_order={
+        "id": "E-PENDING", "clientOrderId": "GGP-PENDING",
+        "status": "open", "filled": 0.0, "remaining": 2.0,
+    })
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    assert ggpbot.startup_trade_recovery() is False
+    row = journal.get(trade_id)
+    assert row["finalized"] == 0
+    assert row["status"] == "ENTRY_PENDING"
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot.MEMORY["recovery_status"] == "ENTRY_PENDING_UNRESOLVED"
+
+
+def test_startup_finalizes_terminal_zero_fill_pending_entry_as_rejected(tmp_path, monkeypatch):
+    journal, trade_id = _seed_zero_fill_entry_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    ex = MockExchange(position=None, entry_order={
+        "id": "E-PENDING", "clientOrderId": "GGP-PENDING",
+        "status": "rejected", "filled": 0.0, "remaining": 2.0,
+    })
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    assert ggpbot.startup_trade_recovery() is True
+    row = journal.get(trade_id)
+    assert row["finalized"] == 1
+    assert row["status"] == "REJECTED"
+    assert row["close_reason"] == "ENTRY_REJECTED_NO_EXPOSURE"
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
+
+
+def test_unresolved_entry_blocks_candidate_iteration(monkeypatch):
+    monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", lambda: None)
+    _fresh_state()
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.MEMORY["position_status"] = "FLAT"
+    ggpbot.STATE.update({"entry_pending": True, "execution_unresolved": True,
+                         "recovery_hold": True})
+    ggpbot.MEMORY["watchlist"] = {
+        "BTC/USDT": {"decision_state": "ENTRY_READY", "side": "BUY", "score": 99,
+                     "exchange_symbol": "BTC/USDT:USDT"}
+    }
+    calls = []
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame",
+                        lambda symbol: calls.append(symbol))
+    assert ggpbot.smart_opportunity_selection() is False
+    assert calls == []
+
+
 # --------------------------------------------------------------------------- #
 # Native-stop replacement gateway (direct, with mock exchange)
 # --------------------------------------------------------------------------- #
@@ -863,3 +987,33 @@ def test_restart_hedge_short_position_restores(tmp_path, monkeypatch):
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["side"] == "SELL"
     assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+
+
+def test_position_sync_malformed_rows_are_unknown_and_raw_size_prevents_false_flat(monkeypatch):
+    class PositionReadExchange:
+        def __init__(self, rows):
+            self.rows = rows
+        def fetch_positions(self, symbols=None):
+            return self.rows
+
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "ex", PositionReadExchange([{}]))
+    status, positions = ggpbot.fetch_position_tri_state()
+    assert status == "UNKNOWN"
+    assert positions is None
+
+    monkeypatch.setattr(ggpbot, "ex", PositionReadExchange([
+        {"symbol": "BTC/USDT:USDT", "contracts": 0.0, "info": {"positionAmt": "0"}}
+    ]))
+    status, positions = ggpbot.fetch_position_tri_state()
+    assert status == "FLAT"
+    assert positions == []
+
+    # Some CCXT parsers may expose a zero normalized contracts field while the
+    # raw BingX positionAmt still shows exposure; never let that become FLAT.
+    monkeypatch.setattr(ggpbot, "ex", PositionReadExchange([
+        {"symbol": "BTC/USDT:USDT", "contracts": 0.0, "info": {"positionAmt": "1"}}
+    ]))
+    status, positions = ggpbot.fetch_position_tri_state()
+    assert status == "OPEN"
+    assert positions[0]["info"]["positionAmt"] == "1"

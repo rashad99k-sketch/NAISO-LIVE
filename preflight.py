@@ -9,7 +9,8 @@ required = [
     "roro_institutional.py", "roro_opportunity_pipeline.py", "roro_confluence.py",
     "roro_resource_manager.py", "roro_trade_journal.py", "bingx_protection.py",
     "roro_config.py", "requirements.txt", ".env.example",
-    "RUN.bat", "RUN_WINDOWS.bat", "RUN_TESTS.bat",
+    "RUN.bat", "RUN_WINDOWS.bat", "RUN_TESTS.bat", "Procfile", ".python-version",
+    "HOSTED_DEPLOYMENT_AR.md", "test_hosted_runtime.py", "test_ggp_runtime_config.py",
 ]
 errors = []
 for rel in required:
