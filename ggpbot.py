@@ -5288,7 +5288,6 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
                 structural_stop=stop_value, trade_id=str(trade_id or STATE.get("trade_id") or uuid.uuid4().hex),
                 management_state=management_state,
-                risk_budget_usdt=sizing.max_risk_usdt,
             )
             if result.state not in {ExecutionState.FILLED, ExecutionState.PARTIAL_FILL}:
                 pending = result.submission_attempted and result.state in {
@@ -6163,7 +6162,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "trail_activated": False, "be_done": False,
     }
     order = open_position(side, qty, symbol, stop_loss=sl, trade_id=trade_id,
-                          management_state=pending_management_state)
+                          management_state=pending_management_state,
+                          risk_budget_usdt=sizing.max_risk_usdt)
     if order:
         actual_filled_qty = safe_float(order.get("filled"), 0.0)
         actual_entry_price = safe_float(order.get("average"), 0.0)
