@@ -15,6 +15,10 @@ import ggpbot
 def _reset_api_caches(monkeypatch):
     monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
     monkeypatch.setattr(ggpbot, "rate_limit", lambda: None)
+    monkeypatch.setattr(
+        ggpbot, "BINGX_API_RELIABILITY",
+        ggpbot.BingXApiReliability(sleep=lambda _seconds: None),
+    )
     with ggpbot._POSITION_FETCH_CACHE_LOCK:
         ggpbot._POSITION_FETCH_CACHE.clear()
     with ggpbot._REALIZED_PNL_CACHE_LOCK:
