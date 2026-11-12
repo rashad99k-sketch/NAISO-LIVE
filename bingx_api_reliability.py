@@ -173,6 +173,13 @@ class BingXApiReliability:
         with self._lock:
             self._cooldown_until = max(self._cooldown_until, until)
             self._cooldown_reason = str(reason)
+            self._recovery_probe_required = True
+
+    def _mark_recovery_probe_success(self) -> None:
+        with self._lock:
+            if self._recovery_probe_required and self._cooldown_until <= self._clock():
+                self._recovery_probe_required = False
+                self._cooldown_reason = ""
 
     def _pace_endpoint(self, method_name: str) -> None:
         interval = max(0.0, float(self.endpoint_min_intervals.get(method_name, 0.0)))
@@ -193,6 +200,7 @@ class BingXApiReliability:
             result = dict(self._stats)
             result["cooldown_remaining"] = max(0.0, self._cooldown_until - self._clock())
             result["cooldown_reason"] = self._cooldown_reason
+            result["recovery_probe_required"] = self._recovery_probe_required
             return result
 
     def call_read(
