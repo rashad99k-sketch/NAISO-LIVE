@@ -260,6 +260,49 @@ class TradeJournal:
             db.execute("COMMIT")
             return True
 
+    def finalize_entry_no_exposure(self, trade_id: str, reason: str) -> bool:
+        """Finalize a terminal zero-fill entry rejection without inventing a trade close."""
+        trade_id = str(trade_id or "")
+        if not trade_id:
+            return False
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT finalized, actual_filled_qty, state_json FROM trades WHERE trade_id=?",
+                (trade_id,),
+            ).fetchone()
+            if not row or row[0]:
+                db.execute("ROLLBACK")
+                return False
+            filled = max(0.0, float(row[1] or 0.0))
+            try:
+                saved_state = json.loads(row[2] or "{}")
+            except (TypeError, ValueError):
+                saved_state = {}
+            if isinstance(saved_state, dict):
+                try:
+                    filled = max(filled, float(saved_state.get("actual_filled_qty") or 0.0))
+                except (TypeError, ValueError):
+                    pass
+            if filled > 0:
+                db.execute("ROLLBACK")
+                return False
+            now = time.time()
+            close_reason = "ENTRY_REJECTED_NO_EXPOSURE"
+            db.execute(
+                """UPDATE trades SET status='REJECTED', close_ts=?, close_reason=?,
+                   close_confidence='EXCHANGE_CONFIRMED_NO_EXPOSURE', realized_pnl=NULL,
+                   finalized=1, remaining_qty=0, recovery_status='', updated_ts=?
+                   WHERE trade_id=? AND finalized=0""",
+                (now, close_reason, now, trade_id),
+            )
+            self.event(
+                trade_id, "entry-rejected-no-exposure", "ENTRY_REJECTED_NO_EXPOSURE",
+                {"reason": str(reason or "terminal zero-fill order"), "filled_qty": 0.0}, db=db,
+            )
+            db.execute("COMMIT")
+            return True
+
     def is_event_consumed(self, event_id: str) -> bool:
         if not event_id:
             return False
