@@ -620,6 +620,93 @@ def test_journal_survives_restart_and_reloads_state(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Trade-lock lifecycle: a lock is released only by safe full-close finalization
+# --------------------------------------------------------------------------- #
+def test_verified_full_close_finalizer_releases_active_trade_lock(monkeypatch):
+    _fresh_state()
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", True)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+    monkeypatch.setattr(ggpbot, "tg_close", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "clear_position_dashboard", lambda: None)
+    monkeypatch.setattr(ggpbot, "update_stats", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.MEMORY["position_status"] = "FLAT"
+    ggpbot.STATE.update({
+        "open": True, "close_verified": True, "current_symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 0.0, "initial_qty": 1.0,
+        "remaining_qty": 0.0, "exchange_qty": 0.0, "trade_id": None,
+        "entry_time": time.time(), "last_close_fill_price": 101.0,
+        "last_close_realized_pnl": 1.0, "last_close_pnl_source": "BINGX_ORDER_REALIZED_PNL",
+        "last_close_pnl_complete": True, "last_close_reason": "TEST_VERIFIED_CLOSE",
+        "execution_unresolved": False, "close_reconciliation_required": False,
+        "recovery_hold": False, "initial_margin": 5.0,
+    })
+    ggpbot.TRADE_STATE.update({"in_position": True, "symbol": "BTC/USDT:USDT"})
+    try:
+        result = ggpbot.finalize_trade_with_reality("BTC/USDT:USDT", "TEST_VERIFIED_CLOSE")
+        assert result[0] == pytest.approx(1.0)
+        assert result[1] == pytest.approx(20.0)
+        assert ggpbot.STATE["open"] is False
+        assert ggpbot.TRADE_STATE["in_position"] is False
+        assert ggpbot._ACTIVE_TRADE is False
+    finally:
+        ggpbot.RECOVERY_BLOCK_ENTRIES = False
+        ggpbot.MEMORY["position_status"] = "FLAT"
+        ggpbot._ACTIVE_TRADE = False
+
+
+@pytest.mark.parametrize("blocked_flag", [
+    "execution_unresolved", "close_reconciliation_required", "recovery_hold",
+])
+def test_verified_full_close_retains_lock_if_recovery_gate_remains(monkeypatch, blocked_flag):
+    _fresh_state()
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", True)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+    monkeypatch.setattr(ggpbot, "tg_close", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "clear_position_dashboard", lambda: None)
+    monkeypatch.setattr(ggpbot, "update_stats", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.MEMORY["position_status"] = "FLAT"
+    ggpbot.STATE.update({
+        "open": True, "close_verified": True, "current_symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 0.0, "initial_qty": 1.0,
+        "remaining_qty": 0.0, "exchange_qty": 0.0, "trade_id": None,
+        "entry_time": time.time(), "last_close_fill_price": 101.0,
+        "last_close_realized_pnl": 1.0, "last_close_pnl_source": "BINGX_ORDER_REALIZED_PNL",
+        "last_close_pnl_complete": True, "last_close_reason": "TEST_VERIFIED_CLOSE",
+        "execution_unresolved": False, "close_reconciliation_required": False,
+        "recovery_hold": False, "initial_margin": 5.0,
+    })
+    ggpbot.STATE[blocked_flag] = True
+    ggpbot.TRADE_STATE.update({"in_position": True, "symbol": "BTC/USDT:USDT"})
+    try:
+        ggpbot.finalize_trade_with_reality("BTC/USDT:USDT", "TEST_VERIFIED_CLOSE")
+        assert ggpbot.STATE["open"] is False
+        assert ggpbot._ACTIVE_TRADE is True
+    finally:
+        ggpbot.STATE[blocked_flag] = False
+        ggpbot.RECOVERY_BLOCK_ENTRIES = False
+        ggpbot.MEMORY["position_status"] = "FLAT"
+        ggpbot._ACTIVE_TRADE = False
+
+
+def test_open_position_reports_held_trade_lock_without_releasing_it(monkeypatch):
+    _fresh_state()
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)
+    messages = []
+    monkeypatch.setattr(ggpbot, "log_execution", lambda message, *args, **kwargs: messages.append(str(message)))
+    assert ggpbot.open_position("BUY", 1.0, "BTC/USDT:USDT") is None
+    assert ggpbot._ACTIVE_TRADE is True
+    assert any("[ENTRY_LOCKED]" in message for message in messages)
+
+
+# --------------------------------------------------------------------------- #
 # 16: no new entries while Recovery Hold is active
 # --------------------------------------------------------------------------- #
 def test_no_new_entry_during_recovery_hold(monkeypatch):
