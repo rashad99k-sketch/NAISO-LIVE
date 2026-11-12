@@ -8792,9 +8792,15 @@ def manual_close():
 
 @app.route("/health")
 def health():
+    # Liveness only: a temporary exchange outage must not cause the host to restart
+    # a process that may be managing an existing position.
+    runtime = hosted_runtime_snapshot()
     return jsonify({
         "ok": True,
+        "status": "alive",
+        "ready": runtime.get("ready", not HOSTED_RUNTIME_REQUIRED),
         "mode": "LIVE" if MODE_LIVE else "PAPER",
+        "runtime": runtime,
         "dashboard_ports": globals().get("DASHBOARD_ACTIVE_PORTS", []),
         "discovery_scanner": MEMORY.get("discovery_scanner", {}).get("state", "UNKNOWN"),
         "proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}).get("state", "UNKNOWN"),
@@ -8802,6 +8808,18 @@ def health():
         "trade_management_events": len(TRADE_MANAGEMENT_LOG),
         "telegram": {"configured": TELEGRAM_NOTIFIER.configured},
     })
+
+
+@app.route("/ready")
+def readiness():
+    runtime = hosted_runtime_snapshot()
+    ready = bool(runtime.get("ready", not HOSTED_RUNTIME_REQUIRED))
+    payload = {
+        "ready": ready,
+        "mode": "LIVE" if MODE_LIVE else "PAPER",
+        "runtime": runtime,
+    }
+    return jsonify(payload), (200 if ready else 503)
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
@@ -11924,11 +11942,33 @@ def sync_all_states():
 # Journal start/snapshot is tied to the existing GGP trade lifecycle, not a second manager.
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
+    if HOSTED_RUNTIME_REQUIRED and not hosted_runtime_is_ready():
+        log_execution(
+            "[HOSTED_GATE] Entry blocked: exchange connectivity/account read/recovery is not ready",
+            "WARN", debounce_key="hosted_entry_gate", debounce_sec=30
+        )
+        return None
     result = _original_execute_entry_for_journal(*args, **kwargs)
     if result and STATE.get("open"):
         ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
         _persist_trade_journal_start(ctx.get("setup_type"))
     return result
+
+
+# open_position is the final order-submission boundary. Keep a second hosted-only
+# guard here so an alternate caller cannot bypass the execute_entry readiness gate.
+_original_open_position_hosted = open_position
+def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
+    if HOSTED_RUNTIME_REQUIRED and not hosted_runtime_is_ready():
+        log_execution(
+            "[HOSTED_GATE] Order submission blocked: runtime readiness checks are incomplete",
+            "WARN", debounce_key="hosted_open_position_gate", debounce_sec=30
+        )
+        return None
+    return _original_open_position_hosted(
+        side, amount, symbol, stop_loss=stop_loss, trade_id=trade_id,
+        management_state=management_state
+    )
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):
@@ -11937,26 +11977,159 @@ def _manage_live_trade_with_journal(self):
     return result
 LiveTradeManager.manage_live_trade = _manage_live_trade_with_journal
 
+# Hosted runtimes need explicit exchange/account readiness, not merely an HTTP server.
+# A process stays alive during temporary BingX outages, but new entries are gated until
+# public market data, private account reads (LIVE), and journal/exchange recovery succeed.
+_HOSTED_MARKERS = ("RENDER", "RAILWAY_ENVIRONMENT", "DYNO", "FLY_APP_NAME")
+HOSTED_RUNTIME_REQUIRED = bool(str(os.getenv("PORT") or "").strip()) or _env_bool(
+    "HOSTED_RUNTIME_ENFORCE_PREFLIGHT", False
+) or any(bool(os.getenv(key)) for key in _HOSTED_MARKERS)
+HOSTED_PREFLIGHT_INTERVAL_SEC = _env_int_range("HOSTED_PREFLIGHT_INTERVAL_SEC", 60, 20, 300)
+RUNTIME_STATUS_LOCK = threading.RLock()
+RUNTIME_STATUS = {
+    "hosted": HOSTED_RUNTIME_REQUIRED,
+    "ready": not HOSTED_RUNTIME_REQUIRED,
+    "markets_loaded": False,
+    "account_read_ok": False if MODE_LIVE else True,
+    "position_read_status": "NOT_CHECKED",
+    "recovery_complete": False,
+    "last_check_ts": None,
+    "last_success_ts": None,
+    "last_error": None,
+}
+_HOSTED_MONITOR_STARTED = False
+
+
+def hosted_runtime_snapshot():
+    with RUNTIME_STATUS_LOCK:
+        return dict(RUNTIME_STATUS)
+
+
+def hosted_runtime_is_ready():
+    if not HOSTED_RUNTIME_REQUIRED:
+        return True
+    with RUNTIME_STATUS_LOCK:
+        return bool(RUNTIME_STATUS.get("ready"))
+
+
+def _hosted_runtime_probe_once():
+    # Public market metadata is required in both PAPER and LIVE modes.
+    if not RUNTIME_STATUS.get("markets_loaded"):
+        markets = safe_api_call(ex.load_markets)
+        if not isinstance(markets, dict) or not markets:
+            raise RuntimeError("BingX load_markets returned no market catalogue")
+        market_symbol = normalize_symbol(DEFAULT_SYMBOL)
+        market = markets.get(market_symbol)
+        if market is None:
+            market = ex.market(market_symbol)
+        if not isinstance(market, dict) or market.get("active") is False:
+            raise RuntimeError(f"Configured swap market is missing or inactive: {market_symbol}")
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["markets_loaded"] = True
+
+    if MODE_LIVE:
+        if not API_KEY or not API_SECRET:
+            raise RuntimeError("LIVE selected but BingX API key/secret are missing")
+        balance = safe_api_call(ex.fetch_balance)
+        if not isinstance(balance, dict):
+            raise RuntimeError("BingX private balance read did not return an object")
+        free = balance.get("free") if isinstance(balance.get("free"), dict) else {}
+        total = balance.get("total") if isinstance(balance.get("total"), dict) else {}
+        if "USDT" not in free and "USDT" not in total:
+            raise RuntimeError("BingX balance response has no normalized USDT free/total field")
+        position_status, _positions = fetch_position_tri_state(None)
+        if position_status == "UNKNOWN":
+            raise RuntimeError("BingX position endpoint is UNKNOWN; refusing to authorize entries")
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["account_read_ok"] = True
+            RUNTIME_STATUS["position_read_status"] = position_status
+    else:
+        ticker = safe_api_call(ex.fetch_ticker, normalize_symbol(DEFAULT_SYMBOL))
+        if not isinstance(ticker, dict) or safe_float(ticker.get("last"), 0.0) <= 0:
+            raise RuntimeError("BingX public ticker read is missing or invalid")
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["account_read_ok"] = True
+            RUNTIME_STATUS["position_read_status"] = "NOT_REQUIRED_PAPER"
+
+    if not RUNTIME_STATUS.get("recovery_complete"):
+        if not startup_trade_recovery():
+            raise RuntimeError(
+                str(MEMORY.get("recovery_status") or STATE.get("recovery_reason")
+                    or "trade journal/exchange recovery is unresolved")
+            )
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["recovery_complete"] = True
+
+    now = time.time()
+    with RUNTIME_STATUS_LOCK:
+        RUNTIME_STATUS.update({
+            "ready": True,
+            "last_check_ts": now,
+            "last_success_ts": now,
+            "last_error": None,
+        })
+    log_execution(
+        f"[HOSTED_READY] mode={'LIVE' if MODE_LIVE else 'PAPER'} "
+        f"markets=OK account_read={'OK' if MODE_LIVE else 'NOT_REQUIRED'} "
+        f"positions={RUNTIME_STATUS.get('position_read_status')} recovery=OK",
+        "SUCCESS", debounce_key="hosted_runtime_ready", debounce_sec=60
+    )
+
+
+def _hosted_runtime_monitor():
+    while True:
+        now = time.time()
+        try:
+            _hosted_runtime_probe_once()
+        except Exception as exc:
+            safe_error = f"{type(exc).__name__}: {str(exc)[:220]}"
+            with RUNTIME_STATUS_LOCK:
+                RUNTIME_STATUS.update({
+                    "ready": False,
+                    "last_check_ts": now,
+                    "last_error": safe_error,
+                })
+            log_execution(
+                f"[HOSTED_NOT_READY] {safe_error}; process remains alive, new entries are blocked",
+                "ERROR", debounce_key="hosted_runtime_not_ready", debounce_sec=30
+            )
+        time.sleep(HOSTED_PREFLIGHT_INTERVAL_SEC)
+
+
 # Start-up recovery must complete before Scanner can authorize a new order.
 _original_main_loop_sniper = main_loop_sniper
 def main_loop_sniper():
-    try:
-        if not PAPER_MODE:
-            try:
-                ex.load_markets()
-            except Exception as exc:
-                MEMORY["position_status"] = "UNKNOWN"
-                MEMORY["recovery_status"] = "MARKETS_UNAVAILABLE"
-                log_execution(f"[RECOVERY] Cannot load BingX markets before startup recovery: {exc}", "ERROR")
+    global _HOSTED_MONITOR_STARTED, RECOVERY_BLOCK_ENTRIES
+    if HOSTED_RUNTIME_REQUIRED:
+        try:
+            _hosted_runtime_probe_once()
+        except Exception as exc:
+            RECOVERY_BLOCK_ENTRIES = True
+            with RUNTIME_STATUS_LOCK:
+                RUNTIME_STATUS.update({
+                    "ready": False,
+                    "last_check_ts": time.time(),
+                    "last_error": f"{type(exc).__name__}: {str(exc)[:220]}",
+                })
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "HOSTED_PREFLIGHT_FAILED"
+            log_execution(
+                f"[HOSTED_STARTUP] Preflight incomplete; keeping service alive but blocking entries: {exc}",
+                "ERROR"
+            )
+        if not _HOSTED_MONITOR_STARTED:
+            _HOSTED_MONITOR_STARTED = True
+            threading.Thread(
+                target=_hosted_runtime_monitor, daemon=True, name="hosted_runtime_monitor"
+            ).start()
+    else:
+        try:
             startup_trade_recovery()
-        else:
-            startup_trade_recovery()
-    except Exception as exc:
-        global RECOVERY_BLOCK_ENTRIES
-        RECOVERY_BLOCK_ENTRIES = True
-        MEMORY["position_status"] = "UNKNOWN"
-        MEMORY["recovery_status"] = "STARTUP_RECOVERY_ERROR"
-        log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
+        except Exception as exc:
+            RECOVERY_BLOCK_ENTRIES = True
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "STARTUP_RECOVERY_ERROR"
+            log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
     return _original_main_loop_sniper()
 
 
@@ -11969,9 +12142,15 @@ DASHBOARD_ACTIVE_PORTS = []
 def start_dashboard_servers():
     """Start Flask dashboard before trading: local ports 8000+8080, hosted PORT only."""
     from werkzeug.serving import make_server
-    hosted_port = os.getenv("PORT")
+    hosted_port = str(os.getenv("PORT") or "").strip()
     if hosted_port:
-        ports = [int(hosted_port)]
+        try:
+            port = int(hosted_port)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Hosting provider supplied an invalid PORT value: {hosted_port!r}") from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"Hosting provider PORT is outside the valid TCP range: {port}")
+        ports = [port]
         bind_host = "0.0.0.0"
     else:
         raw_ports = os.getenv("DASHBOARD_LOCAL_PORTS", "8000,8080")
