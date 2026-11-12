@@ -17,6 +17,7 @@ def test_total_and_free_balance_are_read_from_one_exchange_snapshot(monkeypatch)
     exchange = FakeBalanceExchange()
     monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
     monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "safe_api_call", lambda func, *args, **kwargs: func(*args, **kwargs))
     ggpbot.CACHE.clear()
 
     snapshot = ggpbot.get_wallet_balance_snapshot(max_age_sec=15.0)
