@@ -63,6 +63,8 @@ def test_liquidity_depth_uses_websocket_snapshot_without_rest(monkeypatch):
     result = ggpbot.get_orderbook_cached("SOL/USDT:USDT", 10)
 
     assert result["source"] == "BINGX_WS_DEPTH"
+    assert result["source_age_verified"] is False
+    assert result["local_receive_age_sec"] is None
     assert result["bids"] == [[100.0, 2.0]]
     assert result["asks"] == [[100.1, 3.0]]
 
