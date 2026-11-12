@@ -2697,6 +2697,9 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             mode_result.mode, close_side.upper(), opening=False, closing=True,
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
+        # A close write may succeed even if its response is lost. Invalidate the
+        # passive snapshot first so the next reconciliation cannot reuse pre-close OPEN qty.
+        _invalidate_position_fetch_cache(symbol)
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
         order = ex.create_order(sym, "market", close_side, requested,
                                 params=close_params)
