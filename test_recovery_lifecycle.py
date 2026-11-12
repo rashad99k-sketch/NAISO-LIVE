@@ -987,3 +987,33 @@ def test_restart_hedge_short_position_restores(tmp_path, monkeypatch):
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["side"] == "SELL"
     assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+
+
+def test_position_sync_malformed_rows_are_unknown_and_raw_size_prevents_false_flat(monkeypatch):
+    class PositionReadExchange:
+        def __init__(self, rows):
+            self.rows = rows
+        def fetch_positions(self, symbols=None):
+            return self.rows
+
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "ex", PositionReadExchange([{}]))
+    status, positions = ggpbot.fetch_position_tri_state()
+    assert status == "UNKNOWN"
+    assert positions is None
+
+    monkeypatch.setattr(ggpbot, "ex", PositionReadExchange([
+        {"symbol": "BTC/USDT:USDT", "contracts": 0.0, "info": {"positionAmt": "0"}}
+    ]))
+    status, positions = ggpbot.fetch_position_tri_state()
+    assert status == "FLAT"
+    assert positions == []
+
+    # Some CCXT parsers may expose a zero normalized contracts field while the
+    # raw BingX positionAmt still shows exposure; never let that become FLAT.
+    monkeypatch.setattr(ggpbot, "ex", PositionReadExchange([
+        {"symbol": "BTC/USDT:USDT", "contracts": 0.0, "info": {"positionAmt": "1"}}
+    ]))
+    status, positions = ggpbot.fetch_position_tri_state()
+    assert status == "OPEN"
+    assert positions[0]["info"]["positionAmt"] == "1"

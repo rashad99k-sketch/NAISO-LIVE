@@ -5010,6 +5010,12 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         return None
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
+            log_execution(
+                f"[ENTRY_LOCK] Entry blocked: execution gate already held; "
+                f"state={STATE.get('entry_execution_state') or 'ACTIVE'} "
+                f"trade_id={STATE.get('entry_trade_id') or STATE.get('trade_id') or 'unknown'}",
+                "WARN", debounce_key="entry_lock_held", debounce_sec=10
+            )
             return None
         _ACTIVE_TRADE = True
     order = None
@@ -5023,11 +5029,13 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             raise ValueError("Order amount rounded to zero")
 
         bal = safe_api_call(ex.fetch_balance)
-        if bal is None:
+        if not isinstance(bal, dict):
+            log_execution("[ENTRY_PREFLIGHT] BingX balance read unavailable; blocked before order submission", "ERROR")
             return None
         usdt = safe_float((bal.get("free") or {}).get("USDT"), 0.0)
         ticker = safe_api_call(ex.fetch_ticker, sym)
         if not isinstance(ticker, dict):
+            log_execution(f"[ENTRY_PREFLIGHT] BingX ticker read unavailable for {sym}; blocked before order submission", "ERROR")
             return None
         price = safe_float(ticker.get("last"), 0.0)
         if price <= 0:
@@ -5125,6 +5133,8 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             order = dict(result.raw_order or {})
             order.update({"id": result.exchange_order_id, "filled": result.filled_qty,
                           "remaining": result.remaining_qty, "average": result.average_fill_price,
+                          "execution_state": result.state.value, "order_terminal": bool(result.order_terminal),
+                          "requested_qty": result.requested_qty,
                           "clientOrderId": result.client_order_id,
                           "positionMode": result.position_mode, "positionSide": result.position_side,
                           "native_sl_order_id": native_sl_id, "native_sl_verified": bool(native_sl_id),
@@ -5939,7 +5949,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "position_side": order.get("positionSide"),
             "entry_client_order_id": order.get("clientOrderId"),
             "entry_exchange_order_id": order.get("id"),
-            "entry_execution_state": "FILLED",
+            "entry_execution_state": order.get("execution_state", "FILLED"),
             "native_sl_order_id": order.get("native_sl_order_id"),
             "native_sl_verified": bool(order.get("native_sl_verified", PAPER_MODE)),
             "recovery_hold": bool(order.get("protection_unverified", False)),
@@ -10279,21 +10289,58 @@ _journal_last_snapshot_ts = 0.0
 
 
 def _position_contracts(pos):
+    """Read position size conservatively; a zero normalized field must not mask non-zero raw exposure."""
     info = pos.get("info") if isinstance(pos, dict) else {}
     info = info if isinstance(info, dict) else {}
-    raw = pos.get("contracts")
-    if raw in (None, ""):
-        raw = info.get("positionAmt", info.get("positionSize", info.get("availableAmt", 0)))
-    try:
-        return abs(float(raw or 0))
-    except (TypeError, ValueError):
-        return 0.0
+    candidates = (
+        pos.get("contracts"),
+        info.get("positionAmt"),
+        info.get("positionSize"),
+        info.get("availableAmt"),
+        pos.get("positionAmt"),
+    )
+    parsed = []
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
+        try:
+            value = abs(float(raw))
+            if math.isfinite(value):
+                parsed.append(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    # Prefer CCXT's normalized contracts when it reports exposure; otherwise
+    # fall back to BingX's native signed positionAmt/positionSize fields.
+    for value in parsed:
+        if value > 0:
+            return value
+    return 0.0
 
 
 def _position_symbol(pos):
     info = pos.get("info") if isinstance(pos, dict) else {}
     info = info if isinstance(info, dict) else {}
     return str(pos.get("symbol") or info.get("symbol") or "")
+
+
+def _position_row_readable(pos):
+    """A row without symbol and a parseable size field cannot prove account FLAT."""
+    if not isinstance(pos, dict) or not _position_symbol(pos):
+        return False
+    info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+    values = (
+        pos.get("contracts"), pos.get("positionAmt"),
+        info.get("positionAmt"), info.get("positionSize"), info.get("availableAmt"),
+    )
+    for raw in values:
+        if raw in (None, ""):
+            continue
+        try:
+            if math.isfinite(float(raw)):
+                return True
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return False
 
 
 def fetch_position_tri_state(symbol=None):
@@ -10314,7 +10361,11 @@ def fetch_position_tri_state(symbol=None):
         if result is None or not isinstance(result, (list, tuple)):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
-        open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
+        if any(not _position_row_readable(position) for position in result):
+            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
+            log_execution("[POS_SYNC] BingX returned malformed position rows; refusing to infer FLAT", "ERROR")
+            return "UNKNOWN", None
+        open_positions = [p for p in result if _position_contracts(p) > 0]
         if symbol:
             target = roro_canonical_symbol(symbol)
             matches = [p for p in open_positions if roro_canonical_symbol(_position_symbol(p)) == target]
