@@ -29,6 +29,9 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
+from bingx_api_reliability import BingXApiReliability
+from bingx_market_data import BingXBookTickerFeed
+
 # Load project-local configuration safely. PAPER mode remains the default.
 ENV_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE_PATH = os.path.join(ENV_DIR, ".env")
@@ -39,7 +42,7 @@ try:
     from dotenv import load_dotenv
     # Prefer the user's real .env. If absent, use the template as defaults only;
     # platform-injected values/secrets must never be overwritten by the template.
-    _hosted_runtime = any(os.getenv(name) for name in ("RENDER", "RAILWAY_ENVIRONMENT", "DYNO"))
+    _hosted_runtime = is_hosted_runtime(os.environ)
     _override_raw = os.getenv("GGP_LOCAL_ENV_OVERRIDE")
     _dotenv_override = (
         str(_override_raw).strip().lower() in {"1", "true", "yes", "on"}
@@ -60,7 +63,7 @@ try:
 except Exception as _env_exc:
     print(f"[ENV] configuration loader unavailable: {type(_env_exc).__name__}; process environment only")
 
-from ggp_runtime_config import resolve_trading_mode
+from ggp_runtime_config import resolve_trading_mode, is_hosted_runtime
 from ggp_management_events import TradeManagementEventLog
 from ggp_telegram import TelegramNotifier
 from ggp_position_sizing import (
@@ -564,51 +567,63 @@ def cache_set(key, value):
                 CACHE.pop(old_key, None)
 
 def safe_api_call(func, *args, **kwargs):
-    # Order creation is non-idempotent. Never automatically retry a timed-out
-    # create_order call: BingX may have accepted the first request already.
-    is_order_write = getattr(func, "__name__", "") in {"create_order", "create_market_order", "create_limit_order"}
-    if is_order_write:
-        rate_limit()
+    """Centralized API policy: bounded retries for reads; all writes are one-shot."""
+    name = str(getattr(func, "__name__", ""))
+    is_order_write = name in {"create_order", "create_market_order", "create_limit_order"}
+    is_read = BINGX_API_RELIABILITY.is_read_method(name)
+
+    if is_read:
         try:
-            return func(*args, **kwargs)
+            return BINGX_API_RELIABILITY.call_read(func, *args, before_call=rate_limit, **kwargs)
         except Exception as exc:
-            try:
-                if "STATE" in globals():
-                    STATE["execution_unresolved"] = True
-                if "MEMORY" in globals():
-                    MEMORY["recovery_status"] = "ORDER_SUBMISSION_UNCERTAIN"
-                if "RECOVERY_BLOCK_ENTRIES" in globals():
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                if "log_execution" in globals():
-                    log_execution(f"[ORDER_UNCERTAIN] {getattr(func, '__name__', 'order')} raised {type(exc).__name__}: {exc}; no automatic retry; exchange reconciliation required", "ERROR")
-            except Exception:
-                pass
-            raise
-    for attempt in range(3):
-        try:
-            rate_limit()
-            return func(*args, **kwargs)
-        except Exception as e:
-            if "rate limit" in str(e).lower() or "100410" in str(e):
+            kind = BingXApiReliability.classify(exc)
+            if kind in {"RATE_LIMIT", "BAN", "SYSTEM_BUSY", "RISK_CONTROL", "COOLDOWN"}:
                 _LAST_API_RATE_LIMIT.update({
-                    "ts": time.time(),
-                    "method": getattr(func, "__name__", "exchange_call"),
-                    "message": str(e)[:180],
+                    "ts": time.time(), "method": name, "message": str(exc)[:180],
                 })
-                wait = min(8, 2 ** attempt)
                 try:
+                    state = BINGX_API_RELIABILITY.snapshot()
                     log_execution(
-                        f"[API_BACKOFF] {getattr(func, '__name__', 'exchange_call')} rate-limited; retry in {wait}s",
-                        "WARN", debounce_key=f"api_backoff_{getattr(func, '__name__', 'call')}", debounce_sec=30
+                        f"[API_BACKOFF] {name} class={kind}; no blind retry; "
+                        f"cooldown={state['cooldown_remaining']:.2f}s reason={state['cooldown_reason']}",
+                        "WARN", debounce_key=f"api_backoff_{name}_{kind}", debounce_sec=30
                     )
                 except Exception:
                     pass
-                time.sleep(wait)
-                continue
-            if attempt == 2:
-                raise
-            time.sleep(1)
-    return None
+            raise
+
+    # Unknown methods and all write methods are never automatically replayed.
+    rate_limit()
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        kind = BINGX_API_RELIABILITY.observe_error(exc, name or "unknown_write")
+        if kind in {"RATE_LIMIT", "BAN", "SYSTEM_BUSY", "RISK_CONTROL"}:
+            _LAST_API_RATE_LIMIT.update({
+                "ts": time.time(), "method": name, "message": str(exc)[:180],
+            })
+            try:
+                state = BINGX_API_RELIABILITY.snapshot()
+                log_execution(
+                    f"[API_WRITE_BACKOFF] {name} class={kind}; no replay; "
+                    f"cooldown={state['cooldown_remaining']:.2f}s reason={state['cooldown_reason']}",
+                    "WARN", debounce_key=f"api_write_backoff_{name}_{kind}", debounce_sec=30
+                )
+            except Exception:
+                pass
+        if is_order_write:
+            try:
+                STATE["execution_unresolved"] = True
+                MEMORY["recovery_status"] = "ORDER_SUBMISSION_UNCERTAIN"
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                log_execution(
+                    f"[ORDER_UNCERTAIN] {name} raised {type(exc).__name__}: {exc}; "
+                    "no automatic retry; exchange reconciliation required",
+                    "ERROR",
+                )
+            except Exception:
+                pass
+        raise
 
 # ========== TELEGRAM ==========
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -792,6 +807,38 @@ ex = ccxt.bingx({
     "options": {"defaultType": "swap"}
 })
 
+# Shared read-side back-pressure. CCXT's own limiter remains enabled as a second layer.
+BINGX_API_RELIABILITY = BingXApiReliability(
+    max_attempts=2,
+    max_concurrent=4,
+    transient_delay=0.25,
+    rate_limit_cooldown=_env_float_range("BINGX_RATE_LIMIT_COOLDOWN_SEC", 10.0, 1.0, 60.0),
+    ban_cooldown=_env_float_range("BINGX_418_COOLDOWN_SEC", 900.0, 60.0, 3600.0),
+    system_busy_cooldown=_env_float_range("BINGX_SYSTEM_BUSY_COOLDOWN_SEC", 20.0, 1.0, 300.0),
+    logger=lambda message: (
+        globals().get("log_execution", lambda *_a, **_k: None)(message, "WARN")
+        if callable(globals().get("log_execution")) else None
+    ),
+)
+
+# Subscribe lazily only to symbols reaching the execution spread gate.
+BINGX_MARKET_DATA = BingXBookTickerFeed(
+    stale_after_sec=_env_float_range("BINGX_BOOK_TICKER_STALE_AFTER_SEC", 1.5, 0.2, 10.0),
+    depth_stale_after_sec=_env_float_range("BINGX_DEPTH_STALE_AFTER_SEC", 3.0, 0.5, 10.0),
+    max_subscriptions=_env_int_range("BINGX_WS_MAX_SUBSCRIPTIONS", 150, 1, 180),
+    subscription_interval_sec=_env_float_range("BINGX_WS_SUBSCRIPTION_INTERVAL_SEC", 0.12, 0.05, 1.0),
+    logger=lambda message: (
+        globals().get("log_execution", lambda *_a, **_k: None)(message, "INFO")
+        if callable(globals().get("log_execution")) else None
+    ),
+)
+# Scanner liquidity reads use the WS depth snapshots. REST depth fallback is
+# opt-in because BingX documents a 1 request/second/IP limit for the REST depth endpoint.
+BINGX_REST_DEPTH_FALLBACK_ENABLED = (
+    str(os.getenv("BINGX_REST_DEPTH_FALLBACK_ENABLED", "false")).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
 def normalize_symbol(symbol):
     if not symbol.endswith(":USDT"):
         return f"{symbol}:USDT"
@@ -965,31 +1012,67 @@ def fetch_ticker(symbol):
 def fetch_orderbook(symbol, limit=20):
     return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
 
+def _cache_wallet_balance_response(balance_response):
+    """Cache total and free USDT from one BingX Futures balance response."""
+    total = safe_float((balance_response.get("total") or {}).get("USDT"), 0.0) if isinstance(balance_response, dict) else 0.0
+    free = safe_float((balance_response.get("free") or {}).get("USDT"), 0.0) if isinstance(balance_response, dict) else 0.0
+    stamp = time.time()
+    snapshot = {
+        "total": max(0.0, total),
+        "free": max(0.0, free),
+        "timestamp": stamp,
+        "source": "BINGX_FUTURES_BALANCE",
+    }
+    cache_set("wallet_balance_snapshot", snapshot)
+    cache_set("balance", snapshot["total"])
+    cache_set("free_balance", snapshot["free"])
+    return snapshot
+
+
 def get_balance():
     if PAPER_MODE:
         return paper["balance"]
     bal = safe_api_call(ex.fetch_balance)
     if bal:
-        return bal.get("total", {}).get("USDT", 0.0)
+        return _cache_wallet_balance_response(bal)["total"]
     return 0.0
+
 
 def get_free_balance():
     if PAPER_MODE:
         return paper["balance"]
     bal = safe_api_call(ex.fetch_balance)
     if bal:
-        return bal.get("free", {}).get("USDT", 0.0)
+        return _cache_wallet_balance_response(bal)["free"]
     return 0.0
 
 def get_spread_bps(symbol):
+    """Return spread percent from fresh BookTicker; REST depth is fallback only."""
     try:
-        ob = get_orderbook_cached(symbol, 5)
-        if ob and ob['asks'] and ob['bids']:
-            ask = ob['asks'][0][0]
-            bid = ob['bids'][0][0]
-            return (ask - bid) / bid * 100
-    except:
-        pass
+        feed = globals().get("BINGX_MARKET_DATA")
+        book = feed.get(symbol) if feed is not None else None
+        if book:
+            bid = safe_float(book.get("bid"), 0.0)
+            ask = safe_float(book.get("ask"), 0.0)
+            if bid > 0 and ask >= bid:
+                return (ask - bid) / bid * 100.0
+    except Exception as exc:
+        log_execution(
+            f"[BOOKTICKER] feed unavailable for {symbol}: {type(exc).__name__}: {exc}",
+            "WARN", debounce_key=f"bookticker_{symbol}", debounce_sec=30,
+        )
+    try:
+        ob = get_orderbook_cached(symbol, 5, rest_fallback=True)
+        if ob and ob.get("asks") and ob.get("bids"):
+            ask = safe_float(ob["asks"][0][0], 0.0)
+            bid = safe_float(ob["bids"][0][0], 0.0)
+            if bid > 0 and ask >= bid:
+                return (ask - bid) / bid * 100.0
+    except Exception as exc:
+        log_execution(
+            f"[ORDERBOOK_FALLBACK] {symbol}: {type(exc).__name__}: {exc}",
+            "WARN", debounce_key=f"orderbook_fallback_{symbol}", debounce_sec=30,
+        )
     return 100.0
 
 def validate_dataframe(df, min_length=100):
@@ -1011,40 +1094,54 @@ def get_ohlcv_safe(symbol, limit=120, htf=False):
 
 
 def get_ohlcv_safe_meta(symbol, limit=120, htf=False):
-    """Return (frame, source). `source` is CACHE_HIT or FRESH_REQUEST (or NONE).
-
-    A CACHE_HIT means the frame was served from the local cache without any new
-    BingX request; it must never be logged as a new exchange request.
-    """
+    """Return (frame, source); coalesce concurrent identical OHLCV requests."""
     # Increase TTL during open trade to reduce API calls
     ttl = 10 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
         ttl = max(ttl, 30)
     cache_key = f"ohlcv_{symbol}_{INTERVAL}_{limit}_htf" if htf else f"ohlcv_{symbol}_{INTERVAL}_{limit}"
     cached = cache_get(cache_key, ttl)
-    if cached is not None:
-        if len(cached) >= 100:
+    if cached is not None and len(cached) >= 100:
+        return cached, "CACHE_HIT"
+    with _market_data_fetch_lock(cache_key):
+        cached = cache_get(cache_key, ttl)
+        if cached is not None and len(cached) >= 100:
             return cached, "CACHE_HIT"
-    if htf:
-        df = fetch_ohlcv_htf(symbol, '1h', limit)
-    else:
-        df = fetch_ohlcv(symbol, limit)
-    if df is not None and validate_dataframe(df, min(limit, 100)):
-        cache_set(cache_key, df)
-        return df, "FRESH_REQUEST"
-    return None, "NONE"
+        if htf:
+            df = fetch_ohlcv_htf(symbol, '1h', limit)
+        else:
+            df = fetch_ohlcv(symbol, limit)
+        if df is not None and validate_dataframe(df, min(limit, 100)):
+            cache_set(cache_key, df)
+            return df, "FRESH_REQUEST"
+        return None, "NONE"
 
-def get_ticker_safe(symbol):
-    # Use short TTL for live price
-    cached = cache_get(f"ticker_{symbol}", 1)
+_MARKET_DATA_FETCH_LOCKS = {}
+_MARKET_DATA_FETCH_LOCKS_LOCK = threading.RLock()
+
+
+def _market_data_fetch_lock(key):
+    with _MARKET_DATA_FETCH_LOCKS_LOCK:
+        return _MARKET_DATA_FETCH_LOCKS.setdefault(str(key), threading.Lock())
+
+
+def get_ticker_safe(symbol, max_age_sec=1.0):
+    # Per-symbol single-flight prevents concurrent scanner/entry threads from
+    # issuing duplicate ticker REST reads for the same cache key.
+    key = f"ticker_{symbol}"
+    cached = cache_get(key, max_age_sec)
     if cached is not None:
         return cached
-    ticker = fetch_ticker(symbol)
-    if ticker:
-        price = ticker["last"]
-        if price and price > 0:
-            cache_set(f"ticker_{symbol}", price)
-            return price
+    with _market_data_fetch_lock(key):
+        cached = cache_get(key, max_age_sec)
+        if cached is not None:
+            return cached
+        ticker = fetch_ticker(symbol)
+        if ticker:
+            price = ticker["last"]
+            if price and price > 0:
+                cache_set(key, price)
+                return price
     return None
 
 def get_balance_safe():
@@ -1064,40 +1161,114 @@ def get_free_balance_safe():
     return bal
 
 
-def get_available_balance_snapshot(max_age_sec=15.0):
-    """Return (balance, source, timestamp) for the real BingX available balance.
+POSITION_SIZING_BALANCE_BASIS = str(
+    os.getenv("POSITION_SIZING_BALANCE_BASIS", "AVAILABLE_FREE")
+).strip().upper()
+if POSITION_SIZING_BALANCE_BASIS not in {"AVAILABLE_FREE", "WALLET_TOTAL"}:
+    POSITION_SIZING_BALANCE_BASIS = "AVAILABLE_FREE"
 
-    "free" USDT from BingX Futures is the authoritative available balance. The
-    returned timestamp is the moment the value was fetched, so callers can prove
-    freshness. A value older than `max_age_sec` is refetched rather than reused.
-    In PAPER mode the simulated balance is returned with source "PAPER".
-    """
+
+def resolve_position_sizing_balance(snapshot):
+    """Select the configured sizing basis without changing the risk gate."""
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    basis = POSITION_SIZING_BALANCE_BASIS
+    field = "total" if basis == "WALLET_TOTAL" else "free"
+    return max(0.0, safe_float(snapshot.get(field), 0.0)), basis
+
+
+_WALLET_BALANCE_FETCH_LOCK = threading.Lock()
+
+
+def get_wallet_balance_snapshot(max_age_sec=15.0):
+    """Return total/free Futures USDT from one timestamped, single-flight snapshot."""
     now = time.time()
     if PAPER_MODE:
-        return safe_float(paper.get("balance"), 0.0), "PAPER", now
-    cached = cache_get("free_balance", max_age_sec)
-    if cached is not None:
-        item = CACHE.get("free_balance") if isinstance(CACHE, dict) else None
-        ts = float(item.get("ts", now)) if isinstance(item, dict) else now
-        return safe_float(cached), "BINGX_FUTURES_FREE_USDT", ts
-    bal = get_free_balance()
-    cache_set("free_balance", bal)
-    return safe_float(bal), "BINGX_FUTURES_FREE_USDT", time.time()
+        value = safe_float(paper.get("balance"), 0.0)
+        return {
+            "total": value, "free": value, "timestamp": now, "source": "PAPER",
+        }
+    cached = cache_get("wallet_balance_snapshot", max_age_sec)
+    if isinstance(cached, dict):
+        total = safe_float(cached.get("total"), 0.0)
+        free = safe_float(cached.get("free"), 0.0)
+        stamp = safe_float(cached.get("timestamp"), now)
+        if total >= 0 and free >= 0 and stamp > 0:
+            return {"total": total, "free": free, "timestamp": stamp,
+                    "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE")}
+    with _WALLET_BALANCE_FETCH_LOCK:
+        cached = cache_get("wallet_balance_snapshot", max_age_sec)
+        if isinstance(cached, dict):
+            return {
+                "total": safe_float(cached.get("total"), 0.0),
+                "free": safe_float(cached.get("free"), 0.0),
+                "timestamp": safe_float(cached.get("timestamp"), time.time()),
+                "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE"),
+            }
+        # One balance request populates both total and free; no second REST read.
+        get_free_balance()
+        cached = cache_get("wallet_balance_snapshot", max_age_sec)
+        if not isinstance(cached, dict):
+            return {"total": 0.0, "free": 0.0, "timestamp": time.time(),
+                    "source": "UNAVAILABLE"}
+        return {
+            "total": safe_float(cached.get("total"), 0.0),
+            "free": safe_float(cached.get("free"), 0.0),
+            "timestamp": safe_float(cached.get("timestamp"), time.time()),
+            "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE"),
+        }
 
-def get_orderbook_cached(symbol, limit=20):
-    # During live trade, avoid fetching orderbook to save API calls
+
+def get_available_balance_snapshot(max_age_sec=15.0):
+    """Return (free USDT, source, timestamp); Wallet Total is diagnostic only."""
+    snapshot = get_wallet_balance_snapshot(max_age_sec)
+    source = "PAPER" if PAPER_MODE else "BINGX_FUTURES_FREE_USDT"
+    return safe_float(snapshot.get("free"), 0.0), source, safe_float(snapshot.get("timestamp"), time.time())
+
+_ORDERBOOK_FETCH_LOCKS = {}
+_ORDERBOOK_FETCH_LOCKS_LOCK = threading.RLock()
+
+def get_orderbook_cached(symbol, limit=20, *, rest_fallback=None):
+    key = f"ob_{symbol}_{limit}"
     if STATE.get("open") or TRADE_STATE["in_position"]:
-        cached = cache_get(f"ob_{symbol}_{limit}", 60)  # long TTL
+        cached = cache_get(key, 60)
+        return cached if cached is not None else None
+    with _ORDERBOOK_FETCH_LOCKS_LOCK:
+        fetch_lock = _ORDERBOOK_FETCH_LOCKS.setdefault(key, threading.Lock())
+    with fetch_lock:
+        # Prefer the current connection's live snapshot. WS books are not copied
+        # into the generic cache, so reconnects cannot expose a previous socket's book.
+        feed = globals().get("BINGX_MARKET_DATA")
+        depth = feed.get_depth(symbol, int(limit)) if feed is not None else None
+        if depth:
+            return {
+                "bids": depth.get("bids", []),
+                "asks": depth.get("asks", []),
+                "timestamp": depth.get("server_ts_ms"),
+                "received_mono": depth.get("received_mono"),
+                "local_receive_age_sec": depth.get("age_sec"),
+                "source_age_verified": False,
+                "source": "BINGX_WS_DEPTH",
+            }
+        cached = cache_get(key, 1)
         if cached is not None:
             return cached
-        return None  # don't fetch during trade
-    cached = cache_get(f"ob_{symbol}_{limit}", 1)
-    if cached is not None:
-        return cached
-    ob = fetch_orderbook(symbol, limit)
-    if ob:
-        cache_set(f"ob_{symbol}_{limit}", ob)
-    return ob
+        allow_rest = (
+            BINGX_REST_DEPTH_FALLBACK_ENABLED
+            if rest_fallback is None else bool(rest_fallback)
+        )
+        if not allow_rest:
+            log_execution(
+                f"[WS_DEPTH_WAIT] {symbol} depth{limit} has no fresh WebSocket snapshot; "
+                "scanner REST fallback is disabled",
+                "INFO", debounce_key=f"ws_depth_wait_{symbol}_{limit}", debounce_sec=60,
+            )
+            return None
+        ob = fetch_orderbook(symbol, limit)
+        if ob:
+            ob = dict(ob)
+            ob.setdefault("source", "BINGX_REST_DEPTH")
+            cache_set(key, ob)
+        return ob
 
 # ========== EXCHANGE POSITION SYNC ==========
 def fetch_position(symbol):
@@ -2683,6 +2854,8 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             mode_result.mode, close_side.upper(), opening=False, closing=True,
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
+        # Invalidate passive state before a non-idempotent close write; its outcome may be ambiguous.
+        _invalidate_position_fetch_cache(symbol)
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
         order = ex.create_order(sym, "market", close_side, requested,
                                 params=close_params)
@@ -2767,6 +2940,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             return False
         return _close_failure(f"order {order_id} returned but no position reduction was confirmed")
 
+    _invalidate_realized_pnl_cache(symbol)
     average = safe_float(order_state.get("average") or order_state.get("price") or order.get("average") or order.get("price"))
     realized = None
     for candidate in (order_state.get("info"), order.get("info")):
@@ -4989,8 +5163,8 @@ def update_stats(pnl_pct):
     total = DASHBOARD_STATE["stats"]["trades"]
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
-def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
-    global _ACTIVE_TRADE
+def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None, risk_budget_usdt=None):
+    global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
     sym = normalize_symbol(symbol)
     side = str(side or "").upper()
     if side not in ("BUY", "SELL"):
@@ -4998,10 +5172,25 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         return None
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
+            log_execution(
+                f"[ENTRY_LOCK] Entry blocked: execution gate already held; "
+                f"state={STATE.get('entry_execution_state') or 'ACTIVE'} "
+                f"trade_id={STATE.get('entry_trade_id') or STATE.get('trade_id') or 'unknown'}",
+                "WARN", debounce_key="entry_lock_held", debounce_sec=10
+            )
             return None
         _ACTIVE_TRADE = True
     order = None
     try:
+        if not PAPER_MODE:
+            try:
+                BINGX_API_RELIABILITY.assert_new_entry_allowed()
+            except Exception as exc:
+                log_execution(
+                    f"[ENTRY_API_COOLDOWN] new entry blocked before order submission: {type(exc).__name__}: {exc}",
+                    "WARN",
+                )
+                return None
         market = ex.market(sym)
         contract_size = safe_float(market.get("contractSize"), 0.0)
         if contract_size <= 0:
@@ -5009,17 +5198,72 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         amount = float(ex.amount_to_precision(sym, amount))
         if amount <= 0:
             raise ValueError("Order amount rounded to zero")
+        stop_value = None
+        if stop_loss is not None:
+            try:
+                stop_value = _precision_adjusted_structural_stop(sym, stop_loss)
+            except Exception as exc:
+                if not PAPER_MODE:
+                    log_execution(
+                        f"[LIVE_SAFETY] Structural SL precision unavailable for {sym}: {type(exc).__name__}: {exc}",
+                        "ERROR",
+                    )
+                    return None
+                stop_value = safe_float(stop_loss, 0.0)
 
-        bal = safe_api_call(ex.fetch_balance)
-        if bal is None:
+        # Reuse the sizing snapshot only while it is <=2s old; otherwise refresh
+        # once at the final order boundary before any non-idempotent write.
+        balance_snapshot = get_wallet_balance_snapshot(max_age_sec=2.0)
+        usdt = safe_float(balance_snapshot.get("free"), 0.0)
+        if usdt <= 0:
+            log_execution("[ENTRY_PREFLIGHT] BingX available balance unavailable; blocked before order submission", "ERROR")
             return None
-        usdt = safe_float((bal.get("free") or {}).get("USDT"), 0.0)
-        ticker = safe_api_call(ex.fetch_ticker, sym)
-        if not isinstance(ticker, dict):
-            return None
-        price = safe_float(ticker.get("last"), 0.0)
+        # The final ticker preflight may reuse only a <=1s cached quote.
+        price = safe_float(get_ticker_safe(sym, max_age_sec=1.0), 0.0)
         if price <= 0:
-            raise ValueError("Invalid live ticker price")
+            log_execution(f"[ENTRY_PREFLIGHT] BingX ticker read unavailable for {sym}; blocked before order submission", "ERROR")
+            return None
+
+        if not PAPER_MODE:
+            if stop_value is None or stop_value <= 0:
+                log_execution("[LIVE_SAFETY] Refusing LIVE entry without a precision-valid structural SL", "ERROR")
+                return None
+            if (side == "BUY" and stop_value >= price) or (side == "SELL" and stop_value <= price):
+                log_execution(
+                    f"[LIVE_SAFETY] Precision-adjusted structural SL is on the wrong side: "
+                    f"side={side} live_entry={price:.10f} SL={stop_value:.10f}",
+                    "ERROR",
+                )
+                return None
+            if risk_budget_usdt is not None:
+                risk_budget = safe_float(risk_budget_usdt, 0.0)
+                if risk_budget <= 0:
+                    log_execution("[LIVE_SAFETY] Invalid pre-trade stop-risk budget; refusing LIVE entry", "ERROR")
+                    return None
+                actual_stop_distance = abs(price - stop_value) + price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
+                actual_stop_risk = amount * contract_size * actual_stop_distance
+                if actual_stop_risk > risk_budget * 1.000001:
+                    log_execution(
+                        f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} actual_qty={amount:.10f} live_price={price:.10f} "
+                        f"precision_sl={stop_value:.10f} stop_distance={actual_stop_distance:.10f} "
+                        f"stop_distance_pct={actual_stop_distance / price * 100.0:.5f}% "
+                        f"estimated_risk={actual_stop_risk:.4f} risk_budget={risk_budget:.4f}; "
+                        "entry blocked; quantity not force-expanded",
+                        "WARN",
+                    )
+                    return None
+                log_execution(
+                    f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} estimated_risk={actual_stop_risk:.4f} "
+                    f"risk_budget={risk_budget:.4f} status=PASS",
+                    "INFO",
+                )
+            else:
+                # Preserve the existing scale-in caller; primary entries always pass a sizing risk budget.
+                log_execution(
+                    f"[ENTRY_PREFLIGHT_RISK_GATE] {sym} no new sizing budget supplied; "
+                    "legacy scale-in path retained without changing its management policy",
+                    "DEBUG", debounce_key=f"scale_in_risk_budget_{sym}", debounce_sec=60,
+                )
 
         required_margin = (amount * contract_size * price) / LEVERAGE
         if usdt < required_margin * 1.01:
@@ -5035,30 +5279,78 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             return None
 
         if not PAPER_MODE:
-            if stop_loss is None or not math.isfinite(float(stop_loss)) or float(stop_loss) <= 0:
-                log_execution("[LIVE_SAFETY] Refusing LIVE entry without a valid structural stop", "ERROR")
-                return None
-            stop_value = float(stop_loss)
-            if (side == "BUY" and stop_value >= price) or (side == "SELL" and stop_value <= price):
-                log_execution(f"[LIVE_SAFETY] Structural SL is on the wrong side: side={side} entry={price} SL={stop_value}", "ERROR")
-                return None
+            try:
+                BINGX_API_RELIABILITY.assert_new_entry_allowed()
+            except Exception as exc:
+                    log_execution(
+                        f"[ENTRY_API_COOLDOWN] blocked at final pre-submit boundary: {type(exc).__name__}: {exc}",
+                        "WARN",
+                    )
+                    return None
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
+                api_call=safe_api_call,
+                api_error_handler=lambda exc, method: BINGX_API_RELIABILITY.observe_error(exc, method),
             )
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
                 structural_stop=stop_value, trade_id=str(trade_id or STATE.get("trade_id") or uuid.uuid4().hex),
                 management_state=management_state,
             )
-            if result.state not in {ExecutionState.FILLED}:
-                STATE.update({"execution_unresolved": result.state is ExecutionState.EXECUTION_UNCERTAIN,
-                              "recovery_hold": result.state is not ExecutionState.FILLED,
-                              "entry_execution_state": result.state.value,
-                              "entry_client_order_id": result.client_order_id,
-                              "entry_exchange_order_id": result.exchange_order_id})
-                log_execution(f"[LIVE_SAFETY] Entry not fully verified: {result.state.value} ({result.reason})", "ERROR")
+            if result.state not in {ExecutionState.FILLED, ExecutionState.PARTIAL_FILL}:
+                pending = result.submission_attempted and result.state in {
+                    ExecutionState.EXECUTION_UNCERTAIN,
+                    ExecutionState.ENTRY_PRICE_UNKNOWN,
+                    ExecutionState.PROTECTION_HOLD,
+                }
+                STATE.update({
+                    "execution_unresolved": bool(pending),
+                    "recovery_hold": bool(pending),
+                    "entry_pending": bool(pending),
+                    "entry_execution_state": result.state.value,
+                    "entry_trade_id": result.trade_id if pending else None,
+                    "entry_symbol": sym if pending else None,
+                    "entry_client_order_id": result.client_order_id if pending else None,
+                    "entry_exchange_order_id": result.exchange_order_id if pending else None,
+                    "current_symbol": sym if pending else STATE.get("current_symbol"),
+                })
+                if pending:
+                    RECOVERY_BLOCK_ENTRIES = True
+                    log_execution(
+                        f"[LIVE_SAFETY] Entry outcome unresolved; lock retained for exchange reconciliation: "
+                        f"{result.state.value} ({result.reason})",
+                        "ERROR",
+                    )
+                elif result.state is ExecutionState.REJECTED and result.order_terminal and result.filled_qty <= 0 and result.position_status == "FLAT":
+                    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+                    if journal and hasattr(journal, "finalize_entry_no_exposure"):
+                        journal.finalize_entry_no_exposure(result.trade_id, result.reason)
+                    log_execution(f"[LIVE_SAFETY] Entry rejected with terminal zero-fill proof: {result.reason}", "WARN")
+                else:
+                    log_execution(f"[LIVE_SAFETY] Entry rejected before exposure: {result.reason}", "ERROR")
                 return None
+            if result.state is ExecutionState.PARTIAL_FILL and not (
+                result.order_terminal and result.position_status == "OPEN" and result.filled_qty > 0
+            ):
+                STATE.update({
+                    "execution_unresolved": True, "recovery_hold": True, "entry_pending": True,
+                    "entry_execution_state": ExecutionState.EXECUTION_UNCERTAIN.value,
+                    "entry_trade_id": result.trade_id, "entry_symbol": sym,
+                    "entry_client_order_id": result.client_order_id,
+                    "entry_exchange_order_id": result.exchange_order_id,
+                    "current_symbol": sym,
+                })
+                RECOVERY_BLOCK_ENTRIES = True
+                log_execution("[LIVE_SAFETY] Partial fill lacks terminal order/position proof; entry lock retained", "ERROR")
+                return None
+            STATE.update({
+                "entry_pending": False, "execution_unresolved": False,
+                "entry_execution_state": result.state.value,
+                "entry_trade_id": result.trade_id, "entry_symbol": sym,
+                "entry_client_order_id": result.client_order_id,
+                "entry_exchange_order_id": result.exchange_order_id,
+            })
             native_sl_id = service.place_and_verify_native_stop(
                 symbol=sym, side=side, quantity=result.filled_qty,
                 trigger_price=stop_value, mode=PositionMode(result.position_mode),
@@ -5067,6 +5359,8 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             order = dict(result.raw_order or {})
             order.update({"id": result.exchange_order_id, "filled": result.filled_qty,
                           "remaining": result.remaining_qty, "average": result.average_fill_price,
+                          "execution_state": result.state.value, "order_terminal": bool(result.order_terminal),
+                          "requested_qty": result.requested_qty,
                           "clientOrderId": result.client_order_id,
                           "positionMode": result.position_mode, "positionSide": result.position_side,
                           "native_sl_order_id": native_sl_id, "native_sl_verified": bool(native_sl_id),
@@ -5079,6 +5373,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                               "position_mode": result.position_mode,
                               "position_side": result.position_side,
                               "trade_id": str(trade_id or STATE.get("trade_id") or result.trade_id)})
+                RECOVERY_BLOCK_ENTRIES = True
                 log_execution("[LIVE_SAFETY] Native STOP_MARKET could not be verified; filled exposure retained in RECOVERY_HOLD", "ERROR")
         else:
             order = safe_api_call(ex.create_order, sym, "market", side.lower(), amount, params={})
@@ -5095,7 +5390,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         # Keep the entry lock held after a returned order; execute_entry adopts the
         # position state immediately after this function returns. Do not create a
         # concurrency window where a second entry can race the state update.
-        if order is None and not STATE.get("execution_unresolved"):
+        if order is None and not STATE.get("execution_unresolved") and not STATE.get("entry_pending"):
             with _TRADE_LOCK:
                 _ACTIVE_TRADE = False
     return None
@@ -5429,6 +5724,20 @@ def record_entry_data_rejection(symbol, side, diagnostic, *, stage="INSTITUTIONA
     )
 
 
+def _precision_adjusted_structural_stop(symbol, stop_price):
+    """Return the exact exchange-precision stop trigger used by sizing and entry."""
+    formatter = getattr(ex, "price_to_precision", None)
+    if not callable(formatter):
+        raise ValueError("exchange price precision formatter unavailable for structural SL")
+    try:
+        rounded = float(formatter(normalize_symbol(symbol), float(stop_price)))
+    except Exception as exc:
+        raise ValueError(f"structural SL precision conversion failed: {type(exc).__name__}: {exc}") from exc
+    if not math.isfinite(rounded) or rounded <= 0:
+        raise ValueError("exchange-precision structural SL is invalid")
+    return rounded
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     # Canonicalize once at the strategy/execution boundary so every downstream
     # risk, position, SL/TP and management branch sees the same direction token.
@@ -5468,6 +5777,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             if institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
                 raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
             wallet_snapshot = None if PAPER_MODE else safe_api_call(ex.fetch_balance)
+            if isinstance(wallet_snapshot, dict):
+                _cache_wallet_balance_response(wallet_snapshot)
             wallet_balance, free_balance, balance_source = _sniper_v2_wallet_balances(
                 wallet_snapshot=wallet_snapshot,
                 paper_wallet_balance=paper.get("balance", 0.0),
@@ -5489,8 +5800,23 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 "INFO",
             )
         else:
-            free_bal, balance_source, balance_ts = get_available_balance_snapshot()
-            balance = max(0.0, free_bal * BALANCE_SAFETY_FACTOR)
+            wallet_snapshot = get_wallet_balance_snapshot()
+            free_bal = safe_float(wallet_snapshot.get("free"), 0.0)
+            wallet_total = safe_float(wallet_snapshot.get("total"), 0.0)
+            selected_balance, sizing_basis = resolve_position_sizing_balance(wallet_snapshot)
+            balance_source = (
+                "PAPER" if PAPER_MODE else
+                ("BINGX_FUTURES_TOTAL_USDT" if sizing_basis == "WALLET_TOTAL" else "BINGX_FUTURES_FREE_USDT")
+            )
+            balance_ts = safe_float(wallet_snapshot.get("timestamp"), 0.0)
+            balance = max(0.0, selected_balance * BALANCE_SAFETY_FACTOR)
+            log_execution(
+                f"[SIZING_BALANCE_BASIS] basis={sizing_basis} wallet_total={wallet_total:.4f} "
+                f"free_usdt={free_bal:.4f} selected_balance={selected_balance:.4f} "
+                f"safety_factor={BALANCE_SAFETY_FACTOR:.4f} effective_sizing_balance={balance:.4f} "
+                f"source={wallet_snapshot.get('source')} age_sec={max(0.0, time.time() - balance_ts):.2f}",
+                "INFO",
+            )
             if balance <= 0:
                 raise ValueError("available USDT balance is zero or unreadable")
         sym = normalize_symbol(symbol)
@@ -5504,6 +5830,24 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 raise
             market = {}
             contract_size = 1.0  # PAPER fallback only; LIVE must use exchange market metadata.
+
+        raw_structural_stop = structural_stop
+        try:
+            structural_stop = _precision_adjusted_structural_stop(sym, structural_stop)
+        except Exception:
+            if not PAPER_MODE:
+                raise
+            structural_stop = raw_structural_stop
+        sl = structural_stop
+        validate_trade_geometry(
+            side=side, entry_price=reference_price, stop_price=structural_stop,
+            tp1_price=tp1, tp2_price=tp2,
+        )
+        log_execution(
+            f"[STRUCTURAL_SL_PRECISION] symbol={sym} raw_sl={raw_structural_stop:.10f} "
+            f"exchange_sl={structural_stop:.10f} entry_reference={reference_price:.10f}",
+            "INFO",
+        )
 
         # A caller-supplied label such as SNIPER is not proof of setup quality.
         # Only the unified institutional Watchlist may authorize the strong 30% tier.
@@ -5827,11 +6171,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "trail_activated": False, "be_done": False,
     }
     order = open_position(side, qty, symbol, stop_loss=sl, trade_id=trade_id,
-                          management_state=pending_management_state)
+                          management_state=pending_management_state,
+                          risk_budget_usdt=sizing.max_risk_usdt)
     if order:
         actual_filled_qty = safe_float(order.get("filled"), 0.0)
         actual_entry_price = safe_float(order.get("average"), 0.0)
         if actual_filled_qty <= 0 or actual_entry_price <= 0:
+            _invalidate_position_fetch_cache(symbol)
             STATE.update({"open": True, "current_symbol": symbol, "side": side,
                           "trade_id": trade_id, "qty": qty, "recovery_hold": True,
                           "execution_unresolved": True})
@@ -5840,8 +6186,31 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             return False
         qty = actual_filled_qty
         price = actual_entry_price
+        _invalidate_position_fetch_cache(symbol)
         margin = (qty * contract_size * price) / LEVERAGE
         notional = qty * contract_size * price
+        post_fill_stop_distance = abs(price - structural_stop) + price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
+        post_fill_stop_distance_pct = (post_fill_stop_distance / price * 100.0) if price > 0 else 0.0
+        post_fill_stop_risk = qty * contract_size * post_fill_stop_distance
+        post_fill_risk_pct = (post_fill_stop_risk / sizing.target_margin * 100.0) if sizing.target_margin > 0 else 0.0
+        stop_geometry_valid = (
+            structural_stop < price if side == "BUY" else structural_stop > price
+        )
+        if not stop_geometry_valid:
+            post_fill_risk_status = "INVALID_GEOMETRY"
+        elif post_fill_stop_risk > sizing.max_risk_usdt * 1.000001:
+            post_fill_risk_status = "OVER_CAP"
+        else:
+            post_fill_risk_status = "PASS"
+        log_execution(
+            "[POST_FILL_RISK_RECONCILIATION] "
+            f"symbol={sym} target_margin={sizing.target_margin:.4f} actual_margin={margin:.4f} "
+            f"fill_qty={qty:.10f} fill_price={price:.10f} structural_sl={structural_stop:.10f} "
+            f"actual_stop_distance={post_fill_stop_distance:.10f} actual_stop_distance_pct={post_fill_stop_distance_pct:.5f}% "
+            f"estimated_stop_risk={post_fill_stop_risk:.4f} risk_budget={sizing.max_risk_usdt:.4f} "
+            f"risk_pct={post_fill_risk_pct:.3f}% geometry_valid={stop_geometry_valid} status={post_fill_risk_status}",
+            "WARN" if post_fill_risk_status != "PASS" else "INFO",
+        )
         STATE.update({
             "open": True, "side": side, "entry": price, "qty": qty, "initial_qty": qty,
             "exchange_qty": qty, "remaining_qty": qty,
@@ -5851,6 +6220,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "margin_allocation_pct": margin_percent, "margin_allocated": margin,
             "position_notional": notional, "position_leverage": LEVERAGE,
              "estimated_stop_loss_usdt": estimated_stop_loss,
+            "post_fill_estimated_stop_risk_usdt": post_fill_stop_risk,
+            "post_fill_risk_reconciliation": post_fill_risk_status,
+            "post_fill_risk_pct_of_target_margin": post_fill_risk_pct,
             "max_trade_risk_pct": MAX_TRADE_RISK_PCT,
             "risk_budget_basis": "TARGET_MARGIN",
             "risk_budget_usdt": sizing.max_risk_usdt,
@@ -5880,7 +6252,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "position_side": order.get("positionSide"),
             "entry_client_order_id": order.get("clientOrderId"),
             "entry_exchange_order_id": order.get("id"),
-            "entry_execution_state": "FILLED",
+            "entry_execution_state": order.get("execution_state", "FILLED"),
             "native_sl_order_id": order.get("native_sl_order_id"),
             "native_sl_verified": bool(order.get("native_sl_verified", PAPER_MODE)),
             "recovery_hold": bool(order.get("protection_unverified", False)),
@@ -5950,7 +6322,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return False
 
 def dynamic_spread_tolerance(symbol):
-    df = get_ohlcv_safe(symbol, 50)
+    # The production OHLCV validator requires at least 100 rows.
+    df = get_ohlcv_safe(symbol, MANAGEMENT_OHLCV_LIMIT)
     if df is None:
         return MAX_SPREAD_PERCENT_DEFAULT
     atr = compute_atr(df).iloc[-1]
@@ -8723,9 +9096,15 @@ def manual_close():
 
 @app.route("/health")
 def health():
+    # Liveness only: a temporary exchange outage must not cause the host to restart
+    # a process that may be managing an existing position.
+    runtime = hosted_runtime_snapshot()
     return jsonify({
         "ok": True,
+        "status": "alive",
+        "ready": runtime.get("ready", not HOSTED_RUNTIME_REQUIRED),
         "mode": "LIVE" if MODE_LIVE else "PAPER",
+        "runtime": runtime,
         "dashboard_ports": globals().get("DASHBOARD_ACTIVE_PORTS", []),
         "discovery_scanner": MEMORY.get("discovery_scanner", {}).get("state", "UNKNOWN"),
         "proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}).get("state", "UNKNOWN"),
@@ -8733,6 +9112,18 @@ def health():
         "trade_management_events": len(TRADE_MANAGEMENT_LOG),
         "telegram": {"configured": TELEGRAM_NOTIFIER.configured},
     })
+
+
+@app.route("/ready")
+def readiness():
+    runtime = hosted_runtime_snapshot()
+    ready = bool(runtime.get("ready", not HOSTED_RUNTIME_REQUIRED))
+    payload = {
+        "ready": ready,
+        "mode": "LIVE" if MODE_LIVE else "PAPER",
+        "runtime": runtime,
+    }
+    return jsonify(payload), (200 if ready else 503)
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
@@ -9542,29 +9933,100 @@ def sync_position_with_exchange(symbol):
         log_execution(f"[SYNC] error: {e}", "ERROR")
         return None
 
-def get_realized_pnl(symbol, limit=100):
-    try:
-        trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=limit)
-        if not trades:
-            return 0.0, 0.0
-        buy_value = 0.0
-        sell_value = 0.0
-        for trade in trades:
-            side = trade['side'].lower()
-            qty = trade['amount']
-            price = trade['price']
-            cost = qty * price
-            if side == 'buy':
-                buy_value += cost
-            elif side == 'sell':
-                sell_value += cost
-        pnl = sell_value - buy_value
-        balance = get_balance_safe()
-        pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
-        return pnl, pnl_pct
-    except Exception as e:
-        log_execution(f"[SYNC] error in get_realized_pnl: {e}", "ERROR")
+def get_realized_pnl(symbol, limit=100, *, force=False):
+    """Return cached realized-PnL summary; force=True is reserved for explicit refreshes."""
+    if PAPER_MODE:
         return 0.0, 0.0
+
+    cache_key = (_position_fetch_cache_key(symbol), int(limit))
+    with _REALIZED_PNL_CACHE_LOCK:
+        # Start the age calculation only after acquiring the lock; the lock is
+        # held across the exchange read to coalesce concurrent accounting calls.
+        now_mono = time.monotonic()
+        cached = _REALIZED_PNL_CACHE.get(cache_key)
+        if not force and cached:
+            retry_after = safe_float(cached.get("retry_after"), 0.0)
+            age = max(0.0, now_mono - safe_float(cached.get("updated_mono"), now_mono))
+            if retry_after > now_mono:
+                if isinstance(MEMORY, dict):
+                    MEMORY["realized_pnl_sync"] = {
+                        "status": "STALE_BACKOFF" if cached.get("has_value") else "UNAVAILABLE_BACKOFF",
+                        "age_sec": round(age, 2),
+                        "last_error": cached.get("last_error", ""),
+                    }
+                return cached.get("value", (0.0, 0.0))
+            if cached.get("has_value") and age < REALIZED_PNL_CACHE_TTL_SEC:
+                if isinstance(MEMORY, dict):
+                    MEMORY["realized_pnl_sync"] = {
+                        "status": "CACHE_HIT", "age_sec": round(age, 2),
+                        "last_error": "",
+                    }
+                return cached["value"]
+
+        try:
+            trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=limit)
+            if not trades:
+                value = (0.0, 0.0)
+            else:
+                buy_value = 0.0
+                sell_value = 0.0
+                for trade in trades:
+                    side = str(trade["side"]).lower()
+                    qty = safe_float(trade["amount"])
+                    price = safe_float(trade["price"])
+                    cost = qty * price
+                    if side == "buy":
+                        buy_value += cost
+                    elif side == "sell":
+                        sell_value += cost
+                pnl = sell_value - buy_value
+                balance = get_balance_safe()
+                pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
+                value = (pnl, pnl_pct)
+
+            _REALIZED_PNL_CACHE[cache_key] = {
+                "value": value,
+                "has_value": True,
+                "updated_mono": time.monotonic(),
+                "updated_at": time.time(),
+                "retry_after": 0.0,
+                "last_error": "",
+            }
+            if isinstance(MEMORY, dict):
+                MEMORY["realized_pnl_sync"] = {
+                    "status": "FRESH", "age_sec": 0.0, "last_error": "",
+                    "updated_at": time.time(),
+                }
+            return value
+        except Exception as exc:
+            now_mono = time.monotonic()
+            previous = cached or {}
+            is_busy = "109500" in str(exc) or "current system is busy" in str(exc).lower()
+            backoff = REALIZED_PNL_ERROR_BACKOFF_SEC if is_busy else 5.0
+            value = previous.get("value", (0.0, 0.0))
+            updated_mono = safe_float(previous.get("updated_mono"), 0.0)
+            age = max(0.0, now_mono - updated_mono) if updated_mono > 0 else None
+            _REALIZED_PNL_CACHE[cache_key] = {
+                "value": value,
+                "has_value": bool(previous.get("has_value", False)),
+                "updated_mono": updated_mono,
+                "updated_at": previous.get("updated_at"),
+                "retry_after": now_mono + backoff,
+                "last_error": f"{type(exc).__name__}: {exc}"[:240],
+            }
+            if isinstance(MEMORY, dict):
+                MEMORY["realized_pnl_sync"] = {
+                    "status": "STALE_BACKOFF" if previous.get("has_value") else "UNAVAILABLE_BACKOFF",
+                    "age_sec": round(age, 2) if age is not None else None,
+                    "last_error": f"{type(exc).__name__}: {exc}"[:240],
+                }
+            log_execution(
+                f"[SYNC] error in get_realized_pnl: {type(exc).__name__}: {exc}",
+                "WARN" if is_busy else "ERROR",
+                debounce_key=f"realized_pnl_error_{cache_key[0]}",
+                debounce_sec=backoff,
+            )
+            return value
 
 def validate_position_state(local_pos, symbol):
     real_pos = sync_position_with_exchange(symbol)
@@ -9675,7 +10137,7 @@ def main_loop_sniper():
                 sym = STATE["current_symbol"]
                 price = get_ticker_safe(sym)
                 if price and price > 0:
-                    df = get_ohlcv_safe(sym, 50)
+                    df = get_ohlcv_safe(sym, MANAGEMENT_OHLCV_LIMIT)
                     if df is not None:
                         # Exit authority is exclusively LiveTradeManager; this block only updates auxiliary risk context.
                         atr = compute_atr(_closed_candle_frame(df, INTERVAL)).iloc[-1]
@@ -10219,16 +10681,75 @@ RECOVERY_BLOCK_ENTRIES = False
 _journal_last_snapshot_ts = 0.0
 
 
+# Background position and accounting reads are coalesced. Execution-critical
+# callers retain force=True and always perform a fresh exchange read.
+POSITION_FETCH_CACHE_TTL_SEC = _env_float_range("POSITION_FETCH_CACHE_TTL_SEC", 10.0, 2.0, 30.0)
+POSITION_FETCH_UNKNOWN_CACHE_TTL_SEC = _env_float_range("POSITION_FETCH_UNKNOWN_CACHE_TTL_SEC", 5.0, 1.0, 15.0)
+_POSITION_FETCH_CACHE = {}
+_POSITION_FETCH_CACHE_LOCK = threading.RLock()
+
+REALIZED_PNL_CACHE_TTL_SEC = _env_float_range("REALIZED_PNL_CACHE_TTL_SEC", 30.0, 5.0, 300.0)
+REALIZED_PNL_ERROR_BACKOFF_SEC = _env_float_range("REALIZED_PNL_ERROR_BACKOFF_SEC", 20.0, 5.0, 120.0)
+_REALIZED_PNL_CACHE = {}
+_REALIZED_PNL_CACHE_LOCK = threading.RLock()
+
+
+def _position_fetch_cache_key(symbol=None):
+    if not symbol:
+        return "__ALL_POSITIONS__"
+    try:
+        return str(roro_canonical_symbol(symbol))
+    except Exception:
+        return str(symbol).strip().upper()
+
+
+def _invalidate_position_fetch_cache(symbol=None):
+    key = _position_fetch_cache_key(symbol)
+    with _POSITION_FETCH_CACHE_LOCK:
+        if symbol:
+            _POSITION_FETCH_CACHE.pop(key, None)
+        else:
+            _POSITION_FETCH_CACHE.clear()
+
+
+def _invalidate_realized_pnl_cache(symbol=None):
+    with _REALIZED_PNL_CACHE_LOCK:
+        if not symbol:
+            _REALIZED_PNL_CACHE.clear()
+            return
+        canonical = _position_fetch_cache_key(symbol)
+        for key in list(_REALIZED_PNL_CACHE):
+            if key[0] == canonical:
+                _REALIZED_PNL_CACHE.pop(key, None)
+
+
 def _position_contracts(pos):
+    """Read position size conservatively; a zero normalized field must not mask non-zero raw exposure."""
     info = pos.get("info") if isinstance(pos, dict) else {}
     info = info if isinstance(info, dict) else {}
-    raw = pos.get("contracts")
-    if raw in (None, ""):
-        raw = info.get("positionAmt", info.get("positionSize", info.get("availableAmt", 0)))
-    try:
-        return abs(float(raw or 0))
-    except (TypeError, ValueError):
-        return 0.0
+    candidates = (
+        pos.get("contracts"),
+        info.get("positionAmt"),
+        info.get("positionSize"),
+        info.get("availableAmt"),
+        pos.get("positionAmt"),
+    )
+    parsed = []
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
+        try:
+            value = abs(float(raw))
+            if math.isfinite(value):
+                parsed.append(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    # Prefer CCXT's normalized contracts when it reports exposure; otherwise
+    # fall back to BingX's native signed positionAmt/positionSize fields.
+    for value in parsed:
+        if value > 0:
+            return value
+    return 0.0
 
 
 def _position_symbol(pos):
@@ -10237,7 +10758,27 @@ def _position_symbol(pos):
     return str(pos.get("symbol") or info.get("symbol") or "")
 
 
-def fetch_position_tri_state(symbol=None):
+def _position_row_readable(pos):
+    """A row without symbol and a parseable size field cannot prove account FLAT."""
+    if not isinstance(pos, dict) or not _position_symbol(pos):
+        return False
+    info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+    values = (
+        pos.get("contracts"), pos.get("positionAmt"),
+        info.get("positionAmt"), info.get("positionSize"), info.get("availableAmt"),
+    )
+    for raw in values:
+        if raw in (None, ""):
+            continue
+        try:
+            if math.isfinite(float(raw)):
+                return True
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return False
+
+
+def _fetch_position_tri_state_uncached(symbol=None):
     """Return OPEN/FLAT/UNKNOWN; API errors must never be interpreted as FLAT."""
     global LAST_POSITION_FETCH_STATUS
     if PAPER_MODE:
@@ -10255,7 +10796,11 @@ def fetch_position_tri_state(symbol=None):
         if result is None or not isinstance(result, (list, tuple)):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
-        open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
+        if any(not _position_row_readable(position) for position in result):
+            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
+            log_execution("[POS_SYNC] BingX returned malformed position rows; refusing to infer FLAT", "ERROR")
+            return "UNKNOWN", None
+        open_positions = [p for p in result if _position_contracts(p) > 0]
         if symbol:
             target = roro_canonical_symbol(symbol)
             matches = [p for p in open_positions if roro_canonical_symbol(_position_symbol(p)) == target]
@@ -10274,6 +10819,41 @@ def fetch_position_tri_state(symbol=None):
         LAST_POSITION_FETCH_STATUS = "UNKNOWN"
         log_execution(f"[POS_SYNC] tri-state fetch failed: {type(exc).__name__}: {exc}", "ERROR")
         return "UNKNOWN", None
+
+
+
+def fetch_position_tri_state(symbol=None, *, force=True):
+    """Return OPEN/FLAT/UNKNOWN; only passive readers may reuse a fresh snapshot.
+
+    force=True is the safe default for close submission, close verification and
+    recovery. UNKNOWN is cached briefly only to avoid duplicate read storms and
+    is never interpreted as FLAT.
+    """
+    global LAST_POSITION_FETCH_STATUS
+    if PAPER_MODE:
+        return _fetch_position_tri_state_uncached(symbol)
+
+    key = _position_fetch_cache_key(symbol)
+    with _POSITION_FETCH_CACHE_LOCK:
+        now = time.monotonic()
+        cached = _POSITION_FETCH_CACHE.get(key)
+        if not force and cached:
+            ttl = (POSITION_FETCH_UNKNOWN_CACHE_TTL_SEC
+                   if cached.get("status") == "UNKNOWN"
+                   else POSITION_FETCH_CACHE_TTL_SEC)
+            if now - safe_float(cached.get("ts_mono"), 0.0) < ttl:
+                LAST_POSITION_FETCH_STATUS = cached["status"]
+                return cached["status"], cached.get("position")
+
+        status, position = _fetch_position_tri_state_uncached(symbol)
+        LAST_POSITION_FETCH_STATUS = status
+        _POSITION_FETCH_CACHE[key] = {
+            "status": status,
+            "position": position,
+            "ts_mono": time.monotonic(),
+            "updated_at": time.time(),
+        }
+        return status, position
 
 
 def _snapshot_from_position(symbol, pos):
@@ -10428,6 +11008,7 @@ def _fetch_external_close_diagnostic(symbol, side, entry_time=None, stop_order_i
 def _clear_confirmed_flat_unlocked(symbol, reason="EXCHANGE_FLAT_CONFIRMED"):
     """Clear exposure only after BingX FLAT; classify close cause from exchange evidence."""
     global RECOVERY_BLOCK_ENTRIES, _ACTIVE_TRADE
+    _invalidate_realized_pnl_cache(symbol)
     if not STATE.get("open"):
         MEMORY["position_status"] = "FLAT"
         MEMORY["current_position"] = None
@@ -11161,6 +11742,292 @@ def _attempt_runtime_trade_recovery(symbol, position=None, *, force=False):
         return _recovery_hold(f"runtime_recovery_exception:{type(exc).__name__}:{exc}", symbol=symbol)
 
 
+# ========== PENDING ENTRY RECONCILIATION ==========
+_PENDING_ENTRY_STATES = {
+    "ENTRY_PENDING", "EXECUTION_UNCERTAIN", "ENTRY_PRICE_UNKNOWN", "PROTECTION_HOLD",
+}
+_ENTRY_TERMINAL_STATES = {"CLOSED", "FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED", "DONE"}
+
+
+def _is_pending_entry_record(row):
+    if not isinstance(row, dict):
+        return False
+    status = str(row.get("status") or "").upper()
+    saved = row.get("state") if isinstance(row.get("state"), dict) else {}
+    return (
+        status in _PENDING_ENTRY_STATES
+        or bool(saved.get("entry_pending"))
+        or bool(saved.get("execution_unresolved"))
+    )
+
+
+def _entry_order_status(order):
+    if not isinstance(order, dict):
+        return "UNKNOWN"
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    return str(order.get("status") or order.get("state") or info.get("status")
+               or info.get("orderStatus") or "UNKNOWN").upper()
+
+
+def _entry_order_filled(order):
+    if not isinstance(order, dict):
+        return 0.0
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    for value in (order.get("filled"), order.get("executedQty"), order.get("cumExecQty"),
+                  info.get("executedQty"), info.get("cumExecQty"), info.get("filled")):
+        try:
+            qty = abs(float(value))
+            if math.isfinite(qty):
+                return qty
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return 0.0
+
+
+def _entry_order_price(order):
+    if not isinstance(order, dict):
+        return None
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    for value in (order.get("average"), order.get("avgPrice"), info.get("avgPrice")):
+        try:
+            price = float(value)
+            if math.isfinite(price) and price > 0:
+                return price
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
+def _read_pending_entry_order(row):
+    if not isinstance(row, dict):
+        return None
+    fetch = getattr(ex, "fetch_order", None)
+    if callable(fetch):
+        ids = [
+            row.get("exchange_order_id"),
+            STATE.get("entry_exchange_order_id") if str(STATE.get("entry_trade_id") or "") == str(row.get("trade_id") or "") else None,
+            row.get("client_order_id"),
+        ]
+        symbol = normalize_symbol(str(row.get("symbol") or STATE.get("entry_symbol") or DEFAULT_SYMBOL))
+        for order_id in dict.fromkeys(str(value) for value in ids if value not in (None, "")):
+            try:
+                try:
+                    found = safe_api_call(fetch, order_id, symbol, {"clientOrderId": row.get("client_order_id")})
+                except TypeError:
+                    found = safe_api_call(fetch, order_id, symbol)
+                if isinstance(found, dict) and found:
+                    return found
+            except Exception as exc:
+                log_execution(
+                    f"[ENTRY_RECOVERY] Order read-back failed for {row.get('trade_id')}: "
+                    f"{type(exc).__name__}: {exc}",
+                    "WARN", debounce_key=f"entry_order_read_{row.get('trade_id')}", debounce_sec=30
+                )
+    fetch_open = getattr(ex, "fetch_open_orders", None)
+    if callable(fetch_open) and row.get("client_order_id"):
+        try:
+            try:
+                orders = safe_api_call(fetch_open, normalize_symbol(str(row.get("symbol") or DEFAULT_SYMBOL)))
+            except TypeError:
+                orders = safe_api_call(
+                    fetch_open, normalize_symbol(str(row.get("symbol") or DEFAULT_SYMBOL)),
+                    None, None, {"clientOrderId": row.get("client_order_id")}
+                )
+            for order in orders if isinstance(orders, list) else []:
+                info = order.get("info") if isinstance(order.get("info"), dict) else {}
+                client_id = order.get("clientOrderId") or info.get("clientOrderId") or info.get("clientOrderID")
+                if str(client_id or "") == str(row.get("client_order_id")):
+                    return order
+        except Exception as exc:
+            log_execution(f"[ENTRY_RECOVERY] Open-order fallback failed: {exc}", "WARN")
+    return None
+
+
+def _pending_entry_hold(row, *, position_status="UNKNOWN", reason="ENTRY_PENDING_UNRESOLVED"):
+    global RECOVERY_BLOCK_ENTRIES, _ACTIVE_TRADE
+    trade_id = str(row.get("trade_id") or STATE.get("entry_trade_id") or "")
+    symbol = str(row.get("symbol") or STATE.get("entry_symbol") or STATE.get("current_symbol") or "")
+    STATE.update({
+        "entry_pending": True, "execution_unresolved": True, "recovery_hold": True,
+        "entry_trade_id": trade_id or None, "entry_symbol": symbol or None,
+        "entry_client_order_id": row.get("client_order_id") or STATE.get("entry_client_order_id"),
+        "entry_exchange_order_id": row.get("exchange_order_id") or STATE.get("entry_exchange_order_id"),
+        "entry_execution_state": str(row.get("status") or "ENTRY_PENDING"),
+    })
+    if not STATE.get("open"):
+        with _TRADE_LOCK:
+            _ACTIVE_TRADE = True
+        if symbol:
+            STATE["current_symbol"] = symbol
+    MEMORY["position_status"] = position_status
+    MEMORY["recovery_status"] = "ENTRY_PENDING_UNRESOLVED"
+    RECOVERY_BLOCK_ENTRIES = True
+    log_execution(
+        f"[ENTRY_RECOVERY] {trade_id or 'unknown'} remains blocked: {reason}; "
+        f"exchange_position={position_status}",
+        "ERROR", debounce_key=f"pending_entry_{trade_id or 'unknown'}", debounce_sec=15
+    )
+    return "UNRESOLVED"
+
+
+def _finalize_pending_entry_no_exposure(row, reason):
+    global RECOVERY_BLOCK_ENTRIES, _ACTIVE_TRADE
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    trade_id = str(row.get("trade_id") or "")
+    if not journal or not hasattr(journal, "finalize_entry_no_exposure"):
+        return _pending_entry_hold(row, position_status="FLAT", reason="trade journal finalizer unavailable")
+    finalized = journal.finalize_entry_no_exposure(trade_id, reason)
+    if not finalized:
+        current = journal.get(trade_id) if hasattr(journal, "get") else None
+        if not (isinstance(current, dict) and current.get("finalized") and current.get("status") == "REJECTED"):
+            return _pending_entry_hold(row, position_status="FLAT", reason="zero-exposure journal finalization failed")
+    STATE.update({
+        "entry_pending": False, "execution_unresolved": False, "recovery_hold": False,
+        "entry_execution_state": "REJECTED", "entry_trade_id": None,
+        "entry_symbol": None, "entry_client_order_id": None, "entry_exchange_order_id": None,
+    })
+    with _TRADE_LOCK:
+        _ACTIVE_TRADE = False
+    MEMORY["position_status"] = "FLAT"
+    MEMORY["current_position"] = None
+    MEMORY["recovery_status"] = "ENTRY_REJECTED_NO_EXPOSURE"
+    RECOVERY_BLOCK_ENTRIES = False
+    log_execution(
+        f"[ENTRY_RECOVERY] {trade_id} finalized as REJECTED: terminal order and exchange FLAT verified; {reason}",
+        "WARN"
+    )
+    return "NO_EXPOSURE"
+
+
+def _reconcile_pending_entry_record(row, exchange_status, positions):
+    """Resolve a journaled pending entry only from terminal order + exchange evidence."""
+    global RECOVERY_BLOCK_ENTRIES
+    if exchange_status not in {"OPEN", "FLAT"}:
+        return _pending_entry_hold(row, position_status=exchange_status, reason="exchange position state is not authoritative")
+    order = _read_pending_entry_order(row)
+    if not isinstance(order, dict):
+        return _pending_entry_hold(row, position_status=exchange_status, reason="original order cannot be read back")
+    order_status = _entry_order_status(order)
+    filled = _entry_order_filled(order)
+    if order_status not in _ENTRY_TERMINAL_STATES:
+        return _pending_entry_hold(
+            row, position_status=exchange_status,
+            reason=f"original order remains non-terminal ({order_status}); no replacement MARKET order sent",
+        )
+    requested = safe_float(row.get("requested_qty"), safe_float(row.get("entry_qty"), 0.0))
+    tolerance = max(requested * 0.002, 1e-10)
+    if filled <= tolerance:
+        if exchange_status == "FLAT":
+            return _finalize_pending_entry_no_exposure(row, f"terminal_order={order_status};filled=0")
+        return _pending_entry_hold(row, position_status=exchange_status, reason="zero-fill order conflicts with open exchange exposure")
+
+    if exchange_status != "OPEN" or not isinstance(positions, (list, tuple)):
+        return _pending_entry_hold(row, position_status=exchange_status, reason="filled order has no matching open exchange position")
+    wanted_symbol = roro_canonical_symbol(str(row.get("symbol") or ""))
+    wanted_side = str(row.get("side") or "").upper()
+    matches = []
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        if roro_canonical_symbol(_position_symbol(position)) != wanted_symbol:
+            continue
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        raw_side = str(position.get("side") or info.get("positionSide") or info.get("side") or "").upper()
+        signed = info.get("positionAmt", position.get("positionAmt"))
+        try:
+            signed_value = float(signed) if signed not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            signed_value = 0.0
+        direction = (
+            "BUY" if raw_side in {"LONG", "BUY"} else
+            "SELL" if raw_side in {"SHORT", "SELL"} else
+            "BUY" if signed_value > 0 else "SELL" if signed_value < 0 else ""
+        )
+        if direction == wanted_side:
+            matches.append(position)
+    if len(matches) != 1:
+        return _pending_entry_hold(row, position_status=exchange_status, reason="matching exchange position side is missing or ambiguous")
+
+    position = matches[0]
+    position_qty = _position_contracts(position)
+    if position_qty <= 0 or abs(position_qty - filled) > max(filled * 0.002, 1e-10):
+        return _pending_entry_hold(
+            row, position_status=exchange_status,
+            reason=f"order/position quantity mismatch; order_filled={filled:.12g}; position_qty={position_qty:.12g}",
+        )
+    price = _entry_order_price(order)
+    if price is None:
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        price = safe_float(position.get("entryPrice") or position.get("average") or info.get("avgPrice"), 0.0) or None
+    if price is None or price <= 0:
+        try:
+            journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+            journal.record_execution(
+                str(row.get("trade_id")), exchange_order_id=str(order.get("id") or row.get("exchange_order_id") or ""),
+                filled_qty=filled, remaining_qty=max(0.0, requested-filled),
+                average_fill_price=None, actual_entry_price=None,
+                status="ENTRY_PRICE_UNKNOWN", recovery_status="ENTRY_PRICE_UNKNOWN",
+            )
+        except Exception:
+            pass
+        return _pending_entry_hold(row, position_status="OPEN", reason="filled exposure verified but entry price is unavailable")
+
+    state = "PARTIAL_FILL" if filled + tolerance < requested or order_status in {"CANCELED", "CANCELLED", "EXPIRED"} else "FILLED"
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not journal:
+        return _pending_entry_hold(row, position_status="OPEN", reason="journal unavailable for verified fill adoption")
+    try:
+        journal.record_execution(
+            str(row.get("trade_id")), exchange_order_id=str(order.get("id") or row.get("exchange_order_id") or ""),
+            filled_qty=filled, remaining_qty=max(0.0, requested-filled),
+            average_fill_price=price, actual_entry_price=price,
+            status=state, recovery_status="",
+        )
+    except Exception as exc:
+        return _pending_entry_hold(row, position_status="OPEN", reason=f"cannot persist verified fill: {exc}")
+    STATE.update({
+        "entry_pending": False, "execution_unresolved": False, "recovery_hold": True,
+        "entry_execution_state": state, "entry_trade_id": str(row.get("trade_id")),
+        "entry_symbol": str(row.get("symbol")), "entry_client_order_id": row.get("client_order_id"),
+        "entry_exchange_order_id": order.get("id") or row.get("exchange_order_id"),
+    })
+    MEMORY["position_status"] = "OPEN"
+    MEMORY["recovery_status"] = "ENTRY_FILL_RECONCILED"
+    RECOVERY_BLOCK_ENTRIES = True
+    return "EXPOSURE_READY"
+
+
+def _reconcile_pending_entries_before_releasing(exchange_status, positions):
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    rows = list(journal.open_trades()) if journal and hasattr(journal, "open_trades") else []
+    pending = [row for row in rows if _is_pending_entry_record(row)]
+    if not pending and STATE.get("entry_pending"):
+        synthetic = {
+            "trade_id": STATE.get("entry_trade_id"),
+            "symbol": STATE.get("entry_symbol") or STATE.get("current_symbol"),
+            "side": STATE.get("side"),
+            "client_order_id": STATE.get("entry_client_order_id"),
+            "exchange_order_id": STATE.get("entry_exchange_order_id"),
+            "status": STATE.get("entry_execution_state") or "ENTRY_PENDING",
+        }
+        return _pending_entry_hold(synthetic, position_status=exchange_status, reason="pending entry has no durable journal row")
+    if not pending:
+        return "NO_PENDING"
+    if len(pending) != 1:
+        return _pending_entry_hold(pending[0], position_status=exchange_status, reason=f"{len(pending)} pending entry rows require manual reconciliation")
+    target_id = str(STATE.get("entry_trade_id") or "")
+    target_client = str(STATE.get("entry_client_order_id") or "")
+    row = pending[0]
+    for candidate in pending:
+        if target_id and str(candidate.get("trade_id") or "") == target_id:
+            row = candidate
+            break
+        if target_client and str(candidate.get("client_order_id") or "") == target_client:
+            row = candidate
+            break
+    return _reconcile_pending_entry_record(row, exchange_status, positions)
+
+
 def startup_trade_recovery():
     """Reconcile persisted journal with BingX before any fresh entry is permitted."""
     global RECOVERY_BLOCK_ENTRIES
@@ -11259,6 +12126,20 @@ def startup_trade_recovery():
         return False
     rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
     positions = positions or []
+    pending_rows = [row for row in rows if _is_pending_entry_record(row)]
+    if pending_rows:
+        pending_outcome = _reconcile_pending_entries_before_releasing(status, positions)
+        if pending_outcome == "UNRESOLVED":
+            MEMORY["recovery_status"] = "ENTRY_PENDING_UNRESOLVED"
+            return False
+        if pending_outcome == "EXPOSURE_READY":
+            rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
+        elif pending_outcome == "NO_EXPOSURE":
+            rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
+        else:
+            MEMORY["recovery_status"] = "ENTRY_PENDING_UNRESOLVED"
+            RECOVERY_BLOCK_ENTRIES = True
+            return False
     if status == "FLAT":
         for row in rows:
             try:
@@ -11348,7 +12229,7 @@ def _exchange_fetch_live_snapshot(self, symbol):
     if PAPER_MODE:
         self.last_fetch_status = "OPEN" if STATE.get("open") else "FLAT"
         return self._paper_snapshot(symbol)
-    status, pos = fetch_position_tri_state(symbol)
+    status, pos = fetch_position_tri_state(symbol, force=False)
     self.last_fetch_status = status
     if status != "OPEN":
         return None
@@ -11476,6 +12357,12 @@ def sync_all_states():
         sync_position_state(symbol)
     else:
         status, positions = fetch_position_tri_state(None)
+        pending_outcome = _reconcile_pending_entries_before_releasing(status, positions)
+        if pending_outcome == "UNRESOLVED":
+            return
+        if pending_outcome == "EXPOSURE_READY":
+            startup_trade_recovery()
+            return
         if status == "UNKNOWN":
             MEMORY["position_status"] = "UNKNOWN"
             MEMORY["current_position"] = None
@@ -11484,9 +12371,10 @@ def sync_all_states():
             MEMORY["position_status"] = "FLAT"
             MEMORY["current_position"] = None
             # Confirmed flat resolves an ambiguous order write without fabricating a fill.
-            STATE["execution_unresolved"] = False
-            STATE["recovery_hold"] = False
-            RECOVERY_BLOCK_ENTRIES = False
+            if not STATE.get("entry_pending"):
+                STATE["execution_unresolved"] = False
+                STATE["recovery_hold"] = False
+                RECOVERY_BLOCK_ENTRIES = False
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]
@@ -11507,11 +12395,33 @@ def sync_all_states():
 # Journal start/snapshot is tied to the existing GGP trade lifecycle, not a second manager.
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
+    if HOSTED_RUNTIME_REQUIRED and not hosted_runtime_is_ready():
+        log_execution(
+            "[HOSTED_GATE] Entry blocked: exchange connectivity/account read/recovery is not ready",
+            "WARN", debounce_key="hosted_entry_gate", debounce_sec=30
+        )
+        return None
     result = _original_execute_entry_for_journal(*args, **kwargs)
     if result and STATE.get("open"):
         ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
         _persist_trade_journal_start(ctx.get("setup_type"))
     return result
+
+
+# open_position is the final order-submission boundary. Keep a second hosted-only
+# guard here so an alternate caller cannot bypass the execute_entry readiness gate.
+_original_open_position_hosted = open_position
+def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None, risk_budget_usdt=None):
+    if HOSTED_RUNTIME_REQUIRED and not hosted_runtime_is_ready():
+        log_execution(
+            "[HOSTED_GATE] Order submission blocked: runtime readiness checks are incomplete",
+            "WARN", debounce_key="hosted_open_position_gate", debounce_sec=30
+        )
+        return None
+    return _original_open_position_hosted(
+        side, amount, symbol, stop_loss=stop_loss, trade_id=trade_id,
+        management_state=management_state, risk_budget_usdt=risk_budget_usdt
+    )
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):
@@ -11520,26 +12430,165 @@ def _manage_live_trade_with_journal(self):
     return result
 LiveTradeManager.manage_live_trade = _manage_live_trade_with_journal
 
+# Hosted runtimes need explicit exchange/account readiness, not merely an HTTP server.
+# A process stays alive during temporary BingX outages, but new entries are gated until
+# public market data, private account reads (LIVE), and journal/exchange recovery succeed.
+HOSTED_RUNTIME_REQUIRED = is_hosted_runtime(os.environ) or _env_bool(
+    "HOSTED_RUNTIME_ENFORCE_PREFLIGHT", False
+)
+HOSTED_PREFLIGHT_INTERVAL_SEC = _env_int_range("HOSTED_PREFLIGHT_INTERVAL_SEC", 60, 20, 300)
+RUNTIME_STATUS_LOCK = threading.RLock()
+RUNTIME_STATUS = {
+    "hosted": HOSTED_RUNTIME_REQUIRED,
+    "ready": not HOSTED_RUNTIME_REQUIRED,
+    "markets_loaded": False,
+    "account_read_ok": False if MODE_LIVE else True,
+    "ticker_read_ok": False,
+    "position_read_status": "NOT_CHECKED",
+    "recovery_complete": False,
+    "last_check_ts": None,
+    "last_success_ts": None,
+    "last_error": None,
+}
+_HOSTED_MONITOR_STARTED = False
+
+
+def hosted_runtime_snapshot():
+    with RUNTIME_STATUS_LOCK:
+        return dict(RUNTIME_STATUS)
+
+
+def hosted_runtime_is_ready():
+    if not HOSTED_RUNTIME_REQUIRED:
+        return True
+    with RUNTIME_STATUS_LOCK:
+        return bool(RUNTIME_STATUS.get("ready"))
+
+
+def _hosted_runtime_probe_once():
+    # Public market metadata is required in both PAPER and LIVE modes.
+    if not RUNTIME_STATUS.get("markets_loaded"):
+        markets = safe_api_call(ex.load_markets)
+        if not isinstance(markets, dict) or not markets:
+            raise RuntimeError("BingX load_markets returned no market catalogue")
+        market_symbol = normalize_symbol(DEFAULT_SYMBOL)
+        market = markets.get(market_symbol)
+        if market is None:
+            market = ex.market(market_symbol)
+        if not isinstance(market, dict) or market.get("active") is False:
+            raise RuntimeError(f"Configured swap market is missing or inactive: {market_symbol}")
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["markets_loaded"] = True
+
+    ticker = safe_api_call(ex.fetch_ticker, normalize_symbol(DEFAULT_SYMBOL))
+    if not isinstance(ticker, dict) or safe_float(ticker.get("last"), 0.0) <= 0:
+        raise RuntimeError("BingX public ticker read is missing or invalid")
+    with RUNTIME_STATUS_LOCK:
+        RUNTIME_STATUS["ticker_read_ok"] = True
+
+    if MODE_LIVE:
+        if not API_KEY or not API_SECRET:
+            raise RuntimeError("LIVE selected but BingX API key/secret are missing")
+        balance = safe_api_call(ex.fetch_balance)
+        if not isinstance(balance, dict):
+            raise RuntimeError("BingX private balance read did not return an object")
+        free = balance.get("free") if isinstance(balance.get("free"), dict) else {}
+        total = balance.get("total") if isinstance(balance.get("total"), dict) else {}
+        if "USDT" not in free and "USDT" not in total:
+            raise RuntimeError("BingX balance response has no normalized USDT free/total field")
+        position_status, _positions = fetch_position_tri_state(None)
+        if position_status == "UNKNOWN":
+            raise RuntimeError("BingX position endpoint is UNKNOWN; refusing to authorize entries")
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["account_read_ok"] = True
+            RUNTIME_STATUS["position_read_status"] = position_status
+    else:
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["account_read_ok"] = True
+            RUNTIME_STATUS["position_read_status"] = "NOT_REQUIRED_PAPER"
+
+    if not RUNTIME_STATUS.get("recovery_complete"):
+        if not startup_trade_recovery():
+            raise RuntimeError(
+                str(MEMORY.get("recovery_status") or STATE.get("recovery_reason")
+                    or "trade journal/exchange recovery is unresolved")
+            )
+        with RUNTIME_STATUS_LOCK:
+            RUNTIME_STATUS["recovery_complete"] = True
+
+    now = time.time()
+    with RUNTIME_STATUS_LOCK:
+        RUNTIME_STATUS.update({
+            "ready": True,
+            "last_check_ts": now,
+            "last_success_ts": now,
+            "last_error": None,
+        })
+    log_execution(
+        f"[HOSTED_READY] mode={'LIVE' if MODE_LIVE else 'PAPER'} "
+        f"markets=OK account_read={'OK' if MODE_LIVE else 'NOT_REQUIRED'} "
+        f"positions={RUNTIME_STATUS.get('position_read_status')} recovery=OK",
+        "SUCCESS", debounce_key="hosted_runtime_ready", debounce_sec=60
+    )
+
+
+def _hosted_runtime_monitor():
+    while True:
+        now = time.time()
+        try:
+            _hosted_runtime_probe_once()
+        except Exception as exc:
+            safe_error = f"{type(exc).__name__}: {str(exc)[:220]}"
+            with RUNTIME_STATUS_LOCK:
+                RUNTIME_STATUS.update({
+                    "ready": False,
+                    "ticker_read_ok": False,
+                    "account_read_ok": False if MODE_LIVE else True,
+                    "position_read_status": "UNKNOWN" if MODE_LIVE else "NOT_REQUIRED_PAPER",
+                    "last_check_ts": now,
+                    "last_error": safe_error,
+                })
+            log_execution(
+                f"[HOSTED_NOT_READY] {safe_error}; process remains alive, new entries are blocked",
+                "ERROR", debounce_key="hosted_runtime_not_ready", debounce_sec=30
+            )
+        time.sleep(HOSTED_PREFLIGHT_INTERVAL_SEC)
+
+
 # Start-up recovery must complete before Scanner can authorize a new order.
 _original_main_loop_sniper = main_loop_sniper
 def main_loop_sniper():
-    try:
-        if not PAPER_MODE:
-            try:
-                ex.load_markets()
-            except Exception as exc:
-                MEMORY["position_status"] = "UNKNOWN"
-                MEMORY["recovery_status"] = "MARKETS_UNAVAILABLE"
-                log_execution(f"[RECOVERY] Cannot load BingX markets before startup recovery: {exc}", "ERROR")
+    global _HOSTED_MONITOR_STARTED, RECOVERY_BLOCK_ENTRIES
+    if HOSTED_RUNTIME_REQUIRED:
+        try:
+            _hosted_runtime_probe_once()
+        except Exception as exc:
+            RECOVERY_BLOCK_ENTRIES = True
+            with RUNTIME_STATUS_LOCK:
+                RUNTIME_STATUS.update({
+                    "ready": False,
+                    "last_check_ts": time.time(),
+                    "last_error": f"{type(exc).__name__}: {str(exc)[:220]}",
+                })
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "HOSTED_PREFLIGHT_FAILED"
+            log_execution(
+                f"[HOSTED_STARTUP] Preflight incomplete; keeping service alive but blocking entries: {exc}",
+                "ERROR"
+            )
+        if not _HOSTED_MONITOR_STARTED:
+            _HOSTED_MONITOR_STARTED = True
+            threading.Thread(
+                target=_hosted_runtime_monitor, daemon=True, name="hosted_runtime_monitor"
+            ).start()
+    else:
+        try:
             startup_trade_recovery()
-        else:
-            startup_trade_recovery()
-    except Exception as exc:
-        global RECOVERY_BLOCK_ENTRIES
-        RECOVERY_BLOCK_ENTRIES = True
-        MEMORY["position_status"] = "UNKNOWN"
-        MEMORY["recovery_status"] = "STARTUP_RECOVERY_ERROR"
-        log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
+        except Exception as exc:
+            RECOVERY_BLOCK_ENTRIES = True
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "STARTUP_RECOVERY_ERROR"
+            log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
     return _original_main_loop_sniper()
 
 
@@ -11552,9 +12601,15 @@ DASHBOARD_ACTIVE_PORTS = []
 def start_dashboard_servers():
     """Start Flask dashboard before trading: local ports 8000+8080, hosted PORT only."""
     from werkzeug.serving import make_server
-    hosted_port = os.getenv("PORT")
+    hosted_port = str(os.getenv("PORT") or "").strip()
     if hosted_port:
-        ports = [int(hosted_port)]
+        try:
+            port = int(hosted_port)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Hosting provider supplied an invalid PORT value: {hosted_port!r}") from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"Hosting provider PORT is outside the valid TCP range: {port}")
+        ports = [port]
         bind_host = "0.0.0.0"
     else:
         raw_ports = os.getenv("DASHBOARD_LOCAL_PORTS", "8000,8080")
