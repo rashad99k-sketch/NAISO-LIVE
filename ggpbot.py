@@ -810,6 +810,8 @@ BINGX_API_RELIABILITY = BingXApiReliability(
 # Subscribe lazily only to symbols reaching the execution spread gate.
 BINGX_MARKET_DATA = BingXBookTickerFeed(
     stale_after_sec=_env_float_range("BINGX_BOOK_TICKER_STALE_AFTER_SEC", 1.5, 0.2, 10.0),
+    max_subscriptions=_env_int_range("BINGX_WS_MAX_SUBSCRIPTIONS", 150, 1, 180),
+    subscription_interval_sec=_env_float_range("BINGX_WS_SUBSCRIPTION_INTERVAL_SEC", 0.12, 0.05, 1.0),
     logger=lambda message: (
         globals().get("log_execution", lambda *_a, **_k: None)(message, "INFO")
         if callable(globals().get("log_execution")) else None
