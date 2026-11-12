@@ -1174,29 +1174,24 @@ def get_orderbook_cached(symbol, limit=20, *, rest_fallback=None):
     if STATE.get("open") or TRADE_STATE["in_position"]:
         cached = cache_get(key, 60)
         return cached if cached is not None else None
-    cached = cache_get(key, 1)
-    if cached is not None:
-        return cached
     with _ORDERBOOK_FETCH_LOCKS_LOCK:
         fetch_lock = _ORDERBOOK_FETCH_LOCKS.setdefault(key, threading.Lock())
     with fetch_lock:
-        cached = cache_get(key, 1)
-        if cached is not None:
-            return cached
-        # Full limited-depth snapshots arrive over WS; no local incremental-book
-        # merge is performed, so a reconnect cannot leave a falsely synchronized book.
+        # Prefer the current connection's live snapshot. WS books are not copied
+        # into the generic cache, so reconnects cannot expose a previous socket's book.
         feed = globals().get("BINGX_MARKET_DATA")
         depth = feed.get_depth(symbol, int(limit)) if feed is not None else None
         if depth:
-            ob = {
+            return {
                 "bids": depth.get("bids", []),
                 "asks": depth.get("asks", []),
                 "timestamp": depth.get("server_ts_ms"),
                 "received_mono": depth.get("received_mono"),
                 "source": "BINGX_WS_DEPTH",
             }
-            cache_set(key, ob)
-            return ob
+        cached = cache_get(key, 1)
+        if cached is not None:
+            return cached
         allow_rest = (
             BINGX_REST_DEPTH_FALLBACK_ENABLED
             if rest_fallback is None else bool(rest_fallback)
