@@ -1080,40 +1080,54 @@ def get_ohlcv_safe(symbol, limit=120, htf=False):
 
 
 def get_ohlcv_safe_meta(symbol, limit=120, htf=False):
-    """Return (frame, source). `source` is CACHE_HIT or FRESH_REQUEST (or NONE).
-
-    A CACHE_HIT means the frame was served from the local cache without any new
-    BingX request; it must never be logged as a new exchange request.
-    """
+    """Return (frame, source); coalesce concurrent identical OHLCV requests."""
     # Increase TTL during open trade to reduce API calls
     ttl = 10 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
         ttl = max(ttl, 30)
     cache_key = f"ohlcv_{symbol}_{INTERVAL}_{limit}_htf" if htf else f"ohlcv_{symbol}_{INTERVAL}_{limit}"
     cached = cache_get(cache_key, ttl)
-    if cached is not None:
-        if len(cached) >= 100:
+    if cached is not None and len(cached) >= 100:
+        return cached, "CACHE_HIT"
+    with _market_data_fetch_lock(cache_key):
+        cached = cache_get(cache_key, ttl)
+        if cached is not None and len(cached) >= 100:
             return cached, "CACHE_HIT"
-    if htf:
-        df = fetch_ohlcv_htf(symbol, '1h', limit)
-    else:
-        df = fetch_ohlcv(symbol, limit)
-    if df is not None and validate_dataframe(df, min(limit, 100)):
-        cache_set(cache_key, df)
-        return df, "FRESH_REQUEST"
-    return None, "NONE"
+        if htf:
+            df = fetch_ohlcv_htf(symbol, '1h', limit)
+        else:
+            df = fetch_ohlcv(symbol, limit)
+        if df is not None and validate_dataframe(df, min(limit, 100)):
+            cache_set(cache_key, df)
+            return df, "FRESH_REQUEST"
+        return None, "NONE"
+
+_MARKET_DATA_FETCH_LOCKS = {}
+_MARKET_DATA_FETCH_LOCKS_LOCK = threading.RLock()
+
+
+def _market_data_fetch_lock(key):
+    with _MARKET_DATA_FETCH_LOCKS_LOCK:
+        return _MARKET_DATA_FETCH_LOCKS.setdefault(str(key), threading.Lock())
+
 
 def get_ticker_safe(symbol, max_age_sec=1.0):
-    # Use a short, caller-controlled TTL for live price
-    cached = cache_get(f"ticker_{symbol}", max_age_sec)
+    # Per-symbol single-flight prevents concurrent scanner/entry threads from
+    # issuing duplicate ticker REST reads for the same cache key.
+    key = f"ticker_{symbol}"
+    cached = cache_get(key, max_age_sec)
     if cached is not None:
         return cached
-    ticker = fetch_ticker(symbol)
-    if ticker:
-        price = ticker["last"]
-        if price and price > 0:
-            cache_set(f"ticker_{symbol}", price)
-            return price
+    with _market_data_fetch_lock(key):
+        cached = cache_get(key, max_age_sec)
+        if cached is not None:
+            return cached
+        ticker = fetch_ticker(symbol)
+        if ticker:
+            price = ticker["last"]
+            if price and price > 0:
+                cache_set(key, price)
+                return price
     return None
 
 def get_balance_safe():
