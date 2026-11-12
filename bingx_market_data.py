@@ -226,7 +226,8 @@ class BingXBookTickerFeed:
                 "subscriptions": len(self._desired),
                 "symbols": sorted(self._books),
                 "book_ages_sec": ages,
-                "depth_subscriptions": len(depth_ages),
+                "depth_subscriptions": sum(1 for channel in self._desired if "@depth" in channel),
+                "depth_snapshots": len(depth_ages),
                 "depth_ages_sec": depth_ages,
                 "last_message_age_sec": (
                     round(max(0.0, now - self._last_message_mono), 3)
