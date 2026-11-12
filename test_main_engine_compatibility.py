@@ -42,7 +42,9 @@ def test_web_dashboard_startup_uses_one_hosted_port_and_two_local_ports():
     function = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.FunctionDef) and node.name == "start_dashboard_servers")
     function_source = ast.get_source_segment(source, function)
-    assert 'hosted_port = os.getenv("PORT")' in function_source
+    assert 'hosted_port = str(os.getenv("PORT") or "").strip()' in function_source
+    assert 'port = int(hosted_port)' in function_source
+    assert 'if not 1 <= port <= 65535' in function_source
     assert 'os.getenv("DASHBOARD_LOCAL_PORTS", "8000,8080")' in function_source
     assert 'bind_host = "0.0.0.0"' in function_source
     assert 'bind_host = os.getenv("DASHBOARD_BIND_HOST", "127.0.0.1")' in function_source
