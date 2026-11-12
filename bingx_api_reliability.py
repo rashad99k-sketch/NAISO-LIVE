@@ -233,7 +233,8 @@ class BingXApiReliability:
                     self._stats["read_calls"] += 1
                 try:
                     result = func(*args, **kwargs)
-                    self._mark_recovery_probe_success()
+                    if method_name != "load_markets":
+                        self._mark_recovery_probe_success()
                     return result
                 except Exception as exc:
                     kind = self.classify(exc)
