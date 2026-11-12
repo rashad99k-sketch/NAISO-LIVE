@@ -1217,6 +1217,11 @@ def get_orderbook_cached(symbol, limit=20, *, rest_fallback=None):
             if rest_fallback is None else bool(rest_fallback)
         )
         if not allow_rest:
+            log_execution(
+                f"[WS_DEPTH_WAIT] {symbol} depth{limit} has no fresh WebSocket snapshot; "
+                "scanner REST fallback is disabled",
+                "INFO", debounce_key=f"ws_depth_wait_{symbol}_{limit}", debounce_sec=60,
+            )
             return None
         ob = fetch_orderbook(symbol, limit)
         if ob:
