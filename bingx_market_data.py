@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import random
 import threading
 import time
@@ -65,7 +66,7 @@ class BingXBookTickerFeed:
     ):
         self.url = url
         self.stale_after_sec = max(0.2, float(stale_after_sec))
-        self.depth_stale_after_sec = max(0.5, float(depth_stale_after_sec))
+        self.depth_stale_after_sec = max(0.5, min(float(depth_stale_after_sec), 10.0))
         self.reconnect_max_sec = max(1.0, float(reconnect_max_sec))
         self.logger = logger or (lambda _message: None)
         self._factory = ws_app_factory
@@ -339,7 +340,7 @@ class BingXBookTickerFeed:
                             quantity = float(row[1])
                         except (TypeError, ValueError, OverflowError):
                             continue
-                        if price is None or quantity < 0 or quantity != quantity:
+                        if price is None or quantity < 0 or not math.isfinite(quantity):
                             continue
                         parsed.append([price, quantity])
                     parsed.sort(key=lambda item: item[0], reverse=reverse)
