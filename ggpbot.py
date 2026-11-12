@@ -1132,6 +1132,21 @@ def get_free_balance_safe():
     return bal
 
 
+POSITION_SIZING_BALANCE_BASIS = str(
+    os.getenv("POSITION_SIZING_BALANCE_BASIS", "AVAILABLE_FREE")
+).strip().upper()
+if POSITION_SIZING_BALANCE_BASIS not in {"AVAILABLE_FREE", "WALLET_TOTAL"}:
+    POSITION_SIZING_BALANCE_BASIS = "AVAILABLE_FREE"
+
+
+def resolve_position_sizing_balance(snapshot):
+    """Select the configured sizing basis without changing the risk gate."""
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    basis = POSITION_SIZING_BALANCE_BASIS
+    field = "total" if basis == "WALLET_TOTAL" else "free"
+    return max(0.0, safe_float(snapshot.get(field), 0.0)), basis
+
+
 def get_wallet_balance_snapshot(max_age_sec=15.0):
     """Return total/free Futures USDT from one timestamped balance snapshot."""
     now = time.time()
@@ -5664,14 +5679,18 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             wallet_snapshot = get_wallet_balance_snapshot()
             free_bal = safe_float(wallet_snapshot.get("free"), 0.0)
             wallet_total = safe_float(wallet_snapshot.get("total"), 0.0)
-            balance_source = "BINGX_FUTURES_FREE_USDT" if not PAPER_MODE else "PAPER"
+            selected_balance, sizing_basis = resolve_position_sizing_balance(wallet_snapshot)
+            balance_source = (
+                "PAPER" if PAPER_MODE else
+                ("BINGX_FUTURES_TOTAL_USDT" if sizing_basis == "WALLET_TOTAL" else "BINGX_FUTURES_FREE_USDT")
+            )
             balance_ts = safe_float(wallet_snapshot.get("timestamp"), 0.0)
-            balance = max(0.0, free_bal * BALANCE_SAFETY_FACTOR)
+            balance = max(0.0, selected_balance * BALANCE_SAFETY_FACTOR)
             log_execution(
-                f"[SIZING_BALANCE_BASIS] basis=AVAILABLE_FREE wallet_total={wallet_total:.4f} "
-                f"free_usdt={free_bal:.4f} safety_factor={BALANCE_SAFETY_FACTOR:.4f} "
-                f"effective_sizing_balance={balance:.4f} source={wallet_snapshot.get('source')} "
-                f"age_sec={max(0.0, time.time() - balance_ts):.2f}",
+                f"[SIZING_BALANCE_BASIS] basis={sizing_basis} wallet_total={wallet_total:.4f} "
+                f"free_usdt={free_bal:.4f} selected_balance={selected_balance:.4f} "
+                f"safety_factor={BALANCE_SAFETY_FACTOR:.4f} effective_sizing_balance={balance:.4f} "
+                f"source={wallet_snapshot.get('source')} age_sec={max(0.0, time.time() - balance_ts):.2f}",
                 "INFO",
             )
             if balance <= 0:
