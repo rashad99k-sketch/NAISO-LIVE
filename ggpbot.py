@@ -7473,10 +7473,6 @@ def finalize_trade_with_reality(symbol, close_reason=None):
         release_reasons.append("RECOVERY_HOLD")
     if globals().get("RECOVERY_BLOCK_ENTRIES", False):
         release_reasons.append("RECOVERY_BLOCK_ENTRIES")
-    position_status = MEMORY.get("position_status")
-    if position_status not in (None, "FLAT"):
-        release_reasons.append(f"POSITION_STATUS_{position_status}")
-
     global _ACTIVE_TRADE
     with _TRADE_LOCK:
         if not release_reasons:
