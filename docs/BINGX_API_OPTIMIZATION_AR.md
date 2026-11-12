@@ -37,7 +37,7 @@ The endpoint limiter is process-local. Run one bot process/replica per API ident
 - Execution-critical reads keep \`force=True\` by default. Close submission, close verification, recovery and other order-critical checks bypass the passive cache.
 - Position caches are invalidated before non-idempotent close writes and after entry exposure is acknowledged.
 - Realized PnL is accounting/dashboard data, not a per-tick execution signal. Successful reads are cached for 30 seconds; failed reads preserve the last good value and use a bounded backoff. Verified closes invalidate the cache.
-- Duplicate concurrent REST depth requests for the same symbol/limit share one fetch.
+- Duplicate concurrent REST depth, ticker, OHLCV and total/free balance reads for the same cache key share one fetch.
 
 ## Position sizing diagnostics
 
