@@ -43,6 +43,8 @@ The endpoint limiter is process-local. Run one bot process/replica per API ident
 
 The normal strategy path defaults to BingX Futures **Free/Available USDT**, after the configured balance safety factor. It can be explicitly switched with `POSITION_SIZING_BALANCE_BASIS=WALLET_TOTAL`; the final exchange free-margin check remains mandatory. Sniper V2 keeps its separate, explicit Wallet Total basis. The default is unchanged.
 
+Before sizing, the structural SL is rounded with BingX market precision and its direction is revalidated. At the final LIVE preflight, stop risk is recalculated from the latest quote, precision-rounded SL, precision-rounded quantity, contract size and execution buffer. A primary entry is blocked if this actual pre-submit risk exceeds its existing risk budget; quantity is never expanded to force the target margin.
+
 The 20% or 30% allocation is a target margin ceiling, not a guaranteed spend. \`MAX_TRADE_RISK_PCT\` limits estimated stop loss as a percentage of that target margin. A wide structural stop therefore reduces the permitted notional and actual margin.
 
 Illustration at 20x:
