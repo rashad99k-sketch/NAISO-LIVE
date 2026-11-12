@@ -211,3 +211,115 @@ def test_sniper_v2_watchlist_scan_rotates_across_universe(monkeypatch):
 def test_sniper_v2_wallet_balance_fails_closed_when_snapshot_missing():
     with pytest.raises(ValueError, match="SNIPER_WALLET_BALANCE_UNAVAILABLE"):
         ggpbot._sniper_v2_wallet_balances(wallet_snapshot=None, paper_mode=False)
+
+
+
+def _entry_test_frame(now_ms, n=100, *, latest_closed_intervals_ago=0, forming=False):
+    tf_ms = 900_000
+    current_bucket = int(now_ms // tf_ms)
+    last_closed_open = (current_bucket - 1 - int(latest_closed_intervals_ago)) * tf_ms
+    timestamps = [last_closed_open - (n - 1 - i) * tf_ms for i in range(n)]
+    prices = [100.0 + i * 0.01 for i in range(n)]
+    frame = pd.DataFrame({
+        "timestamp": timestamps,
+        "open": prices,
+        "high": [p + 0.5 for p in prices],
+        "low": [p - 0.5 for p in prices],
+        "close": [p + 0.1 for p in prices],
+        "volume": [1000.0] * n,
+    })
+    if forming:
+        row = frame.iloc[[-1]].copy()
+        row["timestamp"] = current_bucket * tf_ms
+        frame = pd.concat([frame, row], ignore_index=True)
+    return frame
+
+
+def test_institutional_entry_reuses_same_authorized_closed_frame(monkeypatch):
+    now_ms = int(__import__("time").time() * 1000)
+    frame = _entry_test_frame(now_ms)
+    monkeypatch.setattr(ggpbot, "_entry_exchange_time_ms", lambda: (now_ms, "TEST_EXCHANGE"))
+    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not refetch shared frame")))
+    context = {
+        "exchange_symbol": "BTC/USDT:USDT",
+        "candle_timeframe": "15m",
+        "closed_candle_frame": frame,
+        "closed_candle_source": "SNIPER_V2_CONFIRMED_FRAME",
+    }
+    checked, diagnostic = ggpbot.resolve_entry_closed_candles("BTC/USDT:USDT", context)
+    assert checked is not None
+    assert diagnostic["reason"] == "VALID"
+    assert diagnostic["source"] == "SNIPER_V2_CONFIRMED_FRAME"
+    assert int(checked.timestamp.iloc[-1]) == int(frame.timestamp.iloc[-1])
+
+
+def test_entry_closed_frame_classifies_only_forming_candle():
+    now_ms = int(__import__("time").time() * 1000)
+    tf_ms = 900_000
+    current_open = (now_ms // tf_ms) * tf_ms
+    frame = pd.DataFrame({
+        "timestamp": [current_open], "open": [100.0], "high": [101.0],
+        "low": [99.0], "close": [100.5], "volume": [1000.0],
+    })
+    checked, diagnostic = ggpbot._validate_entry_closed_frame(
+        "BTC/USDT:USDT", frame,
+        {"exchange_symbol": "BTC/USDT:USDT", "candle_timeframe": "15m"},
+        now_ms=now_ms, time_source="TEST_EXCHANGE",
+    )
+    assert checked is None
+    assert diagnostic["reason"] == "ONLY_FORMING_CANDLE"
+
+
+def test_entry_closed_frame_classifies_insufficient_history():
+    now_ms = int(__import__("time").time() * 1000)
+    frame = _entry_test_frame(now_ms, n=60)
+    checked, diagnostic = ggpbot._validate_entry_closed_frame(
+        "BTC/USDT:USDT", frame,
+        {"exchange_symbol": "BTC/USDT:USDT", "candle_timeframe": "15m"},
+        now_ms=now_ms, time_source="TEST_EXCHANGE",
+    )
+    assert checked is None
+    assert diagnostic["reason"] == "INSUFFICIENT_CLOSED_BARS"
+
+
+def test_entry_closed_frame_classifies_stale_market_data():
+    now_ms = int(__import__("time").time() * 1000)
+    frame = _entry_test_frame(now_ms, latest_closed_intervals_ago=3)
+    checked, diagnostic = ggpbot._validate_entry_closed_frame(
+        "BTC/USDT:USDT", frame,
+        {"exchange_symbol": "BTC/USDT:USDT", "candle_timeframe": "15m"},
+        now_ms=now_ms, time_source="TEST_EXCHANGE",
+    )
+    assert checked is None
+    assert diagnostic["reason"] == "CLOSED_CANDLE_STALE"
+
+
+def test_entry_closed_frame_rejects_symbol_or_timeframe_mismatch():
+    now_ms = int(__import__("time").time() * 1000)
+    frame = _entry_test_frame(now_ms)
+    wrong_symbol, symbol_diag = ggpbot._validate_entry_closed_frame(
+        "BTC/USDT:USDT", frame,
+        {"exchange_symbol": "ETH/USDT:USDT", "candle_timeframe": "15m"},
+        now_ms=now_ms, time_source="TEST_EXCHANGE",
+    )
+    wrong_tf, tf_diag = ggpbot._validate_entry_closed_frame(
+        "BTC/USDT:USDT", frame,
+        {"exchange_symbol": "BTC/USDT:USDT", "candle_timeframe": "1h"},
+        now_ms=now_ms, time_source="TEST_EXCHANGE",
+    )
+    assert wrong_symbol is None and symbol_diag["reason"] == "SYMBOL_TIMEFRAME_MISMATCH"
+    assert wrong_tf is None and tf_diag["reason"] == "SYMBOL_TIMEFRAME_MISMATCH"
+
+
+def test_entry_data_rejection_populates_dashboard_why_no_entry():
+    before = len(ggpbot.MEMORY.get("no_entry_feed", []))
+    ggpbot.record_entry_data_rejection(
+        "BTC/USDT:USDT", "SELL",
+        {"reason": "OHLCV_RATE_LIMITED", "detail": "test rate limit"},
+    )
+    item = ggpbot.MEMORY["no_entry_feed"][-1]
+    assert len(ggpbot.MEMORY["no_entry_feed"]) == before + 1
+    assert item["category"] == "OHLCV_RATE_LIMITED"
+    assert item["stage"] == "INSTITUTIONAL_ENTRY_GATE"
+    assert "OHLCV_RATE_LIMITED" in item["reason"]
+    assert ggpbot.MEMORY["entry_rejection_metrics"]["OHLCV_RATE_LIMITED"] >= 1

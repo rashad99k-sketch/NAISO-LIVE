@@ -526,6 +526,7 @@ CACHE = {
 _last_api_call = 0.0
 MIN_API_INTERVAL = _env_float_range("MIN_API_INTERVAL", 0.35, 0.20, 2.0)
 _API_RATE_LOCK = threading.Lock()
+_LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
 def rate_limit():
     """Serialize request-start scheduling across scanner and management threads."""
@@ -589,6 +590,11 @@ def safe_api_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             if "rate limit" in str(e).lower() or "100410" in str(e):
+                _LAST_API_RATE_LIMIT.update({
+                    "ts": time.time(),
+                    "method": getattr(func, "__name__", "exchange_call"),
+                    "message": str(e)[:180],
+                })
                 wait = min(8, 2 ** attempt)
                 try:
                     log_execution(
@@ -868,25 +874,71 @@ def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.D
     return df
 
 # ========== DATA FETCHING (OPTIMIZED CACHE) ==========
+OHLCV_FETCH_DIAGNOSTICS = {}
+
+def _record_ohlcv_fetch_diagnostic(symbol, reason, *, received=0, detail=""):
+    key = str(symbol or "")
+    OHLCV_FETCH_DIAGNOSTICS[key] = {
+        "reason": str(reason),
+        "received_candles": int(received or 0),
+        "detail": str(detail or "")[:180],
+        "timestamp": time.time(),
+        "timeframe": str(INTERVAL),
+    }
+
+
 def fetch_ohlcv(symbol, limit=150):
+    started_at = time.time()
+    sym = str(symbol or "")
     try:
         sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
-        if not data or len(data) < 100:
+        if not data:
+            rate = _LAST_API_RATE_LIMIT
+            reason = (
+                "OHLCV_RATE_LIMITED"
+                if rate.get("method") == "fetch_ohlcv" and float(rate.get("ts", 0.0)) >= started_at
+                else "OHLCV_EMPTY"
+            )
+            _record_ohlcv_fetch_diagnostic(sym, reason, detail="exchange returned no OHLCV rows")
+            return None
+        if len(data) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(data),
+                detail=f"fetcher minimum is 100 rows; received {len(data)}",
+            )
             return None
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
-        df = df.dropna()
+        for col in ["timestamp", "open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
         if len(df) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
+                detail=f"only {len(df)} complete OHLCV rows remained after validation",
+            )
             return None
-        if (df['close'] == 0).any() or (df['high'] == 0).any() or (df['low'] == 0).any():
+        if (df[["close", "high", "low"]] <= 0).any().any():
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_EMPTY", received=len(df), detail="non-positive OHLC value",
+            )
             return None
-        df = df.sort_index().drop_duplicates(subset=['timestamp']).ffill().bfill()
+        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
         if len(df) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
+                detail=f"only {len(df)} unique OHLCV rows remained",
+            )
             return None
+        _record_ohlcv_fetch_diagnostic(sym, "OK", received=len(df))
         return df
     except Exception as e:
+        rate_limited = "rate limit" in str(e).lower() or "100410" in str(e)
+        _record_ohlcv_fetch_diagnostic(
+            sym,
+            "OHLCV_RATE_LIMITED" if rate_limited else "OHLCV_EMPTY",
+            detail=f"{type(e).__name__}: {e}",
+        )
         print(color_text(f"fetch_ohlcv error for {symbol}: {e}", YELLOW))
         return None
 
@@ -5003,6 +5055,303 @@ def close_partial(ratio):
     # This is kept for backward compatibility; use safe_close_partial now
     return safe_close_partial(STATE["current_symbol"], ratio)
 
+
+# ========== INSTITUTIONAL ENTRY CLOSED-CANDLE GATE ==========
+ENTRY_CLOSED_CANDLE_MIN_BARS = 80
+ENTRY_CLOSED_CANDLE_MAX_AGE_INTERVALS = 2.0
+ENTRY_CANDLE_RETRY_DELAY_SEC = 0.35
+_ENTRY_TIME_LOCK = threading.Lock()
+_ENTRY_TIME_SNAPSHOT = {"monotonic": 0.0, "epoch_ms": 0, "source": "LOCAL_UTC_EPOCH"}
+
+
+def _entry_exchange_time_ms():
+    """Use cached BingX server time where available; otherwise use UTC epoch time."""
+    now_mono = time.monotonic()
+    with _ENTRY_TIME_LOCK:
+        snap = dict(_ENTRY_TIME_SNAPSHOT)
+        if snap["epoch_ms"] > 0 and now_mono - snap["monotonic"] <= 15.0:
+            return int(snap["epoch_ms"] + (now_mono - snap["monotonic"]) * 1000.0), snap["source"]
+
+        epoch_ms = None
+        source = "LOCAL_UTC_EPOCH"
+        exchange_obj = globals().get("ex")
+        has = getattr(exchange_obj, "has", {}) if exchange_obj is not None else {}
+        fetch_time = getattr(exchange_obj, "fetch_time", None) if exchange_obj is not None else None
+        if callable(fetch_time) and isinstance(has, dict) and has.get("fetchTime"):
+            try:
+                value = safe_api_call(fetch_time)
+                if value is not None:
+                    candidate = int(float(value))
+                    epoch_ms = candidate if candidate > 10**12 else candidate * 1000
+                    if epoch_ms > 0:
+                        source = "BINGX_SERVER_TIME"
+            except Exception as exc:
+                logger = globals().get("log_execution")
+                if logger:
+                    logger(
+                        f"[ENTRY_TIME] exchange time unavailable; UTC epoch fallback ({type(exc).__name__})",
+                        "WARN", debounce_key="entry_exchange_time_fallback", debounce_sec=60,
+                    )
+        if epoch_ms is None:
+            epoch_ms = int(time.time() * 1000)
+
+        _ENTRY_TIME_SNAPSHOT.update({
+            "monotonic": now_mono, "epoch_ms": epoch_ms, "source": source,
+        })
+        return int(epoch_ms), source
+
+
+def _entry_symbol_key(symbol):
+    canonical = globals().get("roro_canonical_symbol")
+    try:
+        return str(canonical(symbol)) if callable(canonical) else str(symbol).strip().upper()
+    except Exception:
+        return str(symbol).strip().upper()
+
+
+def _validate_entry_closed_frame(symbol, frame, context=None, *, now_ms=None, time_source=""):
+    """Validate symbol/timeframe, closed-bar status, age and minimum history."""
+    context = context if isinstance(context, dict) else {}
+    expected_symbol = context.get("exchange_symbol") or context.get("symbol")
+    if expected_symbol and _entry_symbol_key(expected_symbol) != _entry_symbol_key(symbol):
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": f"context_symbol={expected_symbol} requested_symbol={symbol}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    expected_tf = str(INTERVAL)
+    context_tf = str(context.get("candle_timeframe") or expected_tf)
+    if context_tf != expected_tf:
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": f"context_timeframe={context_tf} expected_timeframe={expected_tf}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        fetch_diag = OHLCV_FETCH_DIAGNOSTICS.get(str(normalize_symbol(symbol)), {})
+        last_rate = _LAST_API_RATE_LIMIT
+        rate_recent = (
+            last_rate.get("method") == "fetch_ohlcv"
+            and time.time() - float(last_rate.get("ts", 0.0)) <= 15.0
+        )
+        reason = fetch_diag.get("reason")
+        if reason not in {"OHLCV_RATE_LIMITED", "INSUFFICIENT_CLOSED_BARS"}:
+            reason = "OHLCV_RATE_LIMITED" if rate_recent else "OHLCV_EMPTY"
+        return None, {
+            "reason": reason,
+            "detail": fetch_diag.get("detail") or "no usable OHLCV frame was available",
+            "received_candles": int(fetch_diag.get("received_candles", 0) or 0),
+            "source": context.get("closed_candle_source", "EXCHANGE_FETCH"),
+        }
+
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    if not required.issubset(set(frame.columns)):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": f"missing_columns={sorted(required - set(frame.columns))}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    timestamps = pd.to_numeric(frame["timestamp"], errors="coerce").dropna()
+    if timestamps.empty or float(timestamps.max()) < 10**12:
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": "timestamps are missing or not Unix milliseconds",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+    timeframe_s = int(_roro_timeframe_seconds(expected_tf))
+    expected_interval_ms = timeframe_s * 1000
+    diffs = timestamps.sort_values().diff().dropna()
+    positive_diffs = diffs[diffs > 0]
+    if len(positive_diffs) >= 5:
+        median_interval_ms = float(positive_diffs.median())
+        ratio = median_interval_ms / float(expected_interval_ms)
+        if not 0.80 <= ratio <= 1.20:
+            return None, {
+                "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+                "detail": (
+                    f"median_bar_interval_ms={median_interval_ms:.0f} "
+                    f"expected_interval_ms={expected_interval_ms}"
+                ),
+                "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+            }
+
+    if now_ms is None:
+        now_ms, time_source = _entry_exchange_time_ms()
+    validator = globals().get("roro_validate_closed_frame")
+    if not callable(validator):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": "closed-candle validator is unavailable",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+    try:
+        closed = validator(
+            frame.copy(), now_ms=int(now_ms), timeframe_s=timeframe_s,
+        )
+    except Exception as exc:
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": f"validator_error={type(exc).__name__}:{exc}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    source = context.get("closed_candle_source", "ENTRY_CONTEXT")
+    received = int(len(frame))
+    closed_count = int(len(closed)) if isinstance(closed, pd.DataFrame) else 0
+    if closed_count == 0:
+        return None, {
+            "reason": "ONLY_FORMING_CANDLE",
+            "detail": "OHLCV rows exist but none has a confirmed close time",
+            "received_candles": received,
+            "closed_candles": 0,
+            "time_source": time_source,
+            "source": source,
+        }
+    if closed_count < ENTRY_CLOSED_CANDLE_MIN_BARS:
+        return None, {
+            "reason": "INSUFFICIENT_CLOSED_BARS",
+            "detail": (
+                f"closed_candles={closed_count} "
+                f"required={ENTRY_CLOSED_CANDLE_MIN_BARS}"
+            ),
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+
+    last_open_ms = int(float(closed["timestamp"].iloc[-1]))
+    close_time_ms = last_open_ms + expected_interval_ms
+    age_ms = int(now_ms) - close_time_ms
+    if age_ms < -2000:
+        return None, {
+            "reason": "ONLY_FORMING_CANDLE",
+            "detail": f"latest_bar_not_closed_yet_by_exchange_time age_ms={age_ms}",
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+    max_age_ms = int(expected_interval_ms * ENTRY_CLOSED_CANDLE_MAX_AGE_INTERVALS)
+    if age_ms > max_age_ms:
+        return None, {
+            "reason": "CLOSED_CANDLE_STALE",
+            "detail": (
+                f"last_closed_ts={last_open_ms} age_sec={age_ms / 1000.0:.1f} "
+                f"max_age_sec={max_age_ms / 1000.0:.1f}"
+            ),
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+    if not validate_dataframe(closed, ENTRY_CLOSED_CANDLE_MIN_BARS):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": "closed OHLCV frame failed structural/finite data validation",
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+
+    return closed.reset_index(drop=True), {
+        "reason": "VALID",
+        "received_candles": received,
+        "closed_candles": closed_count,
+        "last_closed_candle_ts": last_open_ms,
+        "closed_candle_age_sec": round(max(0.0, age_ms / 1000.0), 3),
+        "time_source": time_source,
+        "source": source,
+        "timeframe": expected_tf,
+    }
+
+
+def resolve_entry_closed_candles(symbol, context=None):
+    """Reuse the exact authorized frame; perform at most one short fresh retry."""
+    context = context if isinstance(context, dict) else {}
+    shared_frame = context.get("closed_candle_frame")
+    if isinstance(shared_frame, pd.DataFrame):
+        frame = shared_frame.copy()
+        source = str(context.get("closed_candle_source") or "SHARED_AUTHORIZATION_FRAME")
+    else:
+        frame = get_ohlcv_safe(symbol, 150)
+        source = "SCANNER_CACHE_OR_EXCHANGE"
+
+    local_context = dict(context)
+    local_context.setdefault("exchange_symbol", symbol)
+    local_context.setdefault("candle_timeframe", str(INTERVAL))
+    local_context["closed_candle_source"] = source
+
+    final_frame = None
+    final_diag = None
+    for attempt in range(2):
+        if attempt == 1:
+            # Only one bounded retry. It bypasses the generic 30/90s frame cache.
+            time.sleep(ENTRY_CANDLE_RETRY_DELAY_SEC)
+            frame = fetch_ohlcv(symbol, 150)
+            source = "FRESH_EXCHANGE_RETRY"
+            local_context["closed_candle_source"] = source
+        now_ms, time_source = _entry_exchange_time_ms()
+        checked, diagnostic = _validate_entry_closed_frame(
+            symbol, frame, local_context, now_ms=now_ms, time_source=time_source,
+        )
+        if checked is not None:
+            final_frame, final_diag = checked, diagnostic
+            break
+        final_diag = diagnostic
+        reason = str(diagnostic.get("reason", "OHLCV_EMPTY"))
+        if reason in {"OHLCV_RATE_LIMITED", "SYMBOL_TIMEFRAME_MISMATCH"}:
+            break
+
+    MEMORY.setdefault("last_closed_candle_validation", {}).update({
+        "symbol": str(symbol),
+        **(final_diag or {"reason": "OHLCV_EMPTY"}),
+        "checked_at": time.time(),
+    })
+    if final_frame is not None:
+        log_execution(
+            f"[ENTRY_CANDLE_VALID] {symbol} timeframe={final_diag.get('timeframe')} "
+            f"closed={final_diag.get('closed_candles')} "
+            f"last_closed_ts={final_diag.get('last_closed_candle_ts')} "
+            f"age_sec={final_diag.get('closed_candle_age_sec')} "
+            f"time_source={final_diag.get('time_source')} source={final_diag.get('source')}",
+            "INFO",
+        )
+    return final_frame, (final_diag or {"reason": "OHLCV_EMPTY"})
+
+
+def record_entry_data_rejection(symbol, side, diagnostic, *, stage="INSTITUTIONAL_ENTRY_GATE"):
+    """Feed structured candle-data rejections into the Dashboard WHY NO ENTRY panel."""
+    diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+    reason_code = str(diagnostic.get("reason") or "OHLCV_EMPTY")
+    detail = str(diagnostic.get("detail") or "closed-candle validation failed")
+    now = time.time()
+    metrics = MEMORY.setdefault("entry_rejection_metrics", {})
+    metrics[reason_code] = int(metrics.get(reason_code, 0) or 0) + 1
+    MEMORY["last_closed_candle_validation"] = {
+        "symbol": str(symbol), "side": str(side), "reason": reason_code,
+        "detail": detail, "stage": stage, "checked_at": now,
+        **{k: v for k, v in diagnostic.items() if k not in {"reason", "detail"}},
+    }
+    feed = MEMORY.setdefault("no_entry_feed", [])
+    feed.append({
+        "time": now, "symbol": str(symbol), "side": str(side),
+        "reason": f"{reason_code}: {detail}", "score": None,
+        "category": reason_code, "stage": stage,
+    })
+    MEMORY["no_entry_feed"] = feed[-100:]
+    log_execution(
+        f"[ENTRY_DATA_REJECT] {symbol} {side} stage={stage} reason={reason_code} detail={detail}",
+        "ERROR",
+        debounce_key=f"entry_data_reject:{symbol}:{reason_code}",
+        debounce_sec=5,
+    )
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     # Canonicalize once at the strategy/execution boundary so every downstream
     # risk, position, SL/TP and management branch sees the same direction token.
@@ -5185,7 +5534,21 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
-    df = get_ohlcv_safe(symbol, 100)
+    institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
+    if not PAPER_MODE and MODE_LIVE and institutional_ctx:
+        df, candle_diagnostic = resolve_entry_closed_candles(symbol, institutional_ctx)
+        if df is None:
+            record_entry_data_rejection(symbol, side, candle_diagnostic)
+            log_execution(
+                f"[ENTRY] {candle_diagnostic.get('reason', 'OHLCV_EMPTY')} for authorized "
+                f"institutional setup; LIVE blocked",
+                "ERROR",
+            )
+            return False
+    else:
+        # Preserve the existing PAPER and legacy/manual data path.
+        df = get_ohlcv_safe(symbol, 100)
+
     adx_series = compute_adx(df) if df is not None else None
     adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else 20.0
 
@@ -5210,9 +5573,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 valid = False
             if not valid:
                 log_execution(f"[ENTRY] Institutional authorization incomplete for {setup}; LIVE blocked", "ERROR")
-                return False
-            if df is None:
-                log_execution("[ENTRY] No closed-candle data for authorized institutional setup; LIVE blocked", "ERROR")
                 return False
             # ADX, EMA and VWAP remain contextual evidence. They are not universal entry gates.
             log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f} treated as context, not a hard cross gate", "INFO")
@@ -8200,6 +8560,8 @@ def data():
             "ema9_vwap_proximity_scanner_meta": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}),
             "watchlist": watchlist_data,
             "no_entry_feed": no_entry_feed,
+            "entry_rejection_metrics": MEMORY.get("entry_rejection_metrics", {}),
+            "last_closed_candle_validation": MEMORY.get("last_closed_candle_validation", {}),
             "continuation_probability": STATE.get("continuation_probability", 0.5),
             "hold_quality": STATE.get("hold_quality", "UNKNOWN"),
             "counter_pressure": STATE.get("counter_pressure", 0.0),
@@ -8919,6 +9281,10 @@ def sniper_engine_v2():
                 "exchange_symbol": symbol, "sniper_v2": True,
                 "capital_allocation_tier": "STANDARD_20_PERCENT",
                 "sizing_eligible_strong": False, "sizing_balance_basis": "WALLET_TOTAL",
+                "candle_timeframe": str(INTERVAL),
+                "closed_candle_frame": closed.copy(),
+                "closed_candle_source": "SNIPER_V2_CONFIRMED_FRAME",
+                "closed_candle_timestamp": int(closed["timestamp"].iloc[-1]),
             }
             try:
                 ok = execute_entry(
@@ -9287,7 +9653,7 @@ except Exception as _integration_init_error:
     log_execution(f"[INTEGRATION] optional persistence unavailable: {_integration_init_error}", "WARN")
 
 def _integration_fetch_frame(symbol):
-    return get_ohlcv_safe(roro_exchange_symbol(symbol), 150)
+    return _get_scanner_frame(roro_exchange_symbol(symbol), 150)
 
 # Per-symbol stateful trend/context engines. Keeping these instances separate avoids
 # one asset's trend state leaking into another asset's Watchlist decision.
@@ -9550,6 +9916,10 @@ def smart_opportunity_selection():
                 "pullback_type": next((x.split(":", 1)[0] for x in evidence
                                         if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,
+                "candle_timeframe": str(INTERVAL),
+                "closed_candle_frame": closed_df.copy(),
+                "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
+                "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
             try:
