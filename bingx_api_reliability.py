@@ -32,6 +32,8 @@ class BingXApiReliability:
         system_busy_cooldown: float = 20.0,
         risk_control_cooldown: float = 60.0,
         endpoint_min_intervals: Optional[Dict[str, float]] = None,
+        retry_jitter_ratio: float = 0.20,
+        random_uniform: Callable[[float, float], float] = random.uniform,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         logger: Optional[Callable[[str], None]] = None,
