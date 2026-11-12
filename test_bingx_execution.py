@@ -522,6 +522,8 @@ def test_entry_write_rate_limit_is_observed_without_replaying_order():
         def create_order(self, *args, **kwargs):
             self.create_order_calls += 1
             raise RuntimeError("HTTP 429 Too Many Requests")
+        def fetch_order(self, *args, **kwargs):
+            return None
 
     exchange = RateLimitedExchange()
     exchange.create_order_calls = 0
