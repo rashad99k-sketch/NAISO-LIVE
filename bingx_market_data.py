@@ -11,6 +11,7 @@ import random
 import threading
 import time
 import uuid
+import zlib
 from typing import Any, Callable, Dict, Optional
 
 try:
@@ -115,8 +116,9 @@ class BingXBookTickerFeed:
     def subscribe(self, symbol: str) -> bool:
         channel = self._channel(symbol)
         with self._lock:
+            is_new = channel not in self._desired
             self._desired.add(channel)
-            ws = self._ws if self._connected else None
+            ws = self._ws if self._connected and is_new else None
         if ws is not None:
             self._send_subscribe(ws, channel)
         return self.start()
@@ -184,7 +186,7 @@ class BingXBookTickerFeed:
             if isinstance(message, bytes):
                 try:
                     raw = gzip.decompress(message).decode("utf-8")
-                except (OSError, EOFError):
+                except (OSError, EOFError, zlib.error):
                     raw = message.decode("utf-8")
             else:
                 raw = str(message)
