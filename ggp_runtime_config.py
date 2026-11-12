@@ -27,3 +27,16 @@ def resolve_trading_mode(env: Mapping[str, str]) -> Tuple[bool, bool, str]:
             str(env.get("BINGX_API_SECRET") or "").strip()):
         return True, False, "LIVE request ignored: BingX credentials are missing"
     return False, True, "LIVE explicitly acknowledged with credentials"
+
+
+def is_hosted_runtime(env: Mapping[str, str]) -> bool:
+    """Detect PaaS environments before loading local dotenv values.
+
+    PORT alone is a reliable hosting signal for common web-service platforms;
+    provider markers cover hosts that do not inject PORT until process launch.
+    """
+    if str(env.get("PORT") or "").strip():
+        return True
+    return any(str(env.get(name) or "").strip() for name in (
+        "RENDER", "RAILWAY_ENVIRONMENT", "DYNO", "FLY_APP_NAME",
+    ))
