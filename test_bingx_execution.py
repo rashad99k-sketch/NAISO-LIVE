@@ -78,14 +78,17 @@ def test_hedge_open_and_close_params_never_send_reduce_only():
                                        reduce_only_required=True) == {"positionSide": "SHORT"}
 
 
-def test_unknown_mode_is_fail_closed():
+def test_unknown_position_mode_is_rejected_before_market_submission():
     class Unknown(FakeExchange):
         def fetch_position_mode(self, symbol=None):
             return {"info": {"data": {"unexpected": "value"}}}
-    result = TradeExecutionService(Unknown()).submit_market_entry(symbol="BTC/USDT:USDT", side="BUY", quantity=1)
-    assert result.state is ExecutionState.EXECUTION_UNCERTAIN
+    exchange = Unknown()
+    result = TradeExecutionService(exchange).submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=1)
+    assert result.state is ExecutionState.REJECTED
     assert result.position_mode == "UNKNOWN"
     assert not result.raw_order
+    assert not [call for call in exchange.create_calls if call[1] == "market"]
 
 
 def test_adapter_normalizes_nested_dual_side_response():
@@ -144,14 +147,58 @@ def test_hedge_entry_uses_long_position_side_and_long_leverage_side():
     assert exchange.create_calls[0][4]["positionSide"] == "LONG"
 
 
-def test_partial_fill_is_not_marked_active_or_complete():
-    exchange = FakeExchange(order={"id": "ex-p", "status": "open", "filled": 1.0,
-                                   "remaining": 1.0, "average": 100.0})
+class PartialFillExchange(FakeExchange):
+    def __init__(self, *, terminal_after_cancel=True):
+        super().__init__(
+            order={"id": "ex-p", "status": "open", "filled": 1.0,
+                   "remaining": 1.0, "average": 100.0},
+            position={"symbol": "BTC/USDT:USDT", "side": "long",
+                      "contracts": 1.0, "entryPrice": 100.0},
+        )
+        self.cancel_calls = []
+        self.terminal_after_cancel = terminal_after_cancel
+
+    def cancel_order(self, order_id, symbol=None, params=None):
+        self.cancel_calls.append((str(order_id), symbol))
+        if self.terminal_after_cancel:
+            self.order = {**self.order, "status": "canceled"}
+        return {"id": str(order_id), "status": "canceled"}
+
+
+def test_partial_fill_cancels_remainder_and_verifies_actual_position():
+    exchange = PartialFillExchange()
     result = TradeExecutionService(exchange).submit_market_entry(
         symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-partial")
     assert result.state is ExecutionState.PARTIAL_FILL
     assert result.filled_qty == 1
     assert result.remaining_qty == 1
+    assert result.order_terminal is True
+    assert result.raw_position is not None
+    assert exchange.cancel_calls == [("ex-p", "BTC/USDT:USDT")]
+    assert len([call for call in exchange.create_calls if call[1] == "market"]) == 1
+
+
+def test_partial_fill_cancel_without_terminal_readback_is_uncertain():
+    exchange = PartialFillExchange(terminal_after_cancel=False)
+    result = TradeExecutionService(exchange).submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-partial-ambiguous")
+    assert result.state is ExecutionState.EXECUTION_UNCERTAIN
+    assert result.filled_qty == 1
+    assert result.order_terminal is False
+    assert result.raw_position is not None
+    assert len([call for call in exchange.create_calls if call[1] == "market"]) == 1
+
+
+def test_position_entry_price_falls_back_when_order_average_and_trades_missing():
+    exchange = FakeExchange(
+        order={"id": "ex-position-price", "status": "closed", "filled": 2, "remaining": 0},
+        position={"symbol": "BTC/USDT:USDT", "side": "long",
+                  "contracts": 2.0, "entryPrice": 101.25},
+    )
+    result = TradeExecutionService(exchange).submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-position-price")
+    assert result.state is ExecutionState.FILLED
+    assert result.average_fill_price == pytest.approx(101.25)
 
 
 def test_rejected_order_is_not_a_position():
