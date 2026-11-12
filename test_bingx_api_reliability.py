@@ -211,3 +211,11 @@ def test_transient_read_retry_uses_bounded_jitter():
     assert policy.call_read(exchange.fetch_positions) == []
     assert exchange.calls == 2
     assert waits == [pytest.approx(0.30)]
+
+
+def test_api_cooldown_blocks_new_entries_explicitly():
+    policy = BingXApiReliability(sleep=lambda _seconds: None)
+    policy._set_cooldown(12.0, "HTTP_418_BAN")
+
+    with pytest.raises(ApiCooldownError):
+        policy.assert_new_entry_allowed()
