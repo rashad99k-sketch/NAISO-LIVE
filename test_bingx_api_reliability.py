@@ -219,3 +219,32 @@ def test_api_cooldown_blocks_new_entries_explicitly():
 
     with pytest.raises(ApiCooldownError):
         policy.assert_new_entry_allowed()
+
+
+@pytest.mark.parametrize("method_name", [
+    "fetch_ticker", "fetch_ohlcv", "fetch_trades", "load_markets",
+])
+def test_other_documented_market_data_methods_are_endpoint_paced(method_name):
+    class Exchange:
+        def fetch_ticker(self):
+            return {}
+        def fetch_ohlcv(self):
+            return []
+        def fetch_trades(self):
+            return []
+        def load_markets(self):
+            return {}
+
+    now = [0.0]
+    waits = []
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    exchange = Exchange()
+    policy = BingXApiReliability(clock=lambda: now[0], sleep=sleep)
+    method = getattr(exchange, method_name)
+    policy.call_read(method)
+    policy.call_read(method)
+
+    assert waits == [pytest.approx(1.05)]
