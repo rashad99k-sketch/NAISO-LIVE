@@ -221,15 +221,15 @@ class BingXApiReliability:
                             self._stats["banned"] += 1
                         retry_after = self._retry_after(exc)
                         cooldown = max(self.ban_cooldown, retry_after or 0.0)
-                        self._set_cooldown(min(cooldown, 3600.0), "HTTP_418_BAN")
-                        self._logger(f"[BINGX_API] HTTP 418 ban detected; API circuit paused for {min(cooldown, 3600.0):.0f}s")
+                        self._set_cooldown(cooldown, "HTTP_418_BAN")
+                        self._logger(f"[BINGX_API] HTTP 418 ban detected; API circuit paused for {cooldown:.0f}s")
                         raise
                     if kind == "SYSTEM_BUSY":
                         with self._lock:
                             self._stats["system_busy"] += 1
                         retry_after = self._retry_after(exc)
                         cooldown = max(self.system_busy_cooldown, retry_after or 0.0)
-                        self._set_cooldown(min(cooldown, 3600.0), "BINGX_109500_SYSTEM_BUSY")
+                        self._set_cooldown(cooldown, "BINGX_109500_SYSTEM_BUSY")
                         self._logger(
                             f"[BINGX_API] 109500 system busy; reads paused for {min(cooldown, 3600.0):.0f}s"
                         )
@@ -239,7 +239,7 @@ class BingXApiReliability:
                             self._stats["risk_control"] += 1
                         retry_after = self._retry_after(exc)
                         cooldown = max(self.risk_control_cooldown, retry_after or 0.0)
-                        self._set_cooldown(min(cooldown, 3600.0), "BINGX_RISK_CONTROL")
+                        self._set_cooldown(cooldown, "BINGX_RISK_CONTROL")
                         self._logger(
                             f"[BINGX_API] risk-control response; reads paused for {min(cooldown, 3600.0):.0f}s"
                         )
@@ -256,7 +256,7 @@ class BingXApiReliability:
                             self._logger(f"[BINGX_API] Rate limited; one bounded read retry after {wait:.2f}s")
                             self._sleep(wait)
                             continue
-                        self._set_cooldown(min(max(wait, self.rate_limit_cooldown), 3600.0), "HTTP_429_RATE_LIMIT")
+                        self._set_cooldown(max(wait, self.rate_limit_cooldown), "HTTP_429_RATE_LIMIT")
                         raise
                     if kind == "TRANSIENT":
                         with self._lock:
