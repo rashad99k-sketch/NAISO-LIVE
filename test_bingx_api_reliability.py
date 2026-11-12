@@ -248,3 +248,11 @@ def test_other_documented_market_data_methods_are_endpoint_paced(method_name):
     policy.call_read(method)
 
     assert waits == [pytest.approx(1.05)]
+
+
+def test_single_shot_write_rate_limit_sets_global_entry_cooldown():
+    policy = BingXApiReliability(sleep=lambda _seconds: None)
+    kind = policy.observe_error(RuntimeError("HTTP 429 Too Many Requests"), "create_order")
+    assert kind == "RATE_LIMIT"
+    with pytest.raises(ApiCooldownError):
+        policy.assert_new_entry_allowed()
