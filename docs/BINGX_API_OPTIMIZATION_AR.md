@@ -23,7 +23,7 @@ The existing 20x leverage configuration and read-back remain in place. MARKET an
 CCXT's built-in rate limiter remains enabled. A shared application-level controller adds:
 
 - Bounded concurrency for read requests.
-- Endpoint pacing for public market-data reads whose current BingX documentation specifies 1 request/second/IP, including depth, ticker, klines, trades and market catalogue reads.
+- Endpoint pacing at 1.05 seconds for the explicitly documented 1 request/second/IP methods: REST depth, klines, recent trades and contract catalogue reads. Other methods retain the shared CCXT/application limiter unless their endpoint-specific rate is documented.
 - A shared cooldown for HTTP 429, HTTP 418, BingX 100410, 109403, 109429 and 109500 responses.
 - One bounded retry for safe transient read failures; no automatic retry for order writes or unknown methods.
 - A 418 cooldown defaults to 15 minutes. Do not treat the cooldown expiry as proof that an IP ban has been lifted; verify API recovery before enabling new entries.
