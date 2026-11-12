@@ -115,3 +115,75 @@ def test_fatal_auth_error_is_not_retried():
         policy.call_read(exchange.fetch_balance)
     assert exchange.calls == 1
     assert policy.snapshot()["fatal_failures"] == 1
+
+
+def test_public_market_data_endpoint_has_independent_one_per_second_pacing():
+    class Exchange:
+        def __init__(self):
+            self.calls = 0
+        def fetch_order_book(self):
+            self.calls += 1
+            return {"bids": [], "asks": []}
+
+    now = [0.0]
+    waits = []
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    exchange = Exchange()
+    policy = BingXApiReliability(
+        endpoint_min_intervals={"fetch_order_book": 1.05},
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    policy.call_read(exchange.fetch_order_book)
+    policy.call_read(exchange.fetch_order_book)
+
+    assert exchange.calls == 2
+    assert waits == [pytest.approx(1.05)]
+    assert policy.snapshot()["endpoint_waits"] == 1
+
+
+def test_bingx_109500_system_busy_is_not_retried_and_enters_cooldown():
+    class Exchange:
+        def __init__(self):
+            self.calls = 0
+        def fetch_positions(self):
+            self.calls += 1
+            raise RuntimeError(
+                'bingx {"code":109500,"msg":"The current system is busy, please try again later"}'
+            )
+
+    exchange = Exchange()
+    policy = BingXApiReliability(
+        system_busy_cooldown=20.0,
+        sleep=lambda _seconds: None,
+    )
+    with pytest.raises(RuntimeError):
+        policy.call_read(exchange.fetch_positions)
+    assert exchange.calls == 1
+    assert policy.snapshot()["system_busy"] == 1
+    with pytest.raises(ApiCooldownError):
+        policy.call_read(exchange.fetch_positions)
+    assert exchange.calls == 1
+
+
+@pytest.mark.parametrize("code", [109403, 109429])
+def test_bingx_risk_control_codes_open_cooldown_without_retry(code):
+    class Exchange:
+        def __init__(self):
+            self.calls = 0
+        def fetch_balance(self):
+            self.calls += 1
+            raise RuntimeError(f"bingx error code={code}")
+
+    exchange = Exchange()
+    policy = BingXApiReliability(sleep=lambda _seconds: None)
+    with pytest.raises(RuntimeError):
+        policy.call_read(exchange.fetch_balance)
+    assert exchange.calls == 1
+    assert policy.snapshot()["risk_control"] == 1
+    with pytest.raises(ApiCooldownError):
+        policy.call_read(exchange.fetch_balance)
+    assert exchange.calls == 1
