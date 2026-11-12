@@ -27,16 +27,30 @@ class BingXApiReliability:
         max_attempts: int = 2,
         max_concurrent: int = 4,
         transient_delay: float = 0.25,
-        rate_limit_cooldown: float = 1.0,
-        ban_cooldown: float = 60.0,
+        rate_limit_cooldown: float = 10.0,
+        ban_cooldown: float = 900.0,
+        system_busy_cooldown: float = 20.0,
+        risk_control_cooldown: float = 60.0,
+        endpoint_min_intervals: Optional[Dict[str, float]] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         logger: Optional[Callable[[str], None]] = None,
     ):
         self.max_attempts = max(1, min(int(max_attempts), 2))
         self.transient_delay = max(0.0, min(float(transient_delay), 1.0))
-        self.rate_limit_cooldown = max(0.1, min(float(rate_limit_cooldown), 5.0))
-        self.ban_cooldown = max(1.0, min(float(ban_cooldown), 300.0))
+        self.rate_limit_cooldown = max(1.0, min(float(rate_limit_cooldown), 60.0))
+        self.ban_cooldown = max(60.0, min(float(ban_cooldown), 3600.0))
+        self.system_busy_cooldown = max(1.0, min(float(system_busy_cooldown), 300.0))
+        self.risk_control_cooldown = max(1.0, min(float(risk_control_cooldown), 600.0))
+        self.endpoint_min_intervals = dict(endpoint_min_intervals or {
+            # BingX public market-data REST endpoints documented at 1 request/second/IP.
+            "fetch_order_book": 1.05,
+            "fetch_ticker": 1.05,
+            "fetch_ohlcv": 1.05,
+            "fetch_trades": 1.05,
+            "load_markets": 1.05,
+        })
+        self._endpoint_next_at: Dict[str, float] = {}
         self._sleep = sleep
         self._clock = clock
         self._logger = logger or (lambda _message: None)
@@ -47,6 +61,7 @@ class BingXApiReliability:
         self._stats = {
             "read_calls": 0, "read_retries": 0, "rate_limited": 0,
             "banned": 0, "transient_failures": 0, "fatal_failures": 0,
+            "system_busy": 0, "risk_control": 0, "endpoint_waits": 0,
         }
 
     @classmethod
@@ -94,6 +109,10 @@ class BingXApiReliability:
         message = str(exc).lower()
         if status == 418 or "418" in message or "ipban" in name or "banned" in message:
             return "BAN"
+        if "109500" in message or "current system is busy" in message:
+            return "SYSTEM_BUSY"
+        if "109403" in message or "109429" in message:
+            return "RISK_CONTROL"
         if status == 429 or "100410" in message or "rate limit" in message or "ratelimit" in name or "ddosprotection" in name:
             return "RATE_LIMIT"
         if status is not None and 500 <= status <= 599:
@@ -116,6 +135,20 @@ class BingXApiReliability:
         with self._lock:
             self._cooldown_until = max(self._cooldown_until, until)
             self._cooldown_reason = str(reason)
+
+    def _pace_endpoint(self, method_name: str) -> None:
+        interval = max(0.0, float(self.endpoint_min_intervals.get(method_name, 0.0)))
+        if interval <= 0:
+            return
+        with self._lock:
+            now = self._clock()
+            slot = max(now, self._endpoint_next_at.get(method_name, now))
+            self._endpoint_next_at[method_name] = slot + interval
+            wait = max(0.0, slot - now)
+            if wait > 0:
+                self._stats["endpoint_waits"] += 1
+        if wait > 0:
+            self._sleep(wait)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -149,6 +182,7 @@ class BingXApiReliability:
             for attempt in range(self.max_attempts):
                 if before_call:
                     before_call()
+                self._pace_endpoint(method_name)
                 with self._lock:
                     self._stats["read_calls"] += 1
                 try:
@@ -160,6 +194,22 @@ class BingXApiReliability:
                             self._stats["banned"] += 1
                         self._set_cooldown(self.ban_cooldown, "HTTP_418_BAN")
                         self._logger(f"[BINGX_API] HTTP 418 ban detected; read circuit paused for {self.ban_cooldown:.0f}s")
+                        raise
+                    if kind == "SYSTEM_BUSY":
+                        with self._lock:
+                            self._stats["system_busy"] += 1
+                        self._set_cooldown(self.system_busy_cooldown, "BINGX_109500_SYSTEM_BUSY")
+                        self._logger(
+                            f"[BINGX_API] 109500 system busy; reads paused for {self.system_busy_cooldown:.0f}s"
+                        )
+                        raise
+                    if kind == "RISK_CONTROL":
+                        with self._lock:
+                            self._stats["risk_control"] += 1
+                        self._set_cooldown(self.risk_control_cooldown, "BINGX_RISK_CONTROL")
+                        self._logger(
+                            f"[BINGX_API] risk-control response; reads paused for {self.risk_control_cooldown:.0f}s"
+                        )
                         raise
                     if kind == "RATE_LIMIT":
                         with self._lock:
@@ -173,7 +223,7 @@ class BingXApiReliability:
                             self._logger(f"[BINGX_API] Rate limited; one bounded read retry after {wait:.2f}s")
                             self._sleep(wait)
                             continue
-                        self._set_cooldown(min(max(wait, self.rate_limit_cooldown), 60.0), "HTTP_429_RATE_LIMIT")
+                        self._set_cooldown(min(max(wait, self.rate_limit_cooldown), 3600.0), "HTTP_429_RATE_LIMIT")
                         raise
                     if kind == "TRANSIENT":
                         with self._lock:
