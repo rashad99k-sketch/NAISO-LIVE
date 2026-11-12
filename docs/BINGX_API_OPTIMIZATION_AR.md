@@ -14,7 +14,8 @@ The existing 20x leverage configuration and read-back remain in place. MARKET an
 - Depth snapshots contain complete bid/ask arrays and are replaced atomically on each message. The client does not merge `incrDepth` deltas.
 - The client handles GZIP payloads, Ping/Pong, paced subscriptions, a local 150-topic cap with least-recently-used eviction, reconnect with bounded exponential backoff, and local receive-age validation.
 - Only symbols queried by the existing candidate/watchlist/radar code are subscribed; the full scanner universe is not preloaded.
-- Snapshots older than `BINGX_BOOK_TICKER_STALE_AFTER_SEC` are rejected. On disconnect/reconnect, local books are invalidated until fresh messages arrive.
+- Snapshots older than `BINGX_BOOK_TICKER_STALE_AFTER_SEC` by local receive time are rejected. On disconnect/reconnect, local books are invalidated until fresh messages arrive.
+- BingX documents the limited-depth `ts` as server message-construction time, not matching-engine/source-book age. The depth snapshot is therefore marked `source_age_verified=false`; local receive-age validation does not prove upstream source age. BookTicker's exchange timestamp is retained separately.
 - Scanner depth reads do not call REST by default. Set `BINGX_REST_DEPTH_FALLBACK_ENABLED=true` only if REST depth fallback is deliberately preferred; execution spread preflight retains a rate-limited REST fallback.
 - Full `incrDepth` is deliberately not used. Its separate initialization/recovery protocol is unnecessary for the current bounded depth indicators and must not be approximated with an unsynchronized local merge.
 
