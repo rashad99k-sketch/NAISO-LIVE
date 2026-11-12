@@ -256,3 +256,20 @@ def test_single_shot_write_rate_limit_sets_global_entry_cooldown():
     assert kind == "RATE_LIMIT"
     with pytest.raises(ApiCooldownError):
         policy.assert_new_entry_allowed()
+
+
+def test_expired_cooldown_requires_successful_read_probe_before_new_entry():
+    now = [100.0]
+    policy = BingXApiReliability(clock=lambda: now[0], sleep=lambda _seconds: None)
+    policy._set_cooldown(5.0, "HTTP_418_BAN")
+
+    class Exchange:
+        def fetch_positions(self):
+            return []
+
+    now[0] += 6.0
+    with pytest.raises(ApiCooldownError):
+        policy.assert_new_entry_allowed()
+
+    assert policy.call_read(Exchange().fetch_positions) == []
+    policy.assert_new_entry_allowed()
