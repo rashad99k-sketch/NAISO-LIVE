@@ -11430,6 +11430,7 @@ def _finalize_pending_entry_no_exposure(row, reason):
 
 def _reconcile_pending_entry_record(row, exchange_status, positions):
     """Resolve a journaled pending entry only from terminal order + exchange evidence."""
+    global RECOVERY_BLOCK_ENTRIES
     if exchange_status not in {"OPEN", "FLAT"}:
         return _pending_entry_hold(row, position_status=exchange_status, reason="exchange position state is not authoritative")
     order = _read_pending_entry_order(row)
