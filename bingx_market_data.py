@@ -251,6 +251,9 @@ class BingXBookTickerFeed:
                 )
                 if wait > 0:
                     self._sleep(wait)
+                with self._lock:
+                    if not self._connected or self._ws is not ws or self._stop.is_set():
+                        return
                 ws.send(json.dumps(payload, separators=(",", ":")))
                 self._last_subscribe_sent_mono = self._clock()
         except Exception as exc:
@@ -263,6 +266,16 @@ class BingXBookTickerFeed:
     def _send_unsubscribe(self, ws: Any, channel: str) -> None:
         self._send_request(ws, channel, "unsub")
 
+    def _send_channels(self, ws: Any, channels: list[str]) -> None:
+        # Do not sleep in the WebSocket event-loop callback: Ping/Pong must remain responsive.
+        for channel in channels:
+            if self._stop.is_set():
+                return
+            with self._lock:
+                if not self._connected or self._ws is not ws:
+                    return
+            self._send_subscribe(ws, channel)
+
     def _on_open(self, ws: Any) -> None:
         with self._lock:
             self._connected = True
@@ -272,9 +285,14 @@ class BingXBookTickerFeed:
             self._depths.clear()
             self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
             channels = sorted(self._desired)
-        for channel in channels:
-            self._send_subscribe(ws, channel)
-        self.logger(f"[BINGX_WS] connected; bookTicker subscriptions={len(channels)}")
+        sender = threading.Thread(
+            target=self._send_channels,
+            args=(ws, channels),
+            name="bingx-ws-subscriptions",
+            daemon=True,
+        )
+        sender.start()
+        self.logger(f"[BINGX_WS] connected; queued subscriptions={len(channels)}")
 
     def _on_message(self, ws: Any, message: Any) -> None:
         try:
