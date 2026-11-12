@@ -84,3 +84,17 @@ def test_subscribe_uses_bingx_bookticker_channel():
     assert payload["reqType"] == "sub"
     assert payload["dataType"] == "ETH-USDT@bookTicker"
     feed.start = monkeypatch_start
+
+
+def test_repeated_gets_do_not_send_duplicate_subscriptions():
+    feed = BingXBookTickerFeed()
+    socket = FakeSocket()
+    feed.start = lambda: True
+    with feed._lock:
+        feed._connected = True
+        feed._ws = socket
+
+    feed.subscribe("BTC/USDT:USDT")
+    feed.subscribe("BTC/USDT:USDT")
+
+    assert len(socket.sent) == 1
