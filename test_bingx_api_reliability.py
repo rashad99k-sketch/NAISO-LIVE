@@ -187,3 +187,27 @@ def test_bingx_risk_control_codes_open_cooldown_without_retry(code):
     with pytest.raises(ApiCooldownError):
         policy.call_read(exchange.fetch_balance)
     assert exchange.calls == 1
+
+
+def test_transient_read_retry_uses_bounded_jitter():
+    class Exchange:
+        def __init__(self):
+            self.calls = 0
+        def fetch_positions(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("temporary network timeout")
+            return []
+
+    waits = []
+    exchange = Exchange()
+    policy = BingXApiReliability(
+        transient_delay=0.25,
+        retry_jitter_ratio=0.20,
+        random_uniform=lambda low, high: high,
+        sleep=waits.append,
+    )
+
+    assert policy.call_read(exchange.fetch_positions) == []
+    assert exchange.calls == 2
+    assert waits == [pytest.approx(0.30)]
