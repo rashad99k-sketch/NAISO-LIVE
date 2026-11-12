@@ -290,7 +290,15 @@ class BingXApiReliability:
                                 f"[BINGX_API] Transient read failure in {method_name}; "
                                 f"retry {attempt + 2}/{self.max_attempts}"
                             )
-                            self._sleep(self.transient_delay)
+                            base_delay = self.transient_delay * (2 ** attempt)
+                            jitter = (
+                                self._random_uniform(
+                                    1.0 - self.retry_jitter_ratio,
+                                    1.0 + self.retry_jitter_ratio,
+                                )
+                                if self.retry_jitter_ratio > 0 else 1.0
+                            )
+                            self._sleep(min(base_delay * jitter, 2.0))
                             continue
                         raise
                     with self._lock:
