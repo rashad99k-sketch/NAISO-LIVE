@@ -167,3 +167,28 @@ def test_depth_subscription_lru_cap_evicts_old_channel():
     assert requests[1]["dataType"] == "BTC-USDT@depth10@200ms"
     assert requests[2]["dataType"] == "ETH-USDT@depth10@200ms"
     assert feed._desired == {"ETH-USDT@depth10@200ms"}
+
+
+def test_depth_uses_its_own_local_freshness_window():
+    now = [50.0]
+    feed = BingXBookTickerFeed(
+        clock=lambda: now[0],
+        stale_after_sec=1.0,
+        depth_stale_after_sec=3.0,
+    )
+    feed.start = lambda: True
+    message = {
+        "code": 0,
+        "dataType": "SOL-USDT@depth10@500ms",
+        "data": {
+            "bids": [["100", "1"]],
+            "asks": [["101", "1"]],
+        },
+    }
+    feed._on_message(FakeSocket(), json.dumps(message))
+
+    assert feed.get_depth("SOL/USDT:USDT", 10) is not None
+    now[0] += 2.0
+    assert feed.get_depth("SOL/USDT:USDT", 10) is not None
+    now[0] += 1.1
+    assert feed.get_depth("SOL/USDT:USDT", 10) is None
