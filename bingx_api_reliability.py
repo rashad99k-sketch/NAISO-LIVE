@@ -45,7 +45,6 @@ class BingXApiReliability:
         self.endpoint_min_intervals = dict(endpoint_min_intervals or {
             # BingX public market-data REST endpoints documented at 1 request/second/IP.
             "fetch_order_book": 1.05,
-            "fetch_ticker": 1.05,
             "fetch_ohlcv": 1.05,
             "fetch_trades": 1.05,
             "load_markets": 1.05,
