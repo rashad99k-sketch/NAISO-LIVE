@@ -1102,9 +1102,9 @@ def get_ohlcv_safe_meta(symbol, limit=120, htf=False):
         return df, "FRESH_REQUEST"
     return None, "NONE"
 
-def get_ticker_safe(symbol):
-    # Use short TTL for live price
-    cached = cache_get(f"ticker_{symbol}", 1)
+def get_ticker_safe(symbol, max_age_sec=1.0):
+    # Use a short, caller-controlled TTL for live price
+    cached = cache_get(f"ticker_{symbol}", max_age_sec)
     if cached is not None:
         return cached
     ticker = fetch_ticker(symbol)
@@ -5127,18 +5127,18 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         if amount <= 0:
             raise ValueError("Order amount rounded to zero")
 
-        bal = safe_api_call(ex.fetch_balance)
-        if not isinstance(bal, dict):
-            log_execution("[ENTRY_PREFLIGHT] BingX balance read unavailable; blocked before order submission", "ERROR")
+        # Reuse the sizing snapshot only while it is <=2s old; otherwise refresh
+        # once at the final order boundary before any non-idempotent write.
+        balance_snapshot = get_wallet_balance_snapshot(max_age_sec=2.0)
+        usdt = safe_float(balance_snapshot.get("free"), 0.0)
+        if usdt <= 0:
+            log_execution("[ENTRY_PREFLIGHT] BingX available balance unavailable; blocked before order submission", "ERROR")
             return None
-        usdt = safe_float((bal.get("free") or {}).get("USDT"), 0.0)
-        ticker = safe_api_call(ex.fetch_ticker, sym)
-        if not isinstance(ticker, dict):
+        # The final ticker preflight may reuse only a <=1s cached quote.
+        price = safe_float(get_ticker_safe(sym, max_age_sec=1.0), 0.0)
+        if price <= 0:
             log_execution(f"[ENTRY_PREFLIGHT] BingX ticker read unavailable for {sym}; blocked before order submission", "ERROR")
             return None
-        price = safe_float(ticker.get("last"), 0.0)
-        if price <= 0:
-            raise ValueError("Invalid live ticker price")
 
         required_margin = (amount * contract_size * price) / LEVERAGE
         if usdt < required_margin * 1.01:
@@ -5636,6 +5636,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             if institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
                 raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
             wallet_snapshot = None if PAPER_MODE else safe_api_call(ex.fetch_balance)
+            if isinstance(wallet_snapshot, dict):
+                _cache_wallet_balance_response(wallet_snapshot)
             wallet_balance, free_balance, balance_source = _sniper_v2_wallet_balances(
                 wallet_snapshot=wallet_snapshot,
                 paper_wallet_balance=paper.get("balance", 0.0),
