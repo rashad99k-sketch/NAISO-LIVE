@@ -98,3 +98,72 @@ def test_repeated_gets_do_not_send_duplicate_subscriptions():
     feed.subscribe("BTC/USDT:USDT")
 
     assert len(socket.sent) == 1
+
+
+def test_depth_channel_and_snapshot_are_parsed_and_sorted():
+    feed = BingXBookTickerFeed()
+    feed.start = lambda: True
+    socket = FakeSocket()
+    with feed._lock:
+        feed._connected = True
+        feed._ws = socket
+
+    message = {
+        "code": 0,
+        "dataType": "SOL-USDT@depth10@500ms",
+        "ts": 1794500000000,
+        "data": {
+            "bids": [["99.0", "2"], ["100.0", "1"]],
+            "asks": [["101.0", "3"], ["100.5", "4"]],
+        },
+    }
+    feed._on_message(socket, gzip.compress(json.dumps(message).encode()))
+
+    depth = feed.get_depth("SOL/USDT:USDT", 10)
+    assert depth["bids"] == [[100.0, 1.0], [99.0, 2.0]]
+    assert depth["asks"] == [[100.5, 4.0], [101.0, 3.0]]
+    assert depth["server_ts_ms"] == 1794500000000
+    assert json.loads(socket.sent[-1])["dataType"] == "SOL-USDT@depth10@500ms"
+
+
+def test_depth_interval_uses_fast_interval_only_for_btc_and_eth():
+    assert BingXBookTickerFeed._depth_channel("BTC/USDT:USDT", 10) == "BTC-USDT@depth10@200ms"
+    assert BingXBookTickerFeed._depth_channel("ETH/USDT:USDT", 20) == "ETH-USDT@depth20@200ms"
+    assert BingXBookTickerFeed._depth_channel("SOL/USDT:USDT", 10) == "SOL-USDT@depth10@500ms"
+
+
+def test_disconnect_invalidates_old_book_and_depth_snapshots():
+    feed = BingXBookTickerFeed()
+    feed.start = lambda: True
+    socket = FakeSocket()
+    message = {
+        "code": 0,
+        "dataType": "BTC-USDT@depth10@200ms",
+        "data": {
+            "bids": [["100", "1"]],
+            "asks": [["101", "1"]],
+        },
+    }
+    feed._on_message(socket, json.dumps(message))
+    assert feed._depths
+    feed._on_close(socket, 1006, "disconnect")
+    assert not feed._depths
+    assert feed.get_depth("BTC/USDT:USDT", 10) is None
+
+
+def test_depth_subscription_lru_cap_evicts_old_channel():
+    feed = BingXBookTickerFeed(max_subscriptions=1, subscription_interval_sec=0.05)
+    feed.start = lambda: True
+    socket = FakeSocket()
+    with feed._lock:
+        feed._connected = True
+        feed._ws = socket
+
+    feed.subscribe_depth("BTC/USDT:USDT", 10)
+    feed.subscribe_depth("ETH/USDT:USDT", 10)
+
+    requests = [json.loads(item) for item in socket.sent]
+    assert [item["reqType"] for item in requests] == ["sub", "unsub", "sub"]
+    assert requests[1]["dataType"] == "BTC-USDT@depth10@200ms"
+    assert requests[2]["dataType"] == "ETH-USDT@depth10@200ms"
+    assert feed._desired == {"ETH-USDT@depth10@200ms"}
