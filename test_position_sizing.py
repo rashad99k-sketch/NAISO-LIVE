@@ -201,3 +201,41 @@ def test_medium_and_strong_targets_are_caps_not_forced_margin_spend():
     assert strong.margin_required <= 3.0
     assert medium.estimated_risk_pct <= 1.5
     assert strong.estimated_risk_pct <= 1.5
+
+
+def test_33_usdt_wallet_20_percent_target_can_be_reduced_by_wide_structural_stop():
+    result = calculate_position_size(
+        classification="TREND",
+        available_balance=33.0,
+        entry_price=100.0,
+        stop_price=97.0,
+        side="BUY",
+        leverage=20,
+        contract_size=1.0,
+        max_trade_risk_pct=10.0,
+        stop_execution_buffer_pct=0.05,
+    )
+
+    assert result.target_margin == pytest.approx(6.60)
+    assert result.max_risk_usdt == pytest.approx(0.66)
+    assert result.margin_required < result.target_margin
+    assert result.margin_required == pytest.approx(1.0819672, rel=1e-5)
+    assert result.estimated_loss_at_stop <= result.max_risk_usdt
+
+
+def test_20_percent_of_free_balance_is_not_20_percent_of_total_wallet():
+    total_wallet = 33.0
+    free_balance = 7.5
+    result = calculate_position_size(
+        classification="TREND",
+        available_balance=free_balance,
+        entry_price=100.0,
+        stop_price=99.99,
+        side="BUY",
+        leverage=20,
+        max_trade_risk_pct=10.0,
+        stop_execution_buffer_pct=0.0,
+    )
+
+    assert total_wallet * 0.20 == pytest.approx(6.60)
+    assert result.target_margin == pytest.approx(1.50)
