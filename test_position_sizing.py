@@ -1,4 +1,5 @@
 import pytest
+import ggpbot
 
 from ggp_position_sizing import (
     allocation_for_classification,
