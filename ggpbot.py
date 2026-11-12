@@ -989,20 +989,38 @@ def fetch_ticker(symbol):
 def fetch_orderbook(symbol, limit=20):
     return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
 
+def _cache_wallet_balance_response(balance_response):
+    """Cache total and free USDT from one BingX Futures balance response."""
+    total = safe_float((balance_response.get("total") or {}).get("USDT"), 0.0) if isinstance(balance_response, dict) else 0.0
+    free = safe_float((balance_response.get("free") or {}).get("USDT"), 0.0) if isinstance(balance_response, dict) else 0.0
+    stamp = time.time()
+    snapshot = {
+        "total": max(0.0, total),
+        "free": max(0.0, free),
+        "timestamp": stamp,
+        "source": "BINGX_FUTURES_BALANCE",
+    }
+    cache_set("wallet_balance_snapshot", snapshot)
+    cache_set("balance", snapshot["total"])
+    cache_set("free_balance", snapshot["free"])
+    return snapshot
+
+
 def get_balance():
     if PAPER_MODE:
         return paper["balance"]
     bal = safe_api_call(ex.fetch_balance)
     if bal:
-        return bal.get("total", {}).get("USDT", 0.0)
+        return _cache_wallet_balance_response(bal)["total"]
     return 0.0
+
 
 def get_free_balance():
     if PAPER_MODE:
         return paper["balance"]
     bal = safe_api_call(ex.fetch_balance)
     if bal:
-        return bal.get("free", {}).get("USDT", 0.0)
+        return _cache_wallet_balance_response(bal)["free"]
     return 0.0
 
 def get_spread_bps(symbol):
@@ -1106,25 +1124,41 @@ def get_free_balance_safe():
     return bal
 
 
-def get_available_balance_snapshot(max_age_sec=15.0):
-    """Return (balance, source, timestamp) for the real BingX available balance.
-
-    "free" USDT from BingX Futures is the authoritative available balance. The
-    returned timestamp is the moment the value was fetched, so callers can prove
-    freshness. A value older than `max_age_sec` is refetched rather than reused.
-    In PAPER mode the simulated balance is returned with source "PAPER".
-    """
+def get_wallet_balance_snapshot(max_age_sec=15.0):
+    """Return total/free Futures USDT from one timestamped balance snapshot."""
     now = time.time()
     if PAPER_MODE:
-        return safe_float(paper.get("balance"), 0.0), "PAPER", now
-    cached = cache_get("free_balance", max_age_sec)
-    if cached is not None:
-        item = CACHE.get("free_balance") if isinstance(CACHE, dict) else None
-        ts = float(item.get("ts", now)) if isinstance(item, dict) else now
-        return safe_float(cached), "BINGX_FUTURES_FREE_USDT", ts
-    bal = get_free_balance()
-    cache_set("free_balance", bal)
-    return safe_float(bal), "BINGX_FUTURES_FREE_USDT", time.time()
+        value = safe_float(paper.get("balance"), 0.0)
+        return {
+            "total": value, "free": value, "timestamp": now, "source": "PAPER",
+        }
+    cached = cache_get("wallet_balance_snapshot", max_age_sec)
+    if isinstance(cached, dict):
+        total = safe_float(cached.get("total"), 0.0)
+        free = safe_float(cached.get("free"), 0.0)
+        stamp = safe_float(cached.get("timestamp"), now)
+        if total >= 0 and free >= 0 and stamp > 0:
+            return {"total": total, "free": free, "timestamp": stamp,
+                    "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE")}
+    # One balance request populates both total and free; no second REST read.
+    get_free_balance()
+    cached = cache_get("wallet_balance_snapshot", max_age_sec)
+    if not isinstance(cached, dict):
+        return {"total": 0.0, "free": 0.0, "timestamp": time.time(),
+                "source": "UNAVAILABLE"}
+    return {
+        "total": safe_float(cached.get("total"), 0.0),
+        "free": safe_float(cached.get("free"), 0.0),
+        "timestamp": safe_float(cached.get("timestamp"), time.time()),
+        "source": str(cached.get("source") or "BINGX_FUTURES_BALANCE"),
+    }
+
+
+def get_available_balance_snapshot(max_age_sec=15.0):
+    """Return (free USDT, source, timestamp); Wallet Total is diagnostic only."""
+    snapshot = get_wallet_balance_snapshot(max_age_sec)
+    source = "PAPER" if PAPER_MODE else "BINGX_FUTURES_FREE_USDT"
+    return safe_float(snapshot.get("free"), 0.0), source, safe_float(snapshot.get("timestamp"), time.time())
 
 _ORDERBOOK_FETCH_LOCKS = {}
 _ORDERBOOK_FETCH_LOCKS_LOCK = threading.RLock()
@@ -5598,8 +5632,19 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 "INFO",
             )
         else:
-            free_bal, balance_source, balance_ts = get_available_balance_snapshot()
+            wallet_snapshot = get_wallet_balance_snapshot()
+            free_bal = safe_float(wallet_snapshot.get("free"), 0.0)
+            wallet_total = safe_float(wallet_snapshot.get("total"), 0.0)
+            balance_source = "BINGX_FUTURES_FREE_USDT" if not PAPER_MODE else "PAPER"
+            balance_ts = safe_float(wallet_snapshot.get("timestamp"), 0.0)
             balance = max(0.0, free_bal * BALANCE_SAFETY_FACTOR)
+            log_execution(
+                f"[SIZING_BALANCE_BASIS] basis=AVAILABLE_FREE wallet_total={wallet_total:.4f} "
+                f"free_usdt={free_bal:.4f} safety_factor={BALANCE_SAFETY_FACTOR:.4f} "
+                f"effective_sizing_balance={balance:.4f} source={wallet_snapshot.get('source')} "
+                f"age_sec={max(0.0, time.time() - balance_ts):.2f}",
+                "INFO",
+            )
             if balance <= 0:
                 raise ValueError("available USDT balance is zero or unreadable")
         sym = normalize_symbol(symbol)
