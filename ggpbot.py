@@ -5136,6 +5136,15 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         _ACTIVE_TRADE = True
     order = None
     try:
+        if not PAPER_MODE:
+            try:
+                BINGX_API_RELIABILITY.assert_new_entry_allowed()
+            except Exception as exc:
+                log_execution(
+                    f"[ENTRY_API_COOLDOWN] new entry blocked before order submission: {type(exc).__name__}: {exc}",
+                    "WARN",
+                )
+                return None
         market = ex.market(sym)
         contract_size = safe_float(market.get("contractSize"), 0.0)
         if contract_size <= 0:
