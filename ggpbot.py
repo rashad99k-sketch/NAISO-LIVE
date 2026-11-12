@@ -41,7 +41,7 @@ try:
     from dotenv import load_dotenv
     # Prefer the user's real .env. If absent, use the template as defaults only;
     # platform-injected values/secrets must never be overwritten by the template.
-    _hosted_runtime = any(os.getenv(name) for name in ("RENDER", "RAILWAY_ENVIRONMENT", "DYNO"))
+    _hosted_runtime = is_hosted_runtime(os.environ)
     _override_raw = os.getenv("GGP_LOCAL_ENV_OVERRIDE")
     _dotenv_override = (
         str(_override_raw).strip().lower() in {"1", "true", "yes", "on"}
@@ -62,7 +62,7 @@ try:
 except Exception as _env_exc:
     print(f"[ENV] configuration loader unavailable: {type(_env_exc).__name__}; process environment only")
 
-from ggp_runtime_config import resolve_trading_mode
+from ggp_runtime_config import resolve_trading_mode, is_hosted_runtime
 from ggp_management_events import TradeManagementEventLog
 from ggp_telegram import TelegramNotifier
 from ggp_position_sizing import (
@@ -11980,10 +11980,9 @@ LiveTradeManager.manage_live_trade = _manage_live_trade_with_journal
 # Hosted runtimes need explicit exchange/account readiness, not merely an HTTP server.
 # A process stays alive during temporary BingX outages, but new entries are gated until
 # public market data, private account reads (LIVE), and journal/exchange recovery succeed.
-_HOSTED_MARKERS = ("RENDER", "RAILWAY_ENVIRONMENT", "DYNO", "FLY_APP_NAME")
-HOSTED_RUNTIME_REQUIRED = bool(str(os.getenv("PORT") or "").strip()) or _env_bool(
+HOSTED_RUNTIME_REQUIRED = is_hosted_runtime(os.environ) or _env_bool(
     "HOSTED_RUNTIME_ENFORCE_PREFLIGHT", False
-) or any(bool(os.getenv(key)) for key in _HOSTED_MARKERS)
+)
 HOSTED_PREFLIGHT_INTERVAL_SEC = _env_int_range("HOSTED_PREFLIGHT_INTERVAL_SEC", 60, 20, 300)
 RUNTIME_STATUS_LOCK = threading.RLock()
 RUNTIME_STATUS = {
