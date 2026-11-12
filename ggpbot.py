@@ -577,7 +577,7 @@ def safe_api_call(func, *args, **kwargs):
             return BINGX_API_RELIABILITY.call_read(func, *args, before_call=rate_limit, **kwargs)
         except Exception as exc:
             kind = BingXApiReliability.classify(exc)
-            if kind in {"RATE_LIMIT", "BAN", "SYSTEM_BUSY", "RISK_CONTROL"}:
+            if kind in {"RATE_LIMIT", "BAN", "SYSTEM_BUSY", "RISK_CONTROL", "COOLDOWN"}:
                 _LAST_API_RATE_LIMIT.update({
                     "ts": time.time(), "method": name, "message": str(exc)[:180],
                 })
