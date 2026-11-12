@@ -5246,6 +5246,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
                 api_call=safe_api_call,
+                api_error_handler=lambda exc, method: BINGX_API_RELIABILITY.observe_error(exc, method),
             )
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
