@@ -1,4 +1,6 @@
 import pandas as pd
+import threading
+import time
 
 import ggpbot
 
@@ -103,3 +105,62 @@ def test_explicit_execution_fallback_can_use_rate_limited_rest_depth(monkeypatch
 
     assert result["source"] == "BINGX_REST_DEPTH"
     assert result["bids"] == book["bids"]
+
+
+def test_identical_ticker_reads_are_single_flight(monkeypatch):
+    calls = []
+    def fake_fetch(symbol):
+        calls.append(symbol)
+        time.sleep(0.05)
+        return {"last": 123.45}
+
+    monkeypatch.setattr(ggpbot, "fetch_ticker", fake_fetch)
+    ggpbot.CACHE.pop("ticker_DOGE/USDT:USDT", None)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(ggpbot.get_ticker_safe("DOGE/USDT:USDT")))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert calls == ["DOGE/USDT:USDT"]
+    assert results == [123.45, 123.45]
+
+
+def test_identical_ohlcv_reads_are_single_flight(monkeypatch):
+    calls = []
+    frame = pd.DataFrame({
+        "open": [100.0] * 120,
+        "high": [101.0] * 120,
+        "low": [99.0] * 120,
+        "close": [100.0] * 120,
+        "volume": [1.0] * 120,
+    })
+    def fake_fetch(symbol, limit):
+        calls.append((symbol, limit))
+        time.sleep(0.05)
+        return frame
+
+    monkeypatch.setattr(ggpbot, "fetch_ohlcv", fake_fetch)
+    monkeypatch.setattr(ggpbot, "validate_dataframe", lambda *_args, **_kwargs: True)
+    key = f"ohlcv_ETH/USDT:USDT_{ggpbot.INTERVAL}_120"
+    ggpbot.CACHE.pop(key, None)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(
+            ggpbot.get_ohlcv_safe_meta("ETH/USDT:USDT", 120)
+        ))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert calls == [("ETH/USDT:USDT", 120)]
+    assert sorted(source for _frame, source in results) == ["CACHE_HIT", "FRESH_REQUEST"]
