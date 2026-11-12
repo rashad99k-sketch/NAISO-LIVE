@@ -40,3 +40,16 @@ def test_paper_balance_snapshot_keeps_total_and_free_equal(monkeypatch):
     assert snapshot["total"] == 33.0
     assert snapshot["free"] == 33.0
     assert snapshot["source"] == "PAPER"
+
+
+def test_normal_strategy_sizing_basis_can_select_free_or_total(monkeypatch):
+    snapshot = {"total": 33.0, "free": 7.5}
+    monkeypatch.setattr(ggpbot, "POSITION_SIZING_BALANCE_BASIS", "AVAILABLE_FREE")
+    free_value, free_basis = ggpbot.resolve_position_sizing_balance(snapshot)
+    assert free_value == 7.5
+    assert free_basis == "AVAILABLE_FREE"
+
+    monkeypatch.setattr(ggpbot, "POSITION_SIZING_BALANCE_BASIS", "WALLET_TOTAL")
+    total_value, total_basis = ggpbot.resolve_position_sizing_balance(snapshot)
+    assert total_value == 33.0
+    assert total_basis == "WALLET_TOTAL"
