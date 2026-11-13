@@ -3457,6 +3457,8 @@ class LiveTradeManager:
                             reference_level=STATE["opposing_liquidity_level"],
                             distance_pct=STATE["opposing_liquidity_distance_pct"],
                             scalp_target_pct=STATE["scalp_target_selected_pct"],
+                            scalp_target_price=STATE.get("scalp_target_price", 0.0),
+                            scalp_target_status=STATE.get("scalp_target_status", "UNKNOWN"),
                             reason=STATE["scalp_target_selection_reason"],
                         )
                     except Exception as _pool_error:
