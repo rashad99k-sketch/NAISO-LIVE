@@ -782,3 +782,13 @@ def test_trade_entry_modes_remain_distinct_from_profit_management_modes():
     assert '"profit_mode": STATE.get("profit_mode", STANDARD_MODE)' in source
     assert '"opposing_liquidity": {' in source
 
+
+
+def test_paper_entry_has_one_canonical_intelligence_field_set():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    start = source.index('        STATE.update({\n            "open": True, "side": side, "entry": price')
+    end = source.index("        TRADE_STATE.update({", start)
+    block = source[start:end]
+    for field in ('"entry_zone_low":', '"entry_zone_high":', '"trading_mode":', '"market_intelligence":'):
+        assert block.count(field) == 1
