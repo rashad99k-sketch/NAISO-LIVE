@@ -6,6 +6,7 @@ from ggp_market_intelligence import (
     build_intelligence_decision, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, select_opposing_liquidity_pool,
     select_scalp_target_pct, build_scalp_target, classify_price_pattern,
+    validate_entry_behavior_trigger,
 )
 
 
@@ -1053,3 +1054,105 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
     monkeypatch.setattr(bot, "_last_api_call", clock[0])
     bot.rate_limit(fetch_ticker)
     assert waits[-1] == pytest.approx(bot.MIN_API_INTERVAL)
+
+
+def test_sell_retest_requires_post_origin_touch_and_closed_bearish_rejection():
+    rows = [
+        candle(2000, 9.4, 9.7, 9.2, 9.5),
+        candle(3000, 9.5, 9.9, 9.4, 9.8),
+        candle(4000, 9.8, 10.1, 9.7, 9.9),
+        candle(5000, 9.9, 9.95, 9.4, 9.5),
+    ]
+    result = validate_entry_behavior_trigger(
+        side="SELL", behavior="RETEST", candles=rows, entry_price=9.6,
+        atr=1.0, reference_level=10.0, origin_timestamp=1000,
+    )
+    assert result["valid"] is True
+    assert result["status"] == "CONFIRMED"
+
+
+def test_retest_fails_closed_without_touch_confirmation_or_when_chased():
+    no_touch = [
+        candle(2000, 9.0, 9.4, 8.8, 9.1),
+        candle(3000, 9.1, 9.5, 9.0, 9.2),
+        candle(4000, 9.2, 9.6, 9.1, 9.3),
+        candle(5000, 9.3, 9.7, 9.0, 9.1),
+    ]
+    result = validate_entry_behavior_trigger(
+        side="SELL", behavior="RETEST", candles=no_touch, entry_price=9.2,
+        atr=1.0, reference_level=10.0,
+    )
+    assert not result["valid"]
+    assert result["reason"] == "reference_level_not_retested_after_setup"
+
+    rows = [
+        candle(2000, 9.4, 9.7, 9.2, 9.5),
+        candle(3000, 9.5, 9.9, 9.4, 9.8),
+        candle(4000, 9.8, 10.1, 9.7, 9.9),
+        candle(5000, 9.9, 9.95, 9.4, 9.5),
+    ]
+    chased = validate_entry_behavior_trigger(
+        side="SELL", behavior="RETEST", candles=rows, entry_price=7.0,
+        atr=1.0, reference_level=10.0,
+    )
+    assert not chased["valid"]
+    assert chased["status"] == "ENTRY_WINDOW_MISSED"
+
+
+def test_pullback_requires_causal_zone_touch_and_directional_closed_rejection():
+    rows = [
+        candle(1000, 11.5, 11.7, 11.1, 11.3),
+        candle(2000, 11.3, 11.6, 10.9, 11.2),
+        candle(3000, 10.8, 10.9, 10.2, 10.4),
+        candle(4000, 10.6, 10.7, 9.7, 9.8),
+    ]
+    result = validate_entry_behavior_trigger(
+        side="SELL", behavior="PULLBACK", candles=rows, entry_price=9.9,
+        atr=1.0, zone_low=10.0, zone_high=11.0,
+    )
+    assert result["valid"] is True
+
+    no_zone = validate_entry_behavior_trigger(
+        side="SELL", behavior="PULLBACK", candles=rows, entry_price=9.9,
+        atr=1.0,
+    )
+    assert not no_zone["valid"]
+    assert no_zone["reason"] == "causal_entry_zone_missing"
+
+
+def test_micro_pullback_requires_impulse_pause_and_closed_continuation():
+    rows = [
+        candle(1000, 12.0, 12.1, 9.9, 10.0),
+        candle(2000, 10.0, 10.4, 9.95, 10.3),
+        candle(3000, 10.2, 10.25, 9.6, 9.7),
+    ]
+    result = validate_entry_behavior_trigger(
+        side="SELL", behavior="MICRO_PULLBACK", candles=rows,
+        entry_price=9.8, atr=1.0,
+    )
+    assert result["valid"] is True
+
+    incomplete = validate_entry_behavior_trigger(
+        side="SELL", behavior="MICRO_PULLBACK",
+        candles=rows[:2], entry_price=9.8, atr=1.0,
+    )
+    assert not incomplete["valid"]
+
+
+def test_institutional_entry_behavior_is_hard_gated_in_paper_and_live_execution():
+    from pathlib import Path
+
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    execute_start = source.index("def execute_entry(")
+    execute_end = source.index("\ndef ", execute_start + 5)
+    execute_source = source[execute_start:execute_end]
+    assert "if institutional_ctx:" in execute_source
+    assert "validate_entry_behavior_trigger(" in execute_source
+    assert "ENTRY_BEHAVIOR_EXECUTION_GATE" in execute_source
+    assert "entry_behavior_gate_passed" in execute_source
+
+    open_start = source.index("def open_position(")
+    open_end = source.index("\ndef ", open_start + 5)
+    open_source = source[open_start:open_end]
+    assert "ENTRY_BEHAVIOR_FINAL_BLOCK" in open_source
+    assert "validate_entry_behavior_trigger(" in open_source
