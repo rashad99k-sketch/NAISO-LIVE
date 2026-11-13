@@ -673,55 +673,8 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                     "rejection_reasons": [fetch_error or "market_data_unavailable"],
                     "data_quality": "DATA_UNAVAILABLE", "last_update": time.time(), "icons": {"status": "⚪"}}
         else:
-            try:
-                results = [analyze_symbol(candidate["exchange_symbol"], side, frame) for side in ("BUY", "SELL")]
-            except Exception as exc:
-                # A single malformed symbol or analyzer bug must not abort the
-                # entire rotating watchlist batch. Keep it non-actionable and
-                # continue with the remaining symbols.
-                results = None
-                error_reason = f"analysis_error:{type(exc).__name__}:{str(exc)[:120]}"
-                best = {
-                    "symbol": key, "exchange_symbol": candidate["exchange_symbol"],
-                    "side": "UNKNOWN", "decision_state": "UNKNOWN",
-                    "entry_status": "UNKNOWN", "decision_reason": error_reason,
-                    "rejection_reasons": [error_reason], "data_quality": "ANALYSIS_ERROR",
-                    "last_update": time.time(), "icons": {"status": "⚪"},
-                }
-            if results is not None:
-                for result in results:
-                    if enrich is not None:
-                        try:
-                            enriched = enrich(frame, result.get("side"), result)
-                            if isinstance(enriched, dict): result.update(enriched)
-                        except Exception as exc:
-                            result["gpp_engine_diagnostics"] = {"status": "PARTIAL", "reason": f"{type(exc).__name__}:{str(exc)[:100]}"}
-                    result["source"] = candidate.get("source", "discovery")
-                    result["sources"] = list(candidate.get("sources", []))
-                    result["discovery_score"] = candidate.get("score", 0)
-                    result["side_hints"] = list(candidate.get("sides", []))
-                ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
-                if len(ready) > 1:
-                    best = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
-                    best.update({"decision_state": DecisionState.REJECTED.value, "entry_status": DecisionState.REJECTED.value,
-                                 "decision_reason": "conflicting_opposing_setups_require_resolution",
-                                 "rejection_reasons": ["both_buy_and_sell_hypotheses_entry_ready"],
-                                 "conflicting_directions": [row.get("side") for row in ready],
-                                 "structural_stop": None, "event_id": None,
-                                 "icons": {**(best.get("icons") or {}), "status": "⛔", "setup": "⚠️", "stop": "⚪"}})
-                else:
-                    hints = set(candidate.get("sides", []))
-                    best = dict(max(results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
-                    best["side_hint_used_as_gate"] = False
-                    best["side_selection_reason"] = "both_directions_analyzed; discovery_side_is_soft_hint"
-                best["side_analyses"] = {
-                    row.get("side"): {"state": row.get("decision_state"), "setup": row.get("decision_setup_type"),
-                                      "score": row.get("score"), "reason": row.get("decision_reason"),
-                                      "event_id": row.get("event_id"), "structural_stop": row.get("structural_stop"),
-                                      "trend_support": (row.get("institutional_trend") or {}).get("supporting_check")}
-                    for row in results
-                }
-
+            results = [analyze_symbol(candidate["exchange_symbol"], side, frame) for side in ("BUY", "SELL")]
+            for result in results:
                 if enrich is not None:
                     try:
                         enriched = enrich(frame, result.get("side"), result)
