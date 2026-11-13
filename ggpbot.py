@@ -589,7 +589,21 @@ def safe_api_call(func, *args, **kwargs):
             rate_limit()
             return func(*args, **kwargs)
         except Exception as e:
-            if "rate limit" in str(e).lower() or "100410" in str(e):
+            error_text = str(e).lower()
+            if "109500" in error_text or "current system is busy" in error_text:
+                try:
+                    log_execution(
+                        f"[API_BACKOFF] {getattr(func, '__name__', 'exchange_call')} "
+                        "BingX system-busy response; defer to the next scheduled sync",
+                        "WARN", debounce_key=f"api_busy_{getattr(func, '__name__', 'call')}",
+                        debounce_sec=30,
+                    )
+                except Exception:
+                    pass
+                # A short-lived exchange outage is not improved by three
+                # immediate duplicate reads. The caller owns its next retry.
+                raise
+            if "rate limit" in error_text or "100410" in error_text:
                 _LAST_API_RATE_LIMIT.update({
                     "ts": time.time(),
                     "method": getattr(func, "__name__", "exchange_call"),
@@ -2683,6 +2697,9 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             mode_result.mode, close_side.upper(), opening=False, closing=True,
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
+        # A close write may succeed even if its response is lost. Invalidate the
+        # passive snapshot first so the next reconciliation cannot reuse pre-close OPEN qty.
+        _invalidate_position_fetch_cache(symbol)
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
         order = ex.create_order(sym, "market", close_side, requested,
                                 params=close_params)
@@ -2766,6 +2783,10 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
             return False
         return _close_failure(f"order {order_id} returned but no position reduction was confirmed")
+
+    # A verified reduction changes realized PnL. Invalidate only after an actual
+    # exchange quantity delta has been established; failed/ambiguous closes stay cached.
+    _invalidate_realized_pnl_cache(symbol)
 
     average = safe_float(order_state.get("average") or order_state.get("price") or order.get("average") or order.get("price"))
     realized = None
@@ -5853,6 +5874,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         actual_filled_qty = safe_float(order.get("filled"), 0.0)
         actual_entry_price = safe_float(order.get("average"), 0.0)
         if actual_filled_qty <= 0 or actual_entry_price <= 0:
+            # The exchange acknowledged an exposure, even though its fill payload is incomplete.
+            _invalidate_position_fetch_cache(symbol)
             STATE.update({"open": True, "current_symbol": symbol, "side": side,
                           "trade_id": trade_id, "qty": qty, "recovery_hold": True,
                           "execution_unresolved": True})
@@ -5861,6 +5884,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             return False
         qty = actual_filled_qty
         price = actual_entry_price
+        # Discard any cached pre-entry FLAT snapshot before publishing local OPEN state.
+        _invalidate_position_fetch_cache(symbol)
         margin = (qty * contract_size * price) / LEVERAGE
         notional = qty * contract_size * price
         STATE.update({
@@ -9615,29 +9640,100 @@ def sync_position_with_exchange(symbol):
         log_execution(f"[SYNC] error: {e}", "ERROR")
         return None
 
-def get_realized_pnl(symbol, limit=100):
-    try:
-        trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=limit)
-        if not trades:
-            return 0.0, 0.0
-        buy_value = 0.0
-        sell_value = 0.0
-        for trade in trades:
-            side = trade['side'].lower()
-            qty = trade['amount']
-            price = trade['price']
-            cost = qty * price
-            if side == 'buy':
-                buy_value += cost
-            elif side == 'sell':
-                sell_value += cost
-        pnl = sell_value - buy_value
-        balance = get_balance_safe()
-        pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
-        return pnl, pnl_pct
-    except Exception as e:
-        log_execution(f"[SYNC] error in get_realized_pnl: {e}", "ERROR")
+def get_realized_pnl(symbol, limit=100, *, force=False):
+    """Return cached realized-PnL summary; force=True is reserved for explicit refreshes."""
+    if PAPER_MODE:
         return 0.0, 0.0
+
+    cache_key = (_position_fetch_cache_key(symbol), int(limit))
+    with _REALIZED_PNL_CACHE_LOCK:
+        # Start the age calculation only after acquiring the lock; the lock is
+        # held across the exchange read to coalesce concurrent accounting calls.
+        now_mono = time.monotonic()
+        cached = _REALIZED_PNL_CACHE.get(cache_key)
+        if not force and cached:
+            retry_after = safe_float(cached.get("retry_after"), 0.0)
+            age = max(0.0, now_mono - safe_float(cached.get("updated_mono"), now_mono))
+            if retry_after > now_mono:
+                if isinstance(MEMORY, dict):
+                    MEMORY["realized_pnl_sync"] = {
+                        "status": "STALE_BACKOFF" if cached.get("has_value") else "UNAVAILABLE_BACKOFF",
+                        "age_sec": round(age, 2),
+                        "last_error": cached.get("last_error", ""),
+                    }
+                return cached.get("value", (0.0, 0.0))
+            if cached.get("has_value") and age < REALIZED_PNL_CACHE_TTL_SEC:
+                if isinstance(MEMORY, dict):
+                    MEMORY["realized_pnl_sync"] = {
+                        "status": "CACHE_HIT", "age_sec": round(age, 2),
+                        "last_error": "",
+                    }
+                return cached["value"]
+
+        try:
+            trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=limit)
+            if not trades:
+                value = (0.0, 0.0)
+            else:
+                buy_value = 0.0
+                sell_value = 0.0
+                for trade in trades:
+                    side = str(trade["side"]).lower()
+                    qty = safe_float(trade["amount"])
+                    price = safe_float(trade["price"])
+                    cost = qty * price
+                    if side == "buy":
+                        buy_value += cost
+                    elif side == "sell":
+                        sell_value += cost
+                pnl = sell_value - buy_value
+                balance = get_balance_safe()
+                pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
+                value = (pnl, pnl_pct)
+
+            _REALIZED_PNL_CACHE[cache_key] = {
+                "value": value,
+                "has_value": True,
+                "updated_mono": time.monotonic(),
+                "updated_at": time.time(),
+                "retry_after": 0.0,
+                "last_error": "",
+            }
+            if isinstance(MEMORY, dict):
+                MEMORY["realized_pnl_sync"] = {
+                    "status": "FRESH", "age_sec": 0.0, "last_error": "",
+                    "updated_at": time.time(),
+                }
+            return value
+        except Exception as exc:
+            now_mono = time.monotonic()
+            previous = cached or {}
+            is_busy = "109500" in str(exc) or "current system is busy" in str(exc).lower()
+            backoff = REALIZED_PNL_ERROR_BACKOFF_SEC if is_busy else 5.0
+            value = previous.get("value", (0.0, 0.0))
+            updated_mono = safe_float(previous.get("updated_mono"), 0.0)
+            age = max(0.0, now_mono - updated_mono) if updated_mono > 0 else None
+            _REALIZED_PNL_CACHE[cache_key] = {
+                "value": value,
+                "has_value": bool(previous.get("has_value", False)),
+                "updated_mono": updated_mono,
+                "updated_at": previous.get("updated_at"),
+                "retry_after": now_mono + backoff,
+                "last_error": f"{type(exc).__name__}: {exc}"[:240],
+            }
+            if isinstance(MEMORY, dict):
+                MEMORY["realized_pnl_sync"] = {
+                    "status": "STALE_BACKOFF" if previous.get("has_value") else "UNAVAILABLE_BACKOFF",
+                    "age_sec": round(age, 2) if age is not None else None,
+                    "last_error": f"{type(exc).__name__}: {exc}"[:240],
+                }
+            log_execution(
+                f"[SYNC] error in get_realized_pnl: {type(exc).__name__}: {exc}",
+                "WARN" if is_busy else "ERROR",
+                debounce_key=f"realized_pnl_error_{cache_key[0]}",
+                debounce_sec=backoff,
+            )
+            return value
 
 def validate_position_state(local_pos, symbol):
     real_pos = sync_position_with_exchange(symbol)
@@ -9755,7 +9851,7 @@ def main_loop_sniper():
                 sym = STATE["current_symbol"]
                 price = get_ticker_safe(sym)
                 if price and price > 0:
-                    df = get_ohlcv_safe(sym, 50)
+                    df = get_ohlcv_safe(sym, MANAGEMENT_OHLCV_LIMIT)
                     if df is not None:
                         # Exit authority is exclusively LiveTradeManager; this block only updates auxiliary risk context.
                         atr = compute_atr(_closed_candle_frame(df, INTERVAL)).iloc[-1]
@@ -10415,6 +10511,49 @@ LAST_POSITION_FETCH_STATUS = "UNKNOWN"
 RECOVERY_BLOCK_ENTRIES = False
 _journal_last_snapshot_ts = 0.0
 
+# Background position readers (main loop, manager and reconciliation supervisor)
+# share one exchange snapshot. Close/verification paths explicitly bypass this cache.
+POSITION_FETCH_CACHE_TTL_SEC = _env_float_range("POSITION_FETCH_CACHE_TTL_SEC", 10.0, 2.0, 30.0)
+POSITION_FETCH_UNKNOWN_CACHE_TTL_SEC = _env_float_range("POSITION_FETCH_UNKNOWN_CACHE_TTL_SEC", 5.0, 1.0, 15.0)
+_POSITION_FETCH_CACHE = {}
+_POSITION_FETCH_CACHE_LOCK = threading.RLock()
+
+# PnL is a dashboard/accounting read, not an execution signal. Cache successful
+# reads and apply a short error cooldown so a busy exchange is not polled each loop.
+REALIZED_PNL_CACHE_TTL_SEC = _env_float_range("REALIZED_PNL_CACHE_TTL_SEC", 30.0, 5.0, 300.0)
+REALIZED_PNL_ERROR_BACKOFF_SEC = _env_float_range("REALIZED_PNL_ERROR_BACKOFF_SEC", 20.0, 5.0, 120.0)
+_REALIZED_PNL_CACHE = {}
+_REALIZED_PNL_CACHE_LOCK = threading.RLock()
+
+
+def _position_fetch_cache_key(symbol=None):
+    if not symbol:
+        return "__ALL_POSITIONS__"
+    try:
+        return str(roro_canonical_symbol(symbol))
+    except Exception:
+        return str(symbol).strip().upper()
+
+
+def _invalidate_position_fetch_cache(symbol=None):
+    key = _position_fetch_cache_key(symbol)
+    with _POSITION_FETCH_CACHE_LOCK:
+        if symbol:
+            _POSITION_FETCH_CACHE.pop(key, None)
+        else:
+            _POSITION_FETCH_CACHE.clear()
+
+
+def _invalidate_realized_pnl_cache(symbol=None):
+    with _REALIZED_PNL_CACHE_LOCK:
+        if not symbol:
+            _REALIZED_PNL_CACHE.clear()
+            return
+        canonical = _position_fetch_cache_key(symbol)
+        for key in list(_REALIZED_PNL_CACHE):
+            if key[0] == canonical:
+                _REALIZED_PNL_CACHE.pop(key, None)
+
 
 def _position_contracts(pos):
     info = pos.get("info") if isinstance(pos, dict) else {}
@@ -10434,43 +10573,83 @@ def _position_symbol(pos):
     return str(pos.get("symbol") or info.get("symbol") or "")
 
 
-def fetch_position_tri_state(symbol=None):
-    """Return OPEN/FLAT/UNKNOWN; API errors must never be interpreted as FLAT."""
+def fetch_position_tri_state(symbol=None, *, force=True):
+    """Return OPEN/FLAT/UNKNOWN; only non-execution readers may reuse a fresh snapshot.
+
+    force=True is the safe default for close submission, close verification and other
+    execution-critical callers. Background reconciliation opts into force=False so
+    its independent readers coalesce around the same short-lived exchange response.
+    UNKNOWN is cached briefly only to prevent concurrent retry storms; it is never
+    converted into OPEN or FLAT.
+    """
     global LAST_POSITION_FETCH_STATUS
     if PAPER_MODE:
         status = "OPEN" if STATE.get("open") else "FLAT"
         LAST_POSITION_FETCH_STATUS = status
         return status, None
-    try:
-        if not hasattr(ex, "fetch_positions"):
-            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
-            return "UNKNOWN", None
-        if symbol:
-            result = safe_api_call(ex.fetch_positions, [normalize_symbol(symbol)])
-        else:
-            result = safe_api_call(ex.fetch_positions)
-        if result is None or not isinstance(result, (list, tuple)):
-            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
-            return "UNKNOWN", None
-        open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
-        if symbol:
-            target = roro_canonical_symbol(symbol)
-            matches = [p for p in open_positions if roro_canonical_symbol(_position_symbol(p)) == target]
-            if not matches:
-                LAST_POSITION_FETCH_STATUS = "FLAT"
-                return "FLAT", None
-            if len(matches) > 1:
-                # Multiple position sides for the same market require explicit hedge-mode handling.
-                LAST_POSITION_FETCH_STATUS = "UNKNOWN"
-                return "UNKNOWN", None
-            LAST_POSITION_FETCH_STATUS = "OPEN"
-            return "OPEN", matches[0]
-        LAST_POSITION_FETCH_STATUS = "OPEN" if open_positions else "FLAT"
-        return LAST_POSITION_FETCH_STATUS, open_positions
-    except Exception as exc:
-        LAST_POSITION_FETCH_STATUS = "UNKNOWN"
-        log_execution(f"[POS_SYNC] tri-state fetch failed: {type(exc).__name__}: {exc}", "ERROR")
-        return "UNKNOWN", None
+
+    cache_key = _position_fetch_cache_key(symbol)
+
+    with _POSITION_FETCH_CACHE_LOCK:
+        # Measure age after acquiring the lock; a slow prior fetch must not make
+        # its newly stored snapshot appear artificially fresh to this waiter.
+        now_mono = time.monotonic()
+        cached = _POSITION_FETCH_CACHE.get(cache_key)
+        if not force and cached:
+            ttl = (POSITION_FETCH_UNKNOWN_CACHE_TTL_SEC
+                   if cached.get("status") == "UNKNOWN"
+                   else POSITION_FETCH_CACHE_TTL_SEC)
+            if now_mono - safe_float(cached.get("ts_mono")) < ttl:
+                LAST_POSITION_FETCH_STATUS = cached["status"]
+                return cached["status"], cached.get("position")
+
+        try:
+            if not callable(getattr(ex, "fetch_positions", None)):
+                status, position = "UNKNOWN", None
+            else:
+                if symbol:
+                    result = safe_api_call(ex.fetch_positions, [normalize_symbol(symbol)])
+                else:
+                    result = safe_api_call(ex.fetch_positions)
+
+                if result is None or not isinstance(result, (list, tuple)):
+                    status, position = "UNKNOWN", None
+                else:
+                    open_positions = [
+                        p for p in result
+                        if isinstance(p, dict) and _position_contracts(p) > 0
+                    ]
+                    if symbol:
+                        target = roro_canonical_symbol(symbol)
+                        matches = [
+                            p for p in open_positions
+                            if roro_canonical_symbol(_position_symbol(p)) == target
+                        ]
+                        if not matches:
+                            status, position = "FLAT", None
+                        elif len(matches) > 1:
+                            # Multiple hedge legs require explicit side-aware handling.
+                            status, position = "UNKNOWN", None
+                        else:
+                            status, position = "OPEN", matches[0]
+                    else:
+                        status = "OPEN" if open_positions else "FLAT"
+                        position = open_positions
+        except Exception as exc:
+            status, position = "UNKNOWN", None
+            log_execution(
+                f"[POS_SYNC] tri-state fetch failed: {type(exc).__name__}: {exc}",
+                "ERROR", debounce_key=f"pos_sync_fetch_{cache_key}", debounce_sec=5,
+            )
+
+        LAST_POSITION_FETCH_STATUS = status
+        _POSITION_FETCH_CACHE[cache_key] = {
+            "status": status,
+            "position": position,
+            "ts_mono": time.monotonic(),
+            "updated_at": time.time(),
+        }
+        return status, position
 
 
 def _snapshot_from_position(symbol, pos):
@@ -10625,6 +10804,9 @@ def _fetch_external_close_diagnostic(symbol, side, entry_time=None, stop_order_i
 def _clear_confirmed_flat_unlocked(symbol, reason="EXCHANGE_FLAT_CONFIRMED"):
     """Clear exposure only after BingX FLAT; classify close cause from exchange evidence."""
     global RECOVERY_BLOCK_ENTRIES, _ACTIVE_TRADE
+    # Native SL/manual exchange closes do not pass through the bot's close-order
+    # wrapper. A confirmed FLAT must also refresh the dashboard PnL history.
+    _invalidate_realized_pnl_cache(symbol)
     if not STATE.get("open"):
         MEMORY["position_status"] = "FLAT"
         MEMORY["current_position"] = None
@@ -11545,7 +11727,7 @@ def _exchange_fetch_live_snapshot(self, symbol):
     if PAPER_MODE:
         self.last_fetch_status = "OPEN" if STATE.get("open") else "FLAT"
         return self._paper_snapshot(symbol)
-    status, pos = fetch_position_tri_state(symbol)
+    status, pos = fetch_position_tri_state(symbol, force=False)
     self.last_fetch_status = status
     if status != "OPEN":
         return None
