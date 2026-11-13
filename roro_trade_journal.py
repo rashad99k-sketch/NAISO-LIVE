@@ -84,6 +84,26 @@ class TradeJournal:
                     db.execute(f"ALTER TABLE trades ADD COLUMN {name} {ddl}")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_client_order_id ON trades(client_order_id) WHERE client_order_id IS NOT NULL")
 
+    def checkpoint_wal(self, mode: str = "PASSIVE") -> Dict[str, Any]:
+        """Run a bounded SQLite WAL checkpoint without blocking active writers.
+
+        PASSIVE is the only mode used by runtime maintenance. Other documented
+        SQLite modes are accepted for explicit offline/operator maintenance.
+        """
+        normalized = str(mode or "PASSIVE").upper()
+        if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            raise ValueError(f"Unsupported WAL checkpoint mode: {mode}")
+        with self._db() as db:
+            row = db.execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
+        busy, log_frames, checkpointed_frames = (list(row) + [0, 0, 0])[:3]
+        return {
+            "mode": normalized,
+            "busy": int(busy),
+            "log_frames": int(log_frames),
+            "checkpointed_frames": int(checkpointed_frames),
+            "complete": int(busy) == 0 and int(checkpointed_frames) >= int(log_frames),
+        }
+
     def get_runtime_state(self, state_key: str, default: Any = None) -> Any:
         """Read an independent runtime safety record without touching trade rows."""
         with self._db() as db:
