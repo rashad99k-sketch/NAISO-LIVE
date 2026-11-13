@@ -183,7 +183,8 @@ def test_trade_state_default_keeps_existing_protection_and_reconciliation_keys()
         "tp2_filled_qty", "tp1_execution_price",
     }
     assert required <= keys
-    assert {"entry_zone_low", "entry_zone_high", "zone_event_last_candle_ts"} <= keys
+    assert {"entry_zone_low", "entry_zone_high", "zone_event_last_candle_ts",
+            "failed_breakout_streak", "failed_breakout_last_candle_ts"} <= keys
 
 
 
@@ -227,3 +228,22 @@ def test_failed_breakout_streak_counts_distinct_consecutive_candles():
     assert same_event is True
     assert (new_ts - prior_ts) > 0
     assert 1 + int(same_event) == 2
+
+
+def test_board_uses_only_same_side_fresh_confirmed_failed_breakout_evidence():
+    # These are the explicit acceptance conditions applied before thesis scoring.
+    def qualifies(event, confirmed, confidence, zone_side, trade_side, fresh, streak):
+        return (
+            str(event).upper() == "FAILED_BREAKOUT"
+            and bool(confirmed) and bool(fresh)
+            and str(zone_side).upper() == str(trade_side).upper()
+            and str(trade_side).upper() in {"BUY", "SELL"}
+            and float(confidence) >= 0.75
+            and int(streak) >= 2
+        )
+    assert qualifies("FAILED_BREAKOUT", True, .80, "BUY", "BUY", True, 2)
+    assert not qualifies("FAILED_BREAKOUT", True, .80, "BUY", "BUY", True, 1)
+    assert not qualifies("FAILED_BREAKOUT", True, .80, "SELL", "BUY", True, 2)
+    assert not qualifies("FAILED_BREAKOUT", False, .90, "BUY", "BUY", True, 2)
+    assert not qualifies("FAILED_BREAKOUT", True, .70, "BUY", "BUY", True, 2)
+    assert not qualifies("FAILED_BREAKOUT", True, .90, "BUY", "BUY", False, 2)
