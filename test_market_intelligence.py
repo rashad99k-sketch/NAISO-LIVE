@@ -934,7 +934,7 @@ def _flat_level_fixture(direction="TOP", breakout=True):
         if idx % 2:
             open_price, close = close, open_price
         if direction == "BOTTOM":
-            high = low + 4.0
+            high = 104.0 - idx * 0.08
             low = 100.0
             open_price, close = 102.0 + (idx % 2) * 0.1, 102.5 - (idx % 2) * 0.1
         rows.append(_pattern_candle(open_price, high, low, close, 80))
