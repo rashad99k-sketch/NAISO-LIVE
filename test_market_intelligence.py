@@ -1016,3 +1016,37 @@ def test_institutional_analyzer_uses_local_side_aware_fvg_gate():
     source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
     assert "fvg_ok = _fvg_matches_side(fvg, side)" in source
     assert "fvg.get(\"direction\") == expected" not in source
+
+
+def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
+    import ggpbot as bot
+
+    clock = [100.0]
+    waits = []
+
+    def fake_monotonic():
+        return clock[0]
+
+    def fake_sleep(seconds):
+        waits.append(float(seconds))
+        clock[0] += float(seconds)
+
+    def fetch_ohlcv():
+        return None
+
+    def fetch_ticker():
+        return None
+
+    monkeypatch.setattr(bot.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(bot.time, "sleep", fake_sleep)
+    monkeypatch.setattr(bot, "_last_api_call", 100.0)
+    monkeypatch.setattr(bot, "BINGX_KLINE_MIN_INTERVAL", 1.05)
+    monkeypatch.setitem(bot._API_METHOD_MIN_INTERVALS, "fetch_ohlcv", 1.05)
+
+    bot.rate_limit(fetch_ohlcv)
+    assert waits[-1] == pytest.approx(1.05)
+
+    waits.clear()
+    monkeypatch.setattr(bot, "_last_api_call", clock[0])
+    bot.rate_limit(fetch_ticker)
+    assert waits[-1] == pytest.approx(bot.MIN_API_INTERVAL)
