@@ -127,3 +127,12 @@ def test_buy_sell_opposing_liquidity_targets_trigger_in_correct_direction():
     assert not target_reached("BUY", 100.4, buy["target_price"])
     assert target_reached("SELL", 99.5, sell["target_price"])
     assert not target_reached("SELL", 99.6, sell["target_price"])
+
+
+def test_opposing_liquidity_scalp_plan_has_two_ordered_50_50_targets():
+    buy = build_scalp_target("BUY", 100.0, 100.90)
+    sell = build_scalp_target("SELL", 100.0, 99.10)
+    assert buy["status"] == sell["status"] == "VALID"
+    assert 100.0 < buy["tp1_target_price"] < buy["target_price"] < 100.90
+    assert 99.10 < sell["target_price"] < sell["tp1_target_price"] < 100.0
+    assert build_scalp_target("BUY", 100.0, 100.20)["status"] == "NO_TARGET"
