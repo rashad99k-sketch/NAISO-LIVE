@@ -3,7 +3,7 @@ import pytest
 from ggp_market_intelligence import (
     TradingMode, EntryBehavior, ZoneEvent,
     classify_trading_mode, classify_entry_behavior, classify_zone_event,
-    build_intelligence_decision, advance_failed_breakout_confirmation,
+    build_intelligence_decision, advance_failed_breakout_confirmation,\n    is_confirmed_failed_breakout_evidence,
 )
 
 
@@ -591,3 +591,57 @@ def test_bridge_adx_uses_sma_seeded_wilder_smoothing():
     expected = rma(dx)[-1]
     assert np.isfinite(expected)
     assert _adx(frame, period=period) == pytest.approx(expected, rel=1e-10, abs=1e-10)
+
+
+def test_failed_breakout_closed_candle_lifecycle_produces_board_eligible_evidence():
+    # Candle 3 closes back inside after candle 2 closed outside the BUY zone.
+    first = classify_zone_event(
+        [candle(900, 100.5, 101.0, 100.0, 100.5),
+         candle(1800, 102.2, 103.5, 102.0, 103.0),
+         candle(2700, 103.0, 103.2, 100.5, 101.0)],
+        side="BUY", zone_low=99.0, zone_high=102.0, atr=1.0,
+    )
+    assert first["event"] == ZoneEvent.FAILED_BREAKOUT.value
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event=ZoneEvent.INSIDE_ZONE.value,
+        previous_timestamp=1800, previous_streak=0,
+        current_event=first["event"], current_timestamp=first["timestamp"],
+        timeframe_seconds=900,
+    )
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 1
+
+    # The next distinct completed candle remains inside: this is the second
+    # adjacent confirmation, not another breakout and not an unfinished bar.
+    second = classify_zone_event(
+        [candle(1800, 102.2, 103.5, 102.0, 103.0),
+         candle(2700, 103.0, 103.2, 100.5, 101.0),
+         candle(3600, 101.0, 101.4, 100.2, 100.8)],
+        side="BUY", zone_low=99.0, zone_high=102.0, atr=1.0,
+    )
+    assert second["event"] == ZoneEvent.INSIDE_ZONE.value
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event=event, previous_timestamp=2700, previous_streak=streak,
+        current_event=second["event"], current_timestamp=second["timestamp"],
+        timeframe_seconds=900,
+    )
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 2
+
+    evidence = {
+        "zone_event": event,
+        "zone_event_confirmed": True,
+        "zone_event_fresh": True,
+        "zone_event_confidence": 0.78,
+        "zone_side": "BUY",
+        "failed_breakout_streak": streak,
+        "failed_breakout_thesis_credit_applied": False,
+    }
+    assert is_confirmed_failed_breakout_evidence(evidence, "BUY")
+    assert not is_confirmed_failed_breakout_evidence(evidence, "SELL")
+    assert not is_confirmed_failed_breakout_evidence(
+        {**evidence, "zone_event_fresh": False}, "BUY"
+    )
+    assert not is_confirmed_failed_breakout_evidence(
+        {**evidence, "failed_breakout_thesis_credit_applied": True}, "BUY"
+    )
