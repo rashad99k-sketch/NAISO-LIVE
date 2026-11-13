@@ -417,14 +417,14 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _intelligence = build_intelligence_decision(
         regime=reg.state, adx=None,
         continuation_probability=(float(cont.score) / 100.0 if getattr(cont, "score", None) is not None else None),
-        liquidity_quality="GOOD" if float(_liq_conf or 0) >= 0.65 else "UNKNOWN",
+        liquidity_quality="GOOD" if float(_liq_conf or 0) >= 65.0 else "UNKNOWN",
         displacement_atr=_disp_atr,
         setup_type=decision.setup_type,
         sweep_confirmed=liq_name in ("SWEEP", "GRAB"),
         mss_confirmed=bool(context["structure"].get("mss") or context["structure"].get("bos")),
         causal_zone_valid=bool(ob_ok or fvg_ok),
         bos_level=(context["structure"].get("swing_high") if side == "BUY" else context["structure"].get("swing_low")),
-        volatility_atr=(_atr(closed) / float(context["price"]) if float(context["price"] or 0) > 0 else None),
+        volatility_atr=(_atr(closed) / float(context["price"]) * 100.0 if float(context["price"] or 0) > 0 else None),
         data_quality="VALID_CLOSED_CANDLES",
     ).to_dict()
     return {
