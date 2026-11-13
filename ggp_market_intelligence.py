@@ -86,12 +86,13 @@ def classify_trading_mode(*, regime: str = "UNKNOWN", adx: Any = None,
     if sweep_confirmed and mss_confirmed and causal_zone_valid:
         return TradingMode.SNIPER.value, 0.90, ("liquidity_sweep", "mss_confirmed", "causal_zone_valid")
 
-    if regime in {"STRONG_TREND", "VERY_STRONG", "STRONG_TRENDING", "EXPANSION", "TREND"} and (
+    if regime in {"STRONG_TREND", "VERY_STRONG", "STRONG_TRENDING", "EXPANSION", "TREND",
+                  "TREND_CONTINUATION", "EMA20_PULLBACK", "EMA50_DEEP_PULLBACK"} and (
         adx_v is not None and adx_v >= 22 and cont is not None and cont >= 0.60
     ):
         return TradingMode.TREND.value, 0.82, ("directional_regime", "adx_confirmed", "continuation_confirmed")
 
-    if regime in {"RANGE", "CHOPPY", "COMPRESSION", "RANGE_CHOP"} and (
+    if regime in {"RANGE", "CHOPPY", "COMPRESSION", "RANGE_CHOP", "RANGE_OR_UNCLEAR"} and (
         adx_v is not None and adx_v < 22 and cont is not None and cont < 0.60
         and str(liquidity_quality).upper() in {"GOOD", "ADEQUATE", "HIGH"}
     ):
