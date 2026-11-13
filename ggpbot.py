@@ -3297,6 +3297,35 @@ class LiveTradeManager:
             STATE["adx_slope"] = adx_slope
             STATE["volume_ratio"] = volume_ratio
             STATE["last_management_closed_candle_ts"] = closed_candle_ts
+            # Observational zone lifecycle on fresh, completed candles only.
+            try:
+                _zl = safe_float(STATE.get("entry_zone_low"), 0.0)
+                _zh = safe_float(STATE.get("entry_zone_high"), 0.0)
+                _zts = int(safe_float(STATE.get("zone_event_last_candle_ts"), 0))
+                if _zl > 0 and _zh > _zl and len(df_live) >= 3 and int(closed_candle_ts) > _zts:
+                    _zr = classify_zone_event(df_live.tail(12).to_dict("records"), side=side,
+                                               zone_low=_zl, zone_high=_zh, atr=atr)
+                    if _zr.get("event") != "INSUFFICIENT_DATA":
+                        STATE["zone_event"] = _zr["event"]
+                        STATE["zone_event_last_candle_ts"] = int(_zr.get("timestamp") or closed_candle_ts)
+                        STATE["market_intelligence"] = {
+                            **(STATE.get("market_intelligence") or {}),
+                            "zone_event": _zr["event"],
+                            "zone_event_confirmed": bool(_zr.get("confirmed")),
+                            "zone_event_confidence": safe_float(_zr.get("confidence"), 0.0),
+                            "zone_reference_level": safe_float(_zr.get("level"), 0.0),
+                            "zone_event_reasons": list(_zr.get("reason_codes") or []),
+                            "zone_event_timestamp": STATE["zone_event_last_candle_ts"],
+                        }
+                        record_trade_management_event(
+                            "MARKET_STRUCTURE_EVENT", "CONFIRMED" if _zr.get("confirmed") else "OBSERVED",
+                            dedupe_key=f"zone:{symbol}:{_zr['event']}:{STATE['zone_event_last_candle_ts']}",
+                            dedupe_seconds=0, symbol=symbol, side=side,
+                            reason=_zr["event"], price=mark_price,
+                            reference_level=_zr.get("level"), confidence=_zr.get("confidence"))
+            except Exception as _zone_exc:
+                log_execution(f"[MARKET_INTELLIGENCE] {symbol}: {type(_zone_exc).__name__}",
+                              "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60)
             # Observational closed-candle zone lifecycle; no exchange I/O or order actions.
             try:
                 _zone_low = safe_float(STATE.get("entry_zone_low"), 0.0)
@@ -3598,6 +3627,13 @@ class LiveTradeManager:
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
+            "market_intelligence": dict(STATE.get("market_intelligence") or {}),
+            "zone_event": str(STATE.get("zone_event", "INSUFFICIENT_DATA")),
+            "zone_event_confirmed": bool((STATE.get("market_intelligence") or {}).get("zone_event_confirmed", False)),
+            "zone_event_confidence": safe_float((STATE.get("market_intelligence") or {}).get("zone_event_confidence"), 0.0),
+            "zone_reference_level": safe_float((STATE.get("market_intelligence") or {}).get("zone_reference_level"), 0.0),
+            "entry_trading_mode": str(STATE.get("entry_trading_mode", "UNCLASSIFIED")),
+            "entry_behavior": str(STATE.get("entry_behavior", "WAIT_FOR_STRUCTURE")),
             "market_intelligence": dict(STATE.get("market_intelligence") or {}),
             "zone_event": str((STATE.get("market_intelligence") or {}).get("zone_event", "INSUFFICIENT_DATA")),
             "entry_trading_mode": str(STATE.get("entry_trading_mode", "UNCLASSIFIED")),
@@ -5813,6 +5849,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
             "roe_pct": 0.0, "mark_price": price, "initial_margin": margin,
             "narrative_classification": STATE.get("narrative_classification", ""),
+            "market_intelligence": dict((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence") or {}),
+            "entry_trading_mode": str((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("trading_mode", "UNCLASSIFIED")),
+            "entry_behavior": str((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_behavior", "WAIT_FOR_STRUCTURE")),
+            "entry_behavior_confidence": safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_behavior_confidence"), 0.0),
+            "entry_behavior_reasons": list((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_behavior_reasons") or []),
+            "entry_zone_low": safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_zone_low"), 0.0),
+            "entry_zone_high": safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_zone_high"), 0.0),
+            "zone_event": "INSIDE_ZONE" if safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+            "zone_event_last_candle_ts": 0,
             "narrative_confidence": STATE.get("narrative_confidence", 0.0),
             "confidence_level": STATE.get("confidence_level", ""),
             "trade_thesis": thesis.__dict__,
@@ -10239,8 +10284,6 @@ def smart_opportunity_selection():
                 "entry_behavior": str((item.get("market_intelligence") or {}).get("entry_behavior", "WAIT_FOR_STRUCTURE")),
                 "entry_behavior_confidence": safe_float((item.get("market_intelligence") or {}).get("confidence", 0.0), 0.0),
                 "entry_behavior_reasons": list((item.get("market_intelligence") or {}).get("reason_codes", [])),
-                "capital_allocation_tier": item.get("capital_allocation_tier"),
-                "sizing_eligible_strong": bool(is_strong),
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
             try:
