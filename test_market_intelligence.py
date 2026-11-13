@@ -389,3 +389,49 @@ def test_entry_context_passes_mode_behavior_and_zone_to_trade_state():
     assert '"entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low"))' in source
     assert '"entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high"))' in source
     assert '"trading_mode": "SNIPER"' in source
+
+
+def test_failed_breakout_streak_increments_on_each_adjacent_reentry_candle():
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="FAILED_BREAKOUT", previous_timestamp=100,
+        previous_streak=1, current_event="FAILED_BREAKOUT",
+        current_timestamp=115, timeframe_seconds=15)
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 2
+
+
+def test_failed_breakout_streak_starts_over_after_gap_or_duplicate():
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="FAILED_BREAKOUT", previous_timestamp=100,
+        previous_streak=1, current_event="FAILED_BREAKOUT",
+        current_timestamp=140, timeframe_seconds=15)
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 1
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="FAILED_BREAKOUT", previous_timestamp=100,
+        previous_streak=1, current_event="FAILED_BREAKOUT",
+        current_timestamp=100, timeframe_seconds=15)
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 1
+
+
+def test_adx_rejects_missing_or_nonfinite_ohlc():
+    import numpy as np
+    import pandas as pd
+    from ggp_institutional_bridge import _adx
+    frame = pd.DataFrame({"high":[2.0]*60,"low":[1.0]*60,"close":[1.5]*60})
+    assert np.isnan(_adx(frame.assign(close=np.nan)))
+    assert np.isnan(_adx(frame.drop(columns=["high"])))
+    assert np.isnan(_adx(frame, period=1))
+
+
+def test_management_observer_passes_fresh_zone_evidence_into_same_trade_state_context():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    start = source.index("# Closed-candle zone lifecycle; context only, no order side effects.")
+    end = source.index("# ========== GET DECISION FROM BOARD ==========", start)
+    observer = source[start:end]
+    assert '"zone_event_fresh": (' in observer
+    assert '"zone_side": str(side or "").upper()' in observer
+    assert '"failed_breakout_streak": _failure_streak' in observer
+    assert 'self.board.evaluate(context)' in source
