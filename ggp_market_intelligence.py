@@ -400,7 +400,9 @@ def classify_price_pattern(candles: Sequence[Dict[str, Any]], *, atr: Any,
     telemetry, not an entry authorization or order-management signal.
     """
     atr_v = _num(atr)
-    minimum = max(impulse_bars + flag_bars + 1, range_bars + 1, 12)
+    # Flat-level patterns need only their range window; flags additionally
+    # require the longer impulse + consolidation sequence below.
+    minimum = max(range_bars + 1, 6)
     if atr_v is None or atr_v <= 0 or len(candles or ()) < minimum:
         return {"pattern": "UNKNOWN", "stage": "INSUFFICIENT_DATA",
                 "direction": "NEUTRAL", "confidence": 0.0,
@@ -426,75 +428,76 @@ def classify_price_pattern(candles: Sequence[Dict[str, Any]], *, atr: Any,
         rows.append(values)
 
     trigger = rows[-1]
-    impulse = rows[-(flag_bars + impulse_bars + 1):-(flag_bars + 1)]
-    flag = rows[-(flag_bars + 1):-1]
-    if len(impulse) != impulse_bars or len(flag) != flag_bars:
-        return {"pattern": "UNKNOWN", "stage": "INSUFFICIENT_DATA",
-                "direction": "NEUTRAL", "confidence": 0.0,
-                "reference_level": None, "reason_codes": ["window_not_available"]}
-
-    def _median(values):
-        ordered = sorted(float(v) for v in values)
-        n = len(ordered)
-        return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
-
-    impulse_volume = _median([row["volume"] for row in impulse])
-    flag_volume = _median([row["volume"] for row in flag])
-    volume_contracts = impulse_volume > 0 and flag_volume <= impulse_volume * 1.25
-    impulse_high = max(row["high"] for row in impulse)
-    impulse_low = min(row["low"] for row in impulse)
-    flag_high = max(row["high"] for row in flag)
-    flag_low = min(row["low"] for row in flag)
-
-    # Bull flag: strong upward impulse, contained/shallower downward pause,
-    # then optionally a close through the flag's own ceiling.
-    bull_move = impulse[-1]["close"] - impulse[0]["open"]
-    bull_retrace = (impulse_high - flag_low) / bull_move if bull_move > 0 else float("inf")
-    bull_directional = sum(row["close"] > row["open"] for row in impulse) / impulse_bars
-    bull_pause = flag[-1]["close"] - flag[0]["open"]
-    bull_flag = (
-        bull_move >= 1.8 * atr_v
-        and bull_directional >= 0.625
-        and 0.10 <= bull_retrace <= 0.65
-        and bull_pause <= bull_move * 0.25
-        and flag_low > impulse[0]["open"] - 0.15 * atr_v
-        and flag_high <= impulse_high + 0.50 * atr_v
-    )
-    if bull_flag:
-        breakout = trigger["close"] > flag_high + 0.05 * atr_v
-        confidence = 0.72 + (0.08 if volume_contracts else 0.0) + (0.08 if breakout else 0.0)
-        return {"pattern": "BULL_FLAG",
-                "stage": "BREAKOUT_CONFIRMED" if breakout else "FORMING",
-                "direction": "BULLISH", "confidence": round(min(0.90, confidence), 3),
-                "reference_level": round(float(flag_high), 12),
-                "reason_codes": ["upward_impulse_atr_confirmed", "contained_flag_retracement"]
-                                + (["flag_volume_contraction"] if volume_contracts else [])
-                                + (["closed_candle_flag_ceiling_break"] if breakout else ["waiting_for_flag_ceiling_break"])}
-
-    # Bear flag is the exact directional mirror of the bull flag.
-    bear_move = impulse[0]["open"] - impulse[-1]["close"]
-    bear_retrace = (flag_high - impulse_low) / bear_move if bear_move > 0 else float("inf")
-    bear_directional = sum(row["close"] < row["open"] for row in impulse) / impulse_bars
-    bear_pause = flag[-1]["close"] - flag[0]["open"]
-    bear_flag = (
-        bear_move >= 1.8 * atr_v
-        and bear_directional >= 0.625
-        and 0.10 <= bear_retrace <= 0.65
-        and bear_pause >= -bear_move * 0.25
-        and flag_high < impulse[0]["open"] + 0.15 * atr_v
-        and flag_low >= impulse_low - 0.50 * atr_v
-    )
-    if bear_flag:
-        breakout = trigger["close"] < flag_low - 0.05 * atr_v
-        confidence = 0.72 + (0.08 if volume_contracts else 0.0) + (0.08 if breakout else 0.0)
-        return {"pattern": "BEAR_FLAG",
-                "stage": "BREAKOUT_CONFIRMED" if breakout else "FORMING",
-                "direction": "BEARISH", "confidence": round(min(0.90, confidence), 3),
-                "reference_level": round(float(flag_low), 12),
-                "reason_codes": ["downward_impulse_atr_confirmed", "contained_flag_retracement"]
-                                + (["flag_volume_contraction"] if volume_contracts else [])
-                                + (["closed_candle_flag_floor_break"] if breakout else ["waiting_for_flag_floor_break"])}
-
+    if len(rows) >= impulse_bars + flag_bars + 1:
+        impulse = rows[-(flag_bars + impulse_bars + 1):-(flag_bars + 1)]
+        flag = rows[-(flag_bars + 1):-1]
+        if len(impulse) != impulse_bars or len(flag) != flag_bars:
+            return {"pattern": "UNKNOWN", "stage": "INSUFFICIENT_DATA",
+                    "direction": "NEUTRAL", "confidence": 0.0,
+                    "reference_level": None, "reason_codes": ["window_not_available"]}
+    
+        def _median(values):
+            ordered = sorted(float(v) for v in values)
+            n = len(ordered)
+            return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    
+        impulse_volume = _median([row["volume"] for row in impulse])
+        flag_volume = _median([row["volume"] for row in flag])
+        volume_contracts = impulse_volume > 0 and flag_volume <= impulse_volume * 1.25
+        impulse_high = max(row["high"] for row in impulse)
+        impulse_low = min(row["low"] for row in impulse)
+        flag_high = max(row["high"] for row in flag)
+        flag_low = min(row["low"] for row in flag)
+    
+        # Bull flag: strong upward impulse, contained/shallower downward pause,
+        # then optionally a close through the flag's own ceiling.
+        bull_move = impulse[-1]["close"] - impulse[0]["open"]
+        bull_retrace = (impulse_high - flag_low) / bull_move if bull_move > 0 else float("inf")
+        bull_directional = sum(row["close"] > row["open"] for row in impulse) / impulse_bars
+        bull_pause = flag[-1]["close"] - flag[0]["open"]
+        bull_flag = (
+            bull_move >= 1.8 * atr_v
+            and bull_directional >= 0.625
+            and 0.10 <= bull_retrace <= 0.65
+            and bull_pause <= bull_move * 0.25
+            and flag_low > impulse[0]["open"] - 0.15 * atr_v
+            and flag_high <= impulse_high + 0.50 * atr_v
+        )
+        if bull_flag:
+            breakout = trigger["close"] > flag_high + 0.05 * atr_v
+            confidence = 0.72 + (0.08 if volume_contracts else 0.0) + (0.08 if breakout else 0.0)
+            return {"pattern": "BULL_FLAG",
+                    "stage": "BREAKOUT_CONFIRMED" if breakout else "FORMING",
+                    "direction": "BULLISH", "confidence": round(min(0.90, confidence), 3),
+                    "reference_level": round(float(flag_high), 12),
+                    "reason_codes": ["upward_impulse_atr_confirmed", "contained_flag_retracement"]
+                                    + (["flag_volume_contraction"] if volume_contracts else [])
+                                    + (["closed_candle_flag_ceiling_break"] if breakout else ["waiting_for_flag_ceiling_break"])}
+    
+        # Bear flag is the exact directional mirror of the bull flag.
+        bear_move = impulse[0]["open"] - impulse[-1]["close"]
+        bear_retrace = (flag_high - impulse_low) / bear_move if bear_move > 0 else float("inf")
+        bear_directional = sum(row["close"] < row["open"] for row in impulse) / impulse_bars
+        bear_pause = flag[-1]["close"] - flag[0]["open"]
+        bear_flag = (
+            bear_move >= 1.8 * atr_v
+            and bear_directional >= 0.625
+            and 0.10 <= bear_retrace <= 0.65
+            and bear_pause >= -bear_move * 0.25
+            and flag_high < impulse[0]["open"] + 0.15 * atr_v
+            and flag_low >= impulse_low - 0.50 * atr_v
+        )
+        if bear_flag:
+            breakout = trigger["close"] < flag_low - 0.05 * atr_v
+            confidence = 0.72 + (0.08 if volume_contracts else 0.0) + (0.08 if breakout else 0.0)
+            return {"pattern": "BEAR_FLAG",
+                    "stage": "BREAKOUT_CONFIRMED" if breakout else "FORMING",
+                    "direction": "BEARISH", "confidence": round(min(0.90, confidence), 3),
+                    "reference_level": round(float(flag_low), 12),
+                    "reason_codes": ["downward_impulse_atr_confirmed", "contained_flag_retracement"]
+                                    + (["flag_volume_contraction"] if volume_contracts else [])
+                                    + (["closed_candle_flag_floor_break"] if breakout else ["waiting_for_flag_floor_break"])}
+    
     # Flat top/bottom: repeated, independently observed boundary tests. The
     # breakout candle is evaluated separately from the consolidation window.
     base = rows[-(range_bars + 1):-1]
