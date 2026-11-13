@@ -427,6 +427,11 @@ def classify_price_pattern(candles: Sequence[Dict[str, Any]], *, atr: Any,
                     "reference_level": None, "reason_codes": ["invalid_ohlcv"]}
         rows.append(values)
 
+    def _median(values):
+        ordered = sorted(float(v) for v in values)
+        n = len(ordered)
+        return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+
     trigger = rows[-1]
     if len(rows) >= impulse_bars + flag_bars + 1:
         impulse = rows[-(flag_bars + impulse_bars + 1):-(flag_bars + 1)]
@@ -435,11 +440,6 @@ def classify_price_pattern(candles: Sequence[Dict[str, Any]], *, atr: Any,
             return {"pattern": "UNKNOWN", "stage": "INSUFFICIENT_DATA",
                     "direction": "NEUTRAL", "confidence": 0.0,
                     "reference_level": None, "reason_codes": ["window_not_available"]}
-    
-        def _median(values):
-            ordered = sorted(float(v) for v in values)
-            n = len(ordered)
-            return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
     
         impulse_volume = _median([row["volume"] for row in impulse])
         flag_volume = _median([row["volume"] for row in flag])
