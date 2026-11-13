@@ -457,7 +457,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _intelligence = build_intelligence_decision(
         regime=reg.state, adx=_adx_value,
         continuation_probability=(float(cont.score) / 100.0 if getattr(cont, "score", None) is not None else None),
-        liquidity_quality="GOOD" if float(_liq_conf or 0) >= 65.0 else "UNKNOWN",
+        liquidity_quality=("GOOD" if float(_liq_conf or 0) >= 65.0 else "ADEQUATE" if float(_liq_conf or 0) >= 50.0 else "UNKNOWN"),
         displacement_atr=_disp_atr,
         setup_type=decision.setup_type,
         sweep_confirmed=liq_name in ("SWEEP", "GRAB"),
