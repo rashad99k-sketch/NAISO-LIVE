@@ -188,9 +188,13 @@ def classify_zone_event(candles: Sequence[Dict[str, Any]], *, side: str,
             break
     required = max(2, min(5, int(min_acceptance_closes)))
     if closes_out >= required:
+        # A retest must happen AFTER the first accepted close. Pre-breakout
+        # candles may already trade through the level and are not retests.
+        acceptance_start = len(normalized) - closes_out
+        post_acceptance = normalized[acceptance_start + 1:]
         pullback_touch = any(
             (r["low"] <= boundary + 0.15 * atr_v if side == "BUY" else r["high"] >= boundary - 0.15 * atr_v)
-            for r in normalized[-min(len(normalized), closes_out + 3):-closes_out]
+            for r in post_acceptance
         )
         retest_holds = last["close"] > boundary if side == "BUY" else last["close"] < boundary
         if pullback_touch and retest_holds:
@@ -234,3 +238,35 @@ def build_intelligence_decision(*, regime: str = "UNKNOWN", adx: Any = None,
         reference_low=None, reference_high=None,
         reason_codes=tuple(mode_reasons + behavior_reasons), confirmed=False,
         source_timestamp=None)
+
+
+def advance_failed_breakout_confirmation(*, previous_event: str,
+                                          previous_timestamp: Any,
+                                          previous_streak: Any,
+                                          current_event: str,
+                                          current_timestamp: Any,
+                                          timeframe_seconds: Any) -> Tuple[str, int]:
+    """Confirm a failed breakout over two adjacent closed candles.
+
+    A re-entry after a close outside starts the state. The next distinct
+    closed candle must remain inside the reference zone. Duplicate, stale,
+    gapped, or unrelated events reset the consecutive count.
+    """
+    prev_event = str(previous_event or "").upper()
+    event = str(current_event or "").upper()
+    prev_ts, ts = _num(previous_timestamp), _num(current_timestamp)
+    streak_n = max(0, int(_num(previous_streak) or 0))
+    timeframe = _num(timeframe_seconds)
+    if event == ZoneEvent.FAILED_BREAKOUT.value:
+        return ZoneEvent.FAILED_BREAKOUT.value, 1
+    if (
+        prev_event == ZoneEvent.FAILED_BREAKOUT.value
+        and event == ZoneEvent.INSIDE_ZONE.value
+        and prev_ts is not None and ts is not None
+        and timeframe is not None and timeframe > 0
+        and ts > prev_ts
+        and (ts - prev_ts) <= timeframe * 1.5
+        and streak_n >= 1
+    ):
+        return ZoneEvent.FAILED_BREAKOUT.value, streak_n + 1
+    return event or ZoneEvent.INSUFFICIENT_DATA.value, 0
