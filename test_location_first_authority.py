@@ -1,5 +1,3 @@
-import pandas as pd
-
 from roro_institutional import _location_event_id, _zone_retest_candidates
 
 
@@ -12,8 +10,8 @@ def _context(**overrides):
         "max_location_distance_atr": 1.5,
         "order_block": {
             "low": 99.0, "high": 100.5, "timestamp": 1_699_999_000_000,
-            "impulse_timestamp": 1_699_999_100_000, "strength": 8.0,
-            "distance_atr": 0.0,
+            "impulse_timestamp": 1_699_999_100_000, "strength": 8.0, "zone_definition": "BULLISH_LOW_TO_OPEN",
+            "distance_atr": 0.0, "zone_definition": "BULLISH_LOW_TO_OPEN",
         },
     }
     value.update(overrides)
@@ -36,7 +34,7 @@ def test_location_first_rejects_zone_far_from_current_price():
 
 
 def test_location_first_rejects_zone_without_confirmed_timestamp():
-    context = _context(order_block={"low": 99.0, "high": 100.5, "strength": 8.0})
+    context = _context(order_block={"low": 99.0, "high": 100.5, "strength": 8.0, "zone_definition": "BULLISH_LOW_TO_OPEN"})
     assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
 
 
@@ -67,6 +65,42 @@ def test_same_zone_same_structure_is_deduplicated_but_new_structure_is_allowed()
 def test_location_first_rejects_weak_order_block():
     context = _context(order_block={
         "low": 99.0, "high": 100.5, "timestamp": 1_699_999_000_000,
-        "impulse_timestamp": 1_699_999_100_000, "strength": 4.9,
+        "impulse_timestamp": 1_699_999_100_000, "strength": 4.9, "zone_definition": "BULLISH_LOW_TO_OPEN",
     })
     assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
+
+
+
+def test_location_first_rejects_opposite_direction_order_block():
+    context = _context(order_block={
+        "low": 99.0, "high": 100.5, "timestamp": 1_699_999_000_000,
+        "impulse_timestamp": 1_699_999_100_000, "strength": 8.0,
+        "zone_definition": "BEARISH_OPEN_TO_HIGH",
+    })
+    assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
+
+
+def test_location_first_rejects_opposite_direction_fvg():
+    context = _context(order_block=None, fvg={
+        "lower": 99.0, "upper": 100.5, "timestamp": 1_699_999_100_000,
+        "direction": "BEARISH", "status": "UNFILLED", "size_atr": 0.2,
+    })
+    assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
+
+
+def test_location_first_rejects_future_dated_zone():
+    context = _context(order_block={
+        "low": 99.0, "high": 100.5, "timestamp": 1_700_000_100_000,
+        "impulse_timestamp": 1_700_000_100_000, "strength": 8.0,
+        "zone_definition": "BULLISH_LOW_TO_OPEN",
+    })
+    assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
+
+
+def test_location_first_accepts_side_aligned_unfilled_fvg():
+    context = _context(order_block=None, fvg={
+        "lower": 99.0, "upper": 100.5, "timestamp": 1_699_999_100_000,
+        "direction": "BULLISH", "status": "UNFILLED", "size_atr": 0.2,
+    })
+    zones = _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY")
+    assert zones == [(99.0, 100.5, "FVG", 1_699_999_100_000)]
