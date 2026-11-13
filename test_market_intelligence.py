@@ -775,6 +775,7 @@ def test_state_has_unique_opposing_liquidity_defaults():
     assert state.count('"opposing_liquidity_level":') == 1
     assert state.count('"scalp_target_selected_pct":') == 1
     assert state.count('"scalp_target_price":') == 1
+    assert state.count('"scalp_target_tp1_price":') == 1
     assert state.count('"scalp_target_status":') == 1
 
 
@@ -805,6 +806,7 @@ def test_paper_and_live_entry_reset_liquidity_state_once_each():
     paper = source[paper_start:paper_end]
     assert paper.count('"opposing_liquidity_status":') == 1
     assert paper.count('"scalp_target_price": 0.0') == 1
+    assert paper.count('"scalp_target_tp1_price": 0.0') == 1
     assert paper.count('"scalp_target_status": "UNKNOWN"') == 1
     live_start = source.index('        STATE.update({\n            "open": True, "side": side, "entry": price', source.index("pending_management_state"))
     live_end = source.index("        TRADE_STATE.update({", live_start)
@@ -813,6 +815,7 @@ def test_paper_and_live_entry_reset_liquidity_state_once_each():
     assert live.count('"trading_mode":') == 1
     assert live.count('"opposing_liquidity_status": "UNKNOWN"') == 1
     assert live.count('"scalp_target_price": 0.0') == 1
+    assert live.count('"scalp_target_tp1_price": 0.0') == 1
     assert live.count('"scalp_target_status": "UNKNOWN"') == 1
 
 
@@ -822,12 +825,14 @@ def test_build_scalp_target_is_entry_anchored_for_buy_and_sell():
     assert buy["status"] == "VALID"
     assert buy["target_pct"] == 0.5
     assert buy["target_price"] == 100.5
+    assert buy["tp1_target_price"] == 100.25
     assert buy["target_price"] < 100.90
 
     sell = build_scalp_target("SELL", 100.0, 99.10)
     assert sell["status"] == "VALID"
     assert sell["target_pct"] == 0.5
     assert sell["target_price"] == 99.5
+    assert sell["tp1_target_price"] == 99.75
     assert sell["target_price"] > 99.10
 
 
@@ -846,6 +851,9 @@ def test_trade_management_board_uses_validated_scalp_target_and_strict_close_pat
     board = source[board_start:board_end]
     assert 'scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()' in board
     assert 'scalp_target if scalp_target_status == "VALID" and scalp_target > 0' in board
+    assert 'range_scalp_{target_source}_tp1_50pct' in board
+    assert 'range_scalp_{target_source}_tp2_runner_exit' in board
+    assert 'TradeDecisionType.PARTIAL_CLOSE' in board
     assert 'target_reached(side, current, range_target)' in board
 
     execute_start = source.index("    def _execute_decision(self, decision: TradeDecision, symbol: str):")
@@ -864,4 +872,5 @@ def test_scalp_target_distance_is_measured_from_entry_not_moving_mark():
     assert 'if _existing_scalp_status == "VALID" and _existing_scalp_target > 0:' in source
     assert 'Keep a previously latched target through transient pool-data errors.' in source
     assert 'STATE.get("scalp_target_price")' in source
+    assert 'STATE.get("scalp_target_tp1_price")' in source
     assert '"scalp_target_price": safe_float(STATE.get("scalp_target_price"), 0.0)' in source
