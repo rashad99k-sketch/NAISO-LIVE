@@ -328,7 +328,15 @@ def find_causal_order_block(df: pd.DataFrame, side: str, price: float, atr: floa
             continue
         if side == "SELL" and not later.empty and (later.close > float(ob.high)).any():
             continue
-        low, high = float(ob.low), float(ob.high)
+        # Use the institutional OB body-to-wick range rather than the
+        # entire candle: bullish demand = low -> open; bearish supply = open -> high.
+        candle_low, candle_high = float(ob.low), float(ob.high)
+        low, high = (
+            (candle_low, float(ob.open)) if side == "BUY"
+            else (float(ob.open), candle_high)
+        )
+        if not (0 < low < high):
+            continue
         gap = max(low - price, 0.0, price - high)
         distance_atr = gap / atr
         if distance_atr > 1.5:
@@ -343,6 +351,8 @@ def find_causal_order_block(df: pd.DataFrame, side: str, price: float, atr: floa
                                - age * 0.025))
         return {
             "low": low, "high": high, "price": (low + high) / 2.0,
+            "candle_low": candle_low, "candle_high": candle_high,
+            "zone_definition": "BULLISH_LOW_TO_OPEN" if side == "BUY" else "BEARISH_OPEN_TO_HIGH",
             "strength": round(strength, 2), "distance_atr": round(distance_atr, 3),
             "age_bars": float(age), "volume_ratio": round(volume_ratio, 3),
             "timestamp": float(ob.timestamp),
