@@ -80,6 +80,11 @@ from ggp_market_data import (
     FETCH_MIN_CANDLES,
     timeframe_seconds as _timeframe_seconds,
 )
+from ggp_market_intelligence import (
+    classify_zone_event, advance_failed_breakout_confirmation,
+    is_confirmed_failed_breakout_evidence, build_scalp_target,
+)
+from ggp_institutional_bridge import build_liquidity_pools
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -105,7 +110,7 @@ def record_trade_management_event(event_type, status="INFO", *, log_level=None,
     logger = globals().get("log_execution")
     if logger and (log_level or event_type not in {"BOARD_DECISION"}):
         details = []
-        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "reason", "order_id"):
+        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "entry_mode", "entry_behavior", "reason", "order_id"):
             value = event.get(key)
             if value not in (None, ""):
                 details.append(f"{key}={value}")
@@ -144,6 +149,13 @@ def _env_float_range(name, default, minimum, maximum):
     except (TypeError, ValueError):
         print(f"[CONFIG] Invalid {name}; safe default {default} applied")
         return float(default)
+
+# Observational only: all routine trade-management decisions still come from
+# TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
+TRADE_MANAGEMENT_LOG = TradeManagementEventLog(max_items=200)
+_TRADE_EVENT_DEDUPE = {}
+_TRADE_EVENT_DEDUPE_LOCK = threading.RLock()
+
 
 # ========== INSTITUTIONAL ENGINES (EMBEDDED) ==========
 class SmartMoneyEngine:
@@ -2443,10 +2455,21 @@ class TradeManagementBoard:
                 "action": action.value, "reason": str(reason), "symbol": symbol,
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
-                "profit_mode": profit_mode, "tp1_hit": bool(ctx.get("tp1_hit")),
+                "profit_mode": profit_mode,
+                "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
+                "market_regime": str(ctx.get("regime") or "UNKNOWN"),
+                "tp1_hit": bool(ctx.get("tp1_hit")),
                 "tp2_hit": bool(ctx.get("tp2_hit")),
                 "tp1_price": safe_float(ctx.get("tp1_price")),
                 "tp2_price": safe_float(ctx.get("tp2_price")),
+                "opposing_liquidity_status": str(ctx.get("opposing_liquidity_status") or "UNKNOWN"),
+                "opposing_liquidity_level": safe_float(ctx.get("opposing_liquidity_level"), 0.0),
+                "scalp_target_status": str(ctx.get("scalp_target_status") or "UNKNOWN"),
+                "scalp_target_price": safe_float(ctx.get("scalp_target_price"), 0.0),
+                "scalp_target_tp1_price": safe_float(ctx.get("scalp_target_tp1_price"), 0.0),
+                "scalp_target_selected_pct": safe_float(ctx.get("scalp_target_selected_pct"), 0.0),
             }
             self._decision_history.append(meta)
             signature = (action.value, str(reason), symbol)
@@ -2467,9 +2490,20 @@ class TradeManagementBoard:
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
 
+        # A failed breakout is supporting thesis evidence, not an independent
+        # exit signal. Require a fresh same-side event and two adjacent closed
+        # candles confirming price remained back inside the causal zone.
+        mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
+        zone_evidence_valid = is_confirmed_failed_breakout_evidence(mi, side)
+        thesis_reasons = list(ctx.get("thesis_failure_reasons") or [])
         thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
+        if zone_evidence_valid:
+            thesis_score = min(100.0, thesis_score + 18.0)
+            thesis_reasons.append("confirmed_failed_breakout_reentry")
+            STATE["failed_breakout_thesis_credit_applied"] = True
+
         thesis_action, thesis_reason = thesis_failure_action(
-            side, roe, thesis_score, ctx.get("thesis_failure_reasons") or [],
+            side, roe, thesis_score, thesis_reasons,
             structural_invalidation=bool(ctx.get("structural_invalidation")))
         if thesis_action == "EXIT":
             return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
@@ -2488,16 +2522,44 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP is an intentional exception: it is enabled only by the
-        # multi-evidence policy. The single target closes the entire remaining
-        # exposure, while a previously verified TP1 remains recorded as a real fill.
+        # RANGE_SCALP is enabled only by the multi-evidence policy. It still
+        # follows the canonical two-stage 50/50 model: TP1 is a verified partial
+        # close; TP2 strictly closes the verified remaining runner.
         if profit_mode == "RANGE_SCALP":
-            range_target = safe_float(ctx.get("range_target_price"), 0.0)
-            if range_target > 0 and target_reached(side, current, range_target):
-                return decision(TradeDecisionType.FULL_CLOSE,
-                                f"range_scalp_single_target_hit_{safe_float(ctx.get('range_target_move_pct'), 0.5):.2f}pct",
-                                close_reason="RANGE_SCALP_TARGET")
-            return decision(TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target")
+            scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
+            scalp_target = safe_float(ctx.get("scalp_target_price"), 0.0)
+            range_target = (
+                scalp_target if scalp_target_status == "VALID" and scalp_target > 0
+                else safe_float(ctx.get("range_target_price"), 0.0)
+            )
+            target_source = ("opposing_liquidity_scalp_target"
+                             if scalp_target_status == "VALID" and scalp_target > 0
+                             else "adaptive_range_fallback")
+            tp1_hit = bool(ctx.get("tp1_hit"))
+            tp2_hit = bool(ctx.get("tp2_hit"))
+            if range_target > 0 and entry > 0:
+                tp1_target = safe_float(ctx.get("scalp_target_tp1_price"), 0.0)
+                if tp1_target <= 0:
+                    tp1_target = entry + (range_target - entry) * 0.5
+                if not tp1_hit and remaining > 0 and initial > 0 and target_reached(side, current, tp1_target):
+                    target_remaining = initial * 0.5
+                    tolerance = max(initial * 0.002, 1e-10)
+                    qty_to_close = max(0.0, remaining - target_remaining)
+                    if qty_to_close <= tolerance:
+                        return decision(TradeDecisionType.HOLD, "range_scalp_tp1_quantity_wait_for_reconciliation")
+                    ratio = min(1.0, qty_to_close / remaining)
+                    return decision(TradeDecisionType.PARTIAL_CLOSE,
+                                    f"range_scalp_{target_source}_tp1_50pct",
+                                    ratio=ratio, target_remaining_qty=target_remaining,
+                                    close_reason="TP1", target_price=tp1_target,
+                                    tp2_target_price=range_target)
+                if tp1_hit and not tp2_hit and target_reached(side, current, range_target):
+                    return decision(TradeDecisionType.FULL_CLOSE,
+                                    f"range_scalp_{target_source}_tp2_runner_exit",
+                                    close_reason="TP2", target_price=range_target,
+                                    opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0))
+            return decision(TradeDecisionType.HOLD, "range_scalp_waiting_for_two_stage_targets",
+                            target_price=range_target, target_source=target_source)
 
         # Canonical TP1: reduce the original filled quantity to exactly 50%.
         # This compensates for any previously confirmed partial fill and never
@@ -3334,6 +3396,20 @@ class LiveTradeManager:
             # independent weakness/thin-liquidity observations. Missing data is NOT range.
             mode_context = {
                 "side": side, "regime": regime, "trade_state": trade_state,
+            "market_intelligence": {
+                **(STATE.get("market_intelligence") or {}),
+                "zone_side": str(STATE.get("side") or "").upper(),
+                "trading_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "zone_event_fresh": (
+                    safe_float(STATE.get("zone_event_last_candle_ts"), 0.0) > 0
+                    and 0 <= time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+                    <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                ),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_last_candle_ts": safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0),
+                "failed_breakout_thesis_credit_applied": bool(STATE.get("failed_breakout_thesis_credit_applied", False)),
+            },
                 "adx": adx_now, "adx_slope": adx_slope,
                 "continuation_probability": continuation_eval.continuation_probability,
                 "di_plus": plus_di, "di_minus": minus_di,
@@ -3372,6 +3448,63 @@ class LiveTradeManager:
                         STATE["profit_mode_candidate_count"] = 0
                 STATE["profit_mode_reason"] = candidate_reason
                 STATE["profit_mode_evidence"] = list(candidate_evidence)
+                # Build one opposing-liquidity snapshot from completed candles per candle.
+                if closed_candle_ts > safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0):
+                    try:
+                        _pool_data = build_liquidity_pools(df_live.tail(120).reset_index(drop=True))
+                        _pool_levels = _pool_data.get("high_pools", []) if side == "BUY" else _pool_data.get("low_pools", [])
+                        _pool = select_opposing_liquidity_pool(_pool_levels, side, mark_price)
+                        STATE["opposing_liquidity_status"] = _pool.get("status", "UNKNOWN")
+                        STATE["opposing_liquidity_level"] = safe_float(_pool.get("level"), 0.0)
+                        STATE["opposing_liquidity_distance_pct"] = safe_float(_pool.get("distance_pct"), 0.0)
+                        STATE["opposing_liquidity_timestamp"] = closed_candle_ts
+                        _existing_scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
+                        _existing_scalp_status = str(STATE.get("scalp_target_status") or "UNKNOWN").upper()
+                        # Latch the first valid entry-anchored target for this trade.
+                        # Later swing-pool changes must never move a profit target farther away.
+                        if _existing_scalp_status == "VALID" and _existing_scalp_target > 0:
+                            pass
+                        elif _pool.get("status") == "VALID":
+                            _scalp_plan = build_scalp_target(side, entry, _pool.get("level"))
+                            STATE["scalp_target_status"] = _scalp_plan.get("status", "UNKNOWN")
+                            STATE["scalp_target_price"] = safe_float(_scalp_plan.get("target_price"), 0.0)
+                            STATE["scalp_target_tp1_price"] = safe_float(_scalp_plan.get("tp1_target_price"), 0.0)
+                            STATE["scalp_target_selected_pct"] = safe_float(_scalp_plan.get("target_pct"), 0.0)
+                            STATE["scalp_target_selection_reason"] = str(_scalp_plan.get("reason") or "target_not_available")
+                        else:
+                            STATE["scalp_target_status"] = "NO_TARGET"
+                            STATE["scalp_target_price"] = 0.0
+                            STATE["scalp_target_tp1_price"] = 0.0
+                            STATE["scalp_target_selected_pct"] = 0.0
+                            STATE["scalp_target_selection_reason"] = "no_verified_opposing_pool"
+                        record_trade_management_event(
+                            "OPPOSING_LIQUIDITY_REFRESH", "OBSERVED",
+                            dedupe_key=f"opposing_pool:{symbol}:{side}:{closed_candle_ts}",
+                            dedupe_seconds=0, symbol=symbol, side=side, price=mark_price,
+                            reference_level=STATE["opposing_liquidity_level"],
+                            distance_pct=STATE["opposing_liquidity_distance_pct"],
+                            scalp_target_pct=STATE["scalp_target_selected_pct"],
+                            scalp_target_price=STATE.get("scalp_target_price", 0.0),
+                            scalp_target_tp1_price=STATE.get("scalp_target_tp1_price", 0.0),
+                            scalp_target_status=STATE.get("scalp_target_status", "UNKNOWN"),
+                            reason=STATE["scalp_target_selection_reason"],
+                        )
+                    except Exception as _pool_error:
+                        STATE["opposing_liquidity_status"] = "UNKNOWN"
+                        STATE["opposing_liquidity_level"] = 0.0
+                        STATE["opposing_liquidity_distance_pct"] = 0.0
+                        # Keep a previously latched target through transient pool-data errors.
+                        if not (str(STATE.get("scalp_target_status") or "").upper() == "VALID"
+                                and safe_float(STATE.get("scalp_target_price"), 0.0) > 0):
+                            STATE["scalp_target_status"] = "UNKNOWN"
+                            STATE["scalp_target_price"] = 0.0
+                            STATE["scalp_target_tp1_price"] = 0.0
+                            STATE["scalp_target_selected_pct"] = 0.0
+                            STATE["scalp_target_selection_reason"] = "pool_analysis_error"
+                        log_execution(
+                            f"[OPPOSING_LIQUIDITY] {symbol}: {type(_pool_error).__name__}: {_pool_error}",
+                            "WARN", debounce_key=f"opposing_pool_{symbol}", debounce_sec=60
+                        )
                 if current_mode == RANGE_MODE and not safe_float(STATE.get("range_target_price"), 0.0):
                     # Range exits are anchored to the nearest opposing swing-liquidity
                     # pool, not a hard-coded 0.5/1/2% price move. Use completed bars only.
@@ -3389,13 +3522,28 @@ class LiveTradeManager:
                         swing_levels = []
                     adaptive_target, target_reason = adaptive_range_target_price(
                         side, entry, atr, swing_levels)
+                    _pool_level = safe_float(STATE.get("opposing_liquidity_level"), 0.0)
+                    _scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
+                    if _pool_level > 0 and str(STATE.get("scalp_target_status") or "").upper() == "VALID" and _scalp_target > 0:
+                        _pool_target = _pool_level - atr * 0.10 if side == "BUY" else _pool_level + atr * 0.10
+                        _before_pool = _scalp_target < _pool_target if side == "BUY" else _scalp_target > _pool_target
+                        if _before_pool and ((side == "BUY" and _scalp_target > entry) or (side == "SELL" and _scalp_target < entry)):
+                            adaptive_target = round(_scalp_target, 12)
+                            target_reason = str(STATE.get("scalp_target_selection_reason") or "entry_anchored_scalp_target")
+                        else:
+                            target_reason = "opposing_pool_geometry_rejected_atr_fallback"
+                    elif _pool_level > 0:
+                        target_reason = str(STATE.get("scalp_target_selection_reason") or "no_valid_scalp_target") + "_atr_fallback"
                     STATE["range_target_price"] = adaptive_target
                     STATE["range_target_move_pct"] = (abs(adaptive_target-entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
                     STATE["range_target_reason"] = target_reason
                 elif current_mode != RANGE_MODE:
                     STATE["range_target_price"] = 0.0
                     STATE["range_target_move_pct"] = 0.0
-                log_execution(f"[PROFIT_MODE] {symbol} mode={current_mode} candidate={candidate_mode} reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
+                log_execution(
+                    f"[PROFIT_MODE] {symbol} entry_mode={STATE.get('trading_mode', 'UNCLASSIFIED')} "
+                    f"management_mode={current_mode} candidate={candidate_mode} "
+                    f"reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
 
             # Thesis failure check
             failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
@@ -3560,8 +3708,26 @@ class LiveTradeManager:
             "synthetic_tp1": STATE.get("synthetic_tp1", 0), "tp2_price": STATE.get("tp2_price", 0),
             "range_target_price": STATE.get("range_target_price", 0),
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
+            "opposing_liquidity_status": STATE.get("opposing_liquidity_status", "UNKNOWN"),
+            "opposing_liquidity_level": safe_float(STATE.get("opposing_liquidity_level"), 0.0),
+            "scalp_target_status": STATE.get("scalp_target_status", "UNKNOWN"),
+            "scalp_target_price": safe_float(STATE.get("scalp_target_price"), 0.0),
+            "scalp_target_tp1_price": safe_float(STATE.get("scalp_target_tp1_price"), 0.0),
+            "scalp_target_selected_pct": safe_float(STATE.get("scalp_target_selected_pct"), 0.0),
+            "scalp_target_selection_reason": str(STATE.get("scalp_target_selection_reason") or ""),
+            "opposing_liquidity": {
+                "status": STATE.get("opposing_liquidity_status", "UNKNOWN"),
+                "level": safe_float(STATE.get("opposing_liquidity_level"), 0.0),
+                "distance_pct": safe_float(STATE.get("opposing_liquidity_distance_pct"), 0.0),
+                "source": "CLOSED_CANDLE_SWING_POOLS",
+                "timestamp": safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0),
+            },
+
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
+            "entry_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "entry_mode_confidence": safe_float(STATE.get("entry_behavior_confidence"), 0.0),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
@@ -3578,6 +3744,117 @@ class LiveTradeManager:
             "emergency_exit": bool(STATE.get("emergency_exit", False)),
             "emergency_reason": STATE.get("emergency_reason", ""),
         }
+
+        # Closed-candle zone lifecycle; context only, no order side effects.
+        try:
+            _zone_low = safe_float(STATE.get("entry_zone_low"), 0.0)
+            _zone_high = safe_float(STATE.get("entry_zone_high"), 0.0)
+            _last_zone_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+            if last_closed_ts is not None and _zone_low > 0 and _zone_high > _zone_low and len(df_live) >= 3 and last_closed_ts > _last_zone_ts:
+                # Re-derive the completed-candle frame at the point of use. This
+                # prevents a live/in-progress tail row from entering the zone
+                # classifier even if the upstream fetch format changes.
+                _zone_frame = _closed_candle_frame(raw_frame, INTERVAL)
+                if _zone_frame is None or getattr(_zone_frame, "empty", True):
+                    _zone_frame = df_live.copy()
+                _zone_frame = _zone_frame.tail(12).copy()
+                if "timestamp" not in _zone_frame.columns:
+                    _zone_frame["timestamp"] = _zone_frame.index
+                _zone_rows = []
+                for _candle in _zone_frame[["timestamp", "open", "high", "low", "close"]].to_dict("records"):
+                    _stamp = safe_float(_candle.get("timestamp"), 0.0)
+                    if _stamp > 1e12:
+                        _stamp /= 1000.0
+                    _candle["timestamp"] = _stamp
+                    _zone_rows.append(_candle)
+                _zone_result = classify_zone_event(
+                    _zone_rows, side=side, zone_low=_zone_low, zone_high=_zone_high, atr=atr
+                )
+                if _zone_result.get("event") != "INSUFFICIENT_DATA":
+                    _event_ts = safe_float(_zone_result.get("timestamp"), last_closed_ts)
+                    if _event_ts > _last_zone_ts:
+                        _prior_event = str(STATE.get("zone_event") or "").upper()
+                        _prior_streak = int(safe_float(STATE.get("failed_breakout_streak"), 0))
+                        _management_event, _failure_streak = advance_failed_breakout_confirmation(
+                            previous_event=_prior_event,
+                            previous_timestamp=_last_zone_ts,
+                            previous_streak=_prior_streak,
+                            current_event=_zone_result["event"],
+                            current_timestamp=_event_ts,
+                            timeframe_seconds=_timeframe_seconds(INTERVAL),
+                        )
+                        _failure_active = (
+                            _management_event == "FAILED_BREAKOUT" and _failure_streak >= 2
+                        )
+                        _previous_mi = STATE.get("market_intelligence") or {}
+                        _mi_confidence = (
+                            max(safe_float(_previous_mi.get("zone_event_confidence"), 0.0),
+                                safe_float(_zone_result.get("confidence"), 0.0))
+                            if _failure_active else safe_float(_zone_result.get("confidence"), 0.0)
+                        )
+                        STATE["zone_event"] = _management_event
+                        STATE["zone_event_last_candle_ts"] = _event_ts
+                        STATE["failed_breakout_streak"] = _failure_streak
+                        STATE["failed_breakout_last_candle_ts"] = _event_ts if _failure_active else 0.0
+                        STATE["market_intelligence"] = {
+                            **_previous_mi,
+                            "zone_event": _management_event,
+                            "raw_zone_event": _zone_result["event"],
+                            "zone_event_confirmed": (bool(_zone_result.get("confirmed")) if _management_event != "FAILED_BREAKOUT" else _failure_active),
+                            "zone_event_confidence": _mi_confidence,
+                            "zone_reference_level": safe_float(_zone_result.get("level"), 0.0),
+                            "zone_event_reasons": list(_zone_result.get("reason_codes") or []),
+                            "zone_event_timestamp": _event_ts,
+                            "zone_event_fresh": (
+                                0 <= time.time() - _event_ts
+                                <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                            ),
+                            "zone_side": str(side or "").upper(),
+                            "failed_breakout_streak": _failure_streak,
+                            "failed_breakout_last_candle_ts": _event_ts if _failure_active else 0.0,
+                            "failed_breakout_thesis_credit_applied": bool(STATE.get("failed_breakout_thesis_credit_applied", False)),
+                        }
+                        record_trade_management_event(
+                            "MARKET_STRUCTURE_EVENT",
+                            "CONFIRMED" if (bool(_zone_result.get("confirmed")) and _management_event != "FAILED_BREAKOUT") or _failure_active else "OBSERVED",
+                            dedupe_key=f"zone:{symbol}:{_management_event}:{_event_ts}",
+                            dedupe_seconds=0, symbol=symbol, side=side,
+                            reason=f"{_management_event}; raw={_zone_result['event']}; streak={_failure_streak}",
+                            price=mark_price, reference_level=_zone_result.get("level"),
+                            confidence=_mi_confidence,
+                        )
+        except Exception as _zone_error:
+            log_execution(
+                f"[MARKET_INTELLIGENCE] {symbol}: {type(_zone_error).__name__}: {_zone_error}",
+                "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60
+            )
+
+        # Refresh the intelligence snapshot AFTER the closed-candle observer.
+        # The management context is constructed earlier in this cycle, so without
+        # this hand-off the board would only ever see the previous candle's evidence.
+        try:
+            _mi_context = dict(STATE.get("market_intelligence") or {})
+            _mi_event_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+            _mi_context.update({
+                "zone_event_fresh": (
+                    _mi_event_ts > 0
+                    and 0 <= time.time() - _mi_event_ts
+                    <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                ),
+                "zone_side": str(side or "").upper(),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_thesis_credit_applied": bool(
+                    STATE.get("failed_breakout_thesis_credit_applied", False)
+                ),
+            })
+            context["market_intelligence"] = _mi_context
+        except Exception as _mi_context_error:
+            context["market_intelligence"] = {}
+            log_execution(
+                f"[MARKET_INTELLIGENCE_CONTEXT] {symbol}: "
+                f"{type(_mi_context_error).__name__}: {_mi_context_error}",
+                "WARN", debounce_key=f"mi_context_{symbol}", debounce_sec=60
+            )
 
         # ========== GET DECISION FROM BOARD ==========
         decision = self.board.evaluate(context)
@@ -4883,8 +5160,18 @@ STATE = {
     "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
     "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
     "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
+
+    "opposing_liquidity_status": "UNKNOWN",
+    "opposing_liquidity_level": 0.0,
+    "opposing_liquidity_distance_pct": 0.0,
+    "opposing_liquidity_timestamp": 0.0,
+    "scalp_target_selected_pct": 0.0,
+    "scalp_target_price": 0.0,
+    "scalp_target_tp1_price": 0.0,
+    "scalp_target_status": "UNKNOWN",
+    "scalp_target_selection_reason": "",
+
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
-    "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
     "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
     "execution_unresolved": False, "close_reconciliation_required": False,
     "close_verified": False, "last_close_verified": False, "last_close_order_id": None,
@@ -4897,6 +5184,17 @@ STATE = {
     "structural_invalidation": False, "thesis_failure_reasons": [],
     "emergency_exit": False, "emergency_reason": None,
     "emergency_source": None, "emergency_ts": 0.0,
+    "zone_event_last_candle_ts": 0.0,
+    "failed_breakout_streak": 0,
+    "failed_breakout_last_candle_ts": 0.0,
+    "failed_breakout_thesis_credit_applied": False,
+    "entry_zone_low": 0.0,
+    "entry_zone_high": 0.0,
+    "entry_behavior_confidence": 0.0,
+    "entry_behavior_reasons": [],
+    "trading_mode": "UNCLASSIFIED",
+    "entry_behavior": "WAIT_FOR_STRUCTURE",
+    "market_intelligence": {},
 }
 paper = {"balance": 10000.0, "position": None}
 _ACTIVE_TRADE = False
@@ -5778,6 +6076,23 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "risk_budget_basis": "TARGET_MARGIN",
             "risk_budget_usdt": sizing.max_risk_usdt,
             "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "zone_event": "INSIDE_ZONE" if safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+            "zone_event_last_candle_ts": 0.0,
+            "failed_breakout_streak": 0,
+            "failed_breakout_last_candle_ts": 0.0,
+            "failed_breakout_thesis_credit_applied": False,
+            "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
+            "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
+            "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
+            "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(institutional_entry_ctx.get("entry_behavior") or (institutional_entry_ctx.get("market_intelligence") or {}).get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "market_intelligence": {
+                **(institutional_entry_ctx.get("market_intelligence") or {}),
+                "zone_side": side,
+                "failed_breakout_streak": 0,
+                "failed_breakout_thesis_credit_applied": False,
+            },
             "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
             "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
             "roe_pct": 0.0, "mark_price": price, "initial_margin": margin,
@@ -5802,6 +6117,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
+            "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
+            "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
+            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_tp1_price": 0.0, "scalp_target_status": "UNKNOWN", "scalp_target_selection_reason": "",
+
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
             "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
             "execution_unresolved": False, "close_reconciliation_required": False,
@@ -5876,6 +6195,23 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "risk_budget_basis": "TARGET_MARGIN",
             "risk_budget_usdt": sizing.max_risk_usdt,
             "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "zone_event": "INSIDE_ZONE" if safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+            "zone_event_last_candle_ts": 0.0,
+            "failed_breakout_streak": 0,
+            "failed_breakout_last_candle_ts": 0.0,
+            "failed_breakout_thesis_credit_applied": False,
+            "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
+            "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
+            "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
+            "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(institutional_entry_ctx.get("entry_behavior") or (institutional_entry_ctx.get("market_intelligence") or {}).get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "market_intelligence": {
+                **(institutional_entry_ctx.get("market_intelligence") or {}),
+                "zone_side": side,
+                "failed_breakout_streak": 0,
+                "failed_breakout_thesis_credit_applied": False,
+            },
             "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
             "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
             "roe_pct": 0.0, "mark_price": price, "initial_margin": margin,
@@ -5910,6 +6246,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
+            "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
+            "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
+            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_tp1_price": 0.0,
+            "scalp_target_status": "UNKNOWN", "scalp_target_selection_reason": "",
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
             "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
             "close_reconciliation_required": False,
@@ -9434,6 +9774,18 @@ def sniper_engine_v2():
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup, "event_id": event_id, "evidence": evidence,
                 "structural_stop": structural_stop, "pullback_type": "SNIPER_ZONE_RETEST",
+                "trading_mode": "SNIPER",
+                "entry_behavior": "RETEST",
+                "entry_zone_low": safe_float(zone.get("low"), 0.0),
+                "entry_zone_high": safe_float(zone.get("high"), 0.0),
+                "entry_behavior_confidence": 0.88,
+                "entry_behavior_reasons": ["sniper_pivot_retest", "liquidity_mss_confirmed"],
+                "market_intelligence": {
+                    "mode": "SNIPER", "entry_behavior": "RETEST",
+                    "reference_low": safe_float(zone.get("low"), 0.0),
+                    "reference_high": safe_float(zone.get("high"), 0.0),
+                    "zone_side": side,
+                },
                 "exchange_symbol": symbol, "sniper_v2": True,
                 "capital_allocation_tier": "STANDARD_20_PERCENT",
                 "sizing_eligible_strong": False, "sizing_balance_basis": "WALLET_TOTAL",
@@ -10190,11 +10542,21 @@ def smart_opportunity_selection():
                 item["rejection_reason"] = "profit_targets_invalid"
                 continue
             evidence = list(item.get("evidence") or [])
+            market_intelligence = item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {}
+
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
+                "trading_mode": str(item.get("trading_mode") or market_intelligence.get("mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
+                "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
+                "entry_behavior_confidence": safe_float(item.get("entry_behavior_confidence", market_intelligence.get("confidence")), 0.0),
+                "entry_behavior_reasons": list(item.get("entry_behavior_reasons") or market_intelligence.get("reason_codes") or []),
+                "market_intelligence": dict(market_intelligence),
+
                 "pullback_type": next((x.split(":", 1)[0] for x in evidence
                                         if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,

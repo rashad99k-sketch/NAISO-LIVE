@@ -19,6 +19,8 @@ from roro_institutional import (
 )
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
+from ggp_market_intelligence import build_intelligence_decision, classify_price_pattern
+
 
 REVERSAL = ReversalEngine()
 CONTINUATION = ContinuationEngine()
@@ -82,6 +84,73 @@ def _atr(df: pd.DataFrame, period: int = 14) -> float:
     tr = pd.concat([df.high - df.low, (df.high - prev).abs(), (df.low - prev).abs()], axis=1).max(axis=1)
     value = tr.rolling(period, min_periods=period).mean().iloc[-1]
     return float(value) if pd.notna(value) and np.isfinite(value) and value > 0 else float("nan")
+
+
+def _adx(df: pd.DataFrame, period: int = 14) -> float:
+    """Standard Wilder ADX with SMA-seeded Wilder smoothing; NaN means insufficient evidence."""
+    if (
+        not isinstance(df, pd.DataFrame)
+        or not isinstance(period, int) or period < 2
+        or len(df) < period * 2 + 1
+        or not {"high", "low", "close"}.issubset(df.columns)
+    ):
+        return float("nan")
+    high = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    if not (np.isfinite(high).all() and np.isfinite(low).all() and np.isfinite(close).all()):
+        return float("nan")
+    if np.any(high < low) or np.any(close > high) or np.any(close < low):
+        return float("nan")
+
+    up = np.diff(high, prepend=np.nan)
+    down = -np.diff(low, prepend=np.nan)
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    previous_close = np.roll(close, 1)
+    previous_close[0] = np.nan
+    tr = np.nanmax(np.column_stack((
+        high - low,
+        np.abs(high - previous_close),
+        np.abs(low - previous_close),
+    )), axis=1)
+
+    def _wilder_rma(values: np.ndarray) -> np.ndarray:
+        out = np.full(len(values), np.nan, dtype=float)
+        finite = np.isfinite(values)
+        starts = np.flatnonzero(finite)
+        if len(starts) < period:
+            return out
+        seed_start = None
+        for candidate in starts:
+            if candidate + period <= len(values) and finite[candidate:candidate + period].all():
+                seed_start = int(candidate)
+                break
+        if seed_start is None:
+            return out
+        seed_index = seed_start + period - 1
+        out[seed_index] = float(np.mean(values[seed_start:seed_index + 1]))
+        for idx in range(seed_index + 1, len(values)):
+            if not np.isfinite(values[idx]):
+                return out
+            out[idx] = (out[idx - 1] * (period - 1) + values[idx]) / period
+        return out
+
+    atr = _wilder_rma(tr)
+    plus_smoothed = _wilder_rma(plus_dm)
+    minus_smoothed = _wilder_rma(minus_dm)
+    plus_di = np.divide(100.0 * plus_smoothed, atr, out=np.full(len(atr), np.nan), where=atr > 0)
+    minus_di = np.divide(100.0 * minus_smoothed, atr, out=np.full(len(atr), np.nan), where=atr > 0)
+    denominator = plus_di + minus_di
+    dx = np.divide(
+        100.0 * np.abs(plus_di - minus_di),
+        denominator,
+        out=np.full(len(denominator), np.nan),
+        where=denominator > 0,
+    )
+    adx = _wilder_rma(dx)
+    value = adx[-1] if len(adx) else np.nan
+    return float(value) if np.isfinite(value) else float("nan")
 
 
 def build_liquidity_pools(df: pd.DataFrame) -> Dict[str, List[float]]:
@@ -190,7 +259,7 @@ def detect_structure(df: pd.DataFrame) -> Dict[str, Any]:
     # CHoCH is the close through the protected opposite swing against the prior swing sequence.
     choch = "BULLISH_CHOCH" if bear and close > prior_high else "BEARISH_CHOCH" if bull and close < prior_low else None
     result.update({"direction": direction, "pattern": pattern, "bos": bos, "choch": choch,
-                   "mss": choch or bos, "swing_high": prior_high, "swing_low": prior_low,
+                   "mss": choch, "swing_high": prior_high, "swing_low": prior_low,
                    "confirmed": True})
     return result
 
@@ -275,6 +344,22 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         entry["sides"] = sorted(entry["sides"])
         entry["source"] = ",".join(entry["sources"])
     return merged
+
+
+def _sniper_evidence_matches_side(side: str, liquidity_event: str,
+                                    liquidity_direction: str, market_structure_shift: Any,
+                                    causal_zone_valid: bool) -> bool:
+    """Require the sweep and reversal MSS to agree with the proposed trade side."""
+    direction = str(side or "").upper()
+    expected = "BULLISH" if direction == "BUY" else "BEARISH" if direction == "SELL" else ""
+    expected_mss = f"{expected}_CHOCH" if expected else ""
+    return bool(
+        expected
+        and str(liquidity_event or "").upper() in {"SWEEP", "GRAB"}
+        and str(liquidity_direction or "").upper() == expected
+        and str(market_structure_shift or "").upper() == expected_mss
+        and causal_zone_valid
+    )
 
 
 def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
@@ -400,8 +485,56 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
                      and ob_state not in ("MITIGATED", "INVALIDATED"))
         except (TypeError, ValueError):
             ob_ok = False
-    fvg_ok = bool(fvg and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
+    fvg_ok = bool(isinstance(fvg, dict) and fvg.get("direction") == expected
+                 and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
     d, golden = _decision_result(decision), context["golden_zone"]
+    # Explainable mode/entry-behavior classification. This is analytical metadata only;
+    # UnifiedEntryAuthority and execute_entry remain the sole entry authorization path.
+    _liq_conf = getattr(liq, "confidence", 0.0)
+    _disp_atr = None
+    try:
+        _last = closed.iloc[-1]
+        _disp_atr = abs(float(_last.close) - float(_last.open)) / max(_atr(closed), 1e-12)
+    except Exception:
+        pass
+    _adx_value = _adx(closed)
+    # Prefer the causal order block as the primary zone; use a directionally
+    # valid, unfilled FVG only when no qualified OB exists.
+    _zone_low = _zone_high = None
+    if ob_ok and isinstance(ob, dict):
+        _zone_low = float(ob.get("low", 0) or 0)
+        _zone_high = float(ob.get("high", 0) or 0)
+    elif fvg_ok and isinstance(fvg, dict):
+        _zone_low = float(fvg.get("lower", 0) or 0)
+        _zone_high = float(fvg.get("upper", 0) or 0)
+    if not (_zone_low is not None and _zone_high is not None
+            and np.isfinite(_zone_low) and np.isfinite(_zone_high)
+            and 0 < _zone_low < _zone_high):
+        _zone_low = _zone_high = None
+    _intelligence = build_intelligence_decision(
+        regime=reg.state, adx=_adx_value,
+        continuation_probability=(float(cont.score) / 100.0 if getattr(cont, "score", None) is not None else None),
+        liquidity_quality=("GOOD" if float(_liq_conf or 0) >= 65.0 else "ADEQUATE" if float(_liq_conf or 0) >= 50.0 else "UNKNOWN"),
+        displacement_atr=_disp_atr,
+        setup_type=decision.setup_type,
+        sweep_confirmed=_sniper_evidence_matches_side(
+            side, liq_name, liq_direction, context["structure"].get("mss"), bool(ob_ok or fvg_ok)
+        ),
+        mss_confirmed=(
+            str(context["structure"].get("mss") or "").upper()
+            == ("BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH")
+        ),
+        causal_zone_valid=bool(ob_ok or fvg_ok),
+        bos_level=(context["structure"].get("swing_high") if side == "BUY" else context["structure"].get("swing_low")),
+        reference_low=_zone_low, reference_high=_zone_high,
+        volatility_atr=(_atr(closed) / float(context["price"]) * 100.0 if float(context["price"] or 0) > 0 else None),
+        data_quality="VALID_CLOSED_CANDLES",
+    ).to_dict()
+    # Chart-pattern recognition is observational metadata based exclusively on
+    # the validated closed-candle frame; it cannot authorize or submit orders.
+    _intelligence["price_pattern"] = classify_price_pattern(
+        closed.to_dict("records"), atr=_atr(closed)
+    )
     return {
         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
         "side": side, "price": context["price"], "market_regime": reg.state,
@@ -417,6 +550,14 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
                       "confidence": getattr(liq, "confidence", 0), "reasons": list(getattr(liq, "reasons", []))},
         "order_block": ob, "order_block_state": ob_state, "fvg": fvg, "golden_zone": golden,
         "volume_ratio": context["volume_ratio"], "volume_confirmed": context["volume_confirmed"],
+        "market_intelligence": _intelligence,
+        "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
+        "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
+        "entry_behavior_confidence": float(_intelligence.get("confidence", 0.0) or 0.0),
+        "entry_behavior_reasons": list(_intelligence.get("reason_codes") or []),
+        "entry_zone_low": _intelligence.get("reference_low"),
+        "entry_zone_high": _intelligence.get("reference_high"),
+        "adx": float(_adx_value) if np.isfinite(_adx_value) else None,
         "reversal": _decision_result(rev), "continuation": _decision_result(cont), "entry_status": decision.state,
         "icons": {
             "regime": "📈" if reg.direction == "BULLISH" else "📉" if reg.direction == "BEARISH" else "⚪",
