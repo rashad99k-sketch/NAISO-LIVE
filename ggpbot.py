@@ -5919,13 +5919,16 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "zone_event": "INSIDE_ZONE" if safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
             "zone_event_last_candle_ts": 0,
             "failed_breakout_streak": 0,
-#!/usr/bin/env python3
-# =========================
-            "failed_breakout_thesis_credit_applied": False,===========================================
-# RF LIQUIDITY ENGINE v28.1 - PROFESSIONAL TRADE MANAGEMENT
-# [PRODUCTION PATCH] Institutional-Grade Trade Management Refactor
-# Leverage: 20x | Risk-Capped Dynamic Sizing | Unified Trade Management
-# ====================================================================
+            "failed_breakout_last_candle_ts": 0.0,
+            "failed_breakout_thesis_credit_applied": False,
+            "market_intelligence": {
+                **((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence") or {}),
+                "zone_event": "INSIDE_ZONE" if safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+                "zone_event_confirmed": False,
+                "zone_event_confidence": 0.0,
+                "zone_side": str(side or "").upper(),
+                "failed_breakout_streak": 0,
+            },
 
 import os
 import time
