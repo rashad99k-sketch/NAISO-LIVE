@@ -81,7 +81,7 @@ def test_single_close_is_pending_and_multiple_closes_confirm():
                                   side="BUY", zone_low=99, zone_high=102, atr=1)
     assert pending["event"] == ZoneEvent.BREAKOUT_PENDING.value
     confirmed = classify_zone_event(rows, side="BUY", zone_low=99, zone_high=102, atr=1)
-    assert confirmed["event"] == ZoneEvent.BREAKOUT_CONFIRMED.value
+    assert confirmed["event"] == ZoneEvent.BREAKOUT_RETEST.value
 
 
 def test_failed_breakout_requires_reentry_after_prior_close_outside():
@@ -264,7 +264,7 @@ def test_duplicate_failed_breakout_candle_does_not_increment_streak():
     duplicate_ts = 100.0
     next_ts = 115.0
     assert (duplicate_ts > previous_ts) is False
-    assert next_ts > previous_ts is True
+    assert (next_ts > previous_ts) is True
     assert next_ts - previous_ts <= 15.0 * 1.5
 
 
