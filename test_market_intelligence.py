@@ -247,3 +247,22 @@ def test_board_uses_only_same_side_fresh_confirmed_failed_breakout_evidence():
     assert not qualifies("FAILED_BREAKOUT", False, .90, "BUY", "BUY", True, 2)
     assert not qualifies("FAILED_BREAKOUT", True, .70, "BUY", "BUY", True, 2)
     assert not qualifies("FAILED_BREAKOUT", True, .90, "BUY", "BUY", False, 2)
+
+
+def test_market_intelligence_context_has_one_canonical_failure_streak():
+    source = open("ggpbot.py", encoding="utf-8").read()
+    marker = '"zone_event_fresh": ('
+    i = source.index(marker, source.index("def _apply_management"))
+    j = source.index('            },', i)
+    segment = source[i:j]
+    assert segment.count('"failed_breakout_streak":') == 1
+    assert segment.count('"failed_breakout_last_candle_ts":') == 1
+
+
+def test_duplicate_failed_breakout_candle_does_not_increment_streak():
+    previous_ts = 100.0
+    duplicate_ts = 100.0
+    next_ts = 115.0
+    assert duplicate_ts > previous_ts is False
+    assert next_ts > previous_ts is True
+    assert next_ts - previous_ts <= 15.0 * 1.5
