@@ -454,7 +454,8 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
                      and ob_state not in ("MITIGATED", "INVALIDATED"))
         except (TypeError, ValueError):
             ob_ok = False
-    fvg_ok = bool(isinstance(fvg, dict) and fvg.get("direction") == expected\n                 and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
+    fvg_ok = bool(isinstance(fvg, dict) and fvg.get("direction") == expected
+                 and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
     d, golden = _decision_result(decision), context["golden_zone"]
     # Explainable mode/entry-behavior classification. This is analytical metadata only;
     # UnifiedEntryAuthority and execute_entry remain the sole entry authorization path.
@@ -485,8 +486,13 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         liquidity_quality=("GOOD" if float(_liq_conf or 0) >= 65.0 else "ADEQUATE" if float(_liq_conf or 0) >= 50.0 else "UNKNOWN"),
         displacement_atr=_disp_atr,
         setup_type=decision.setup_type,
-        sweep_confirmed=_sniper_evidence_matches_side(\n            side, liq_name, liq_direction, context["structure"].get("mss"), bool(ob_ok or fvg_ok)\n        ),
-        mss_confirmed=(\n            str(context["structure"].get("mss") or "").upper()\n            == ("BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH")\n        ),
+        sweep_confirmed=_sniper_evidence_matches_side(
+            side, liq_name, liq_direction, context["structure"].get("mss"), bool(ob_ok or fvg_ok)
+        ),
+        mss_confirmed=(
+            str(context["structure"].get("mss") or "").upper()
+            == ("BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH")
+        ),
         causal_zone_valid=bool(ob_ok or fvg_ok),
         bos_level=(context["structure"].get("swing_high") if side == "BUY" else context["structure"].get("swing_low")),
         reference_low=_zone_low, reference_high=_zone_high,
