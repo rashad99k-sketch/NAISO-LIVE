@@ -3362,8 +3362,10 @@ class LiveTradeManager:
                             _failure_streak = int(safe_float(STATE.get("failed_breakout_streak"), 0))
                             if _zr["event"] == "FAILED_BREAKOUT":
                                 STATE["failed_breakout_streak"] = _failure_streak + 1 if _same_failed_event else 1
+                                STATE["failed_breakout_last_candle_ts"] = _event_ts
                             else:
                                 STATE["failed_breakout_streak"] = 0
+                                STATE["failed_breakout_last_candle_ts"] = 0.0
                             STATE["market_intelligence"] = {
                                 **(STATE.get("market_intelligence") or {}),
                                 "zone_event": _zr["event"],
@@ -5908,6 +5910,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "zone_event_last_candle_ts": 0,
             "failed_breakout_streak": 0,
             "failed_breakout_last_candle_ts": 0.0,
+            "market_intelligence": {
+                **((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence") or {}),
+                "zone_event": "INSIDE_ZONE" if safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+                "zone_event_confirmed": False,
+                "zone_event_confidence": 0.0,
+                "zone_side": str(side or "").upper(),
+                "failed_breakout_streak": 0,
+            },
             "narrative_confidence": STATE.get("narrative_confidence", 0.0),
             "confidence_level": STATE.get("confidence_level", ""),
             "trade_thesis": thesis.__dict__,
