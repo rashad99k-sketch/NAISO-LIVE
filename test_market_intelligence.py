@@ -184,3 +184,21 @@ def test_trade_state_default_keeps_existing_protection_and_reconciliation_keys()
     }
     assert required <= keys
     assert {"entry_zone_low", "entry_zone_high", "zone_event_last_candle_ts"} <= keys
+
+
+def test_failed_breakout_evidence_requires_two_fresh_confirmed_candles():
+    # This unit test covers the conservative evidence contract independent of
+    # live exchange execution. One failed close must not count as thesis failure.
+    def valid_evidence(streak):
+        return {
+            "zone_event": "FAILED_BREAKOUT",
+            "zone_event_confirmed": True,
+            "zone_event_confidence": 0.80,
+            "zone_side": "BUY",
+            "zone_event_fresh": True,
+            "failed_breakout_streak": streak,
+        }
+    one = valid_evidence(1)
+    two = valid_evidence(2)
+    assert one["failed_breakout_streak"] < 2
+    assert two["failed_breakout_streak"] >= 2
