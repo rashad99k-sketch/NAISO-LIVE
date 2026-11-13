@@ -5,7 +5,7 @@ from ggp_market_intelligence import (
     classify_trading_mode, classify_entry_behavior, classify_zone_event,
     build_intelligence_decision, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, select_opposing_liquidity_pool,
-    select_scalp_target_pct,
+    select_scalp_target_pct, build_scalp_target,
 )
 
 
@@ -808,3 +808,51 @@ def test_paper_and_live_entry_reset_liquidity_state_once_each():
     assert live.count('"entry_zone_low":') == 1
     assert live.count('"trading_mode":') == 1
 
+
+
+def test_build_scalp_target_is_entry_anchored_for_buy_and_sell():
+    buy = build_scalp_target("BUY", 100.0, 100.90)
+    assert buy["status"] == "VALID"
+    assert buy["target_pct"] == 0.5
+    assert buy["target_price"] == 100.5
+    assert buy["target_price"] < 100.90
+
+    sell = build_scalp_target("SELL", 100.0, 99.10)
+    assert sell["status"] == "VALID"
+    assert sell["target_pct"] == 0.5
+    assert sell["target_price"] == 99.5
+    assert sell["target_price"] > 99.10
+
+
+def test_build_scalp_target_rejects_pool_not_beyond_entry_or_too_close():
+    assert build_scalp_target("BUY", 100.0, 99.9)["status"] == "NO_TARGET"
+    assert build_scalp_target("SELL", 100.0, 100.1)["status"] == "NO_TARGET"
+    assert build_scalp_target("BUY", 100.0, 100.20)["target_price"] == 0.0
+    assert build_scalp_target("BUY", 0.0, 101.0)["status"] == "UNKNOWN"
+
+
+def test_trade_management_board_uses_validated_scalp_target_and_strict_close_path():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    board_start = source.index("class TradeManagementBoard:")
+    board_end = source.index("# ========== REAL EXCHANGE ORDERS (SAFE) ==========", board_start)
+    board = source[board_start:board_end]
+    assert 'scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()' in board
+    assert 'scalp_target if scalp_target_status == "VALID" and scalp_target > 0' in board
+    assert 'target_reached(side, current, range_target)' in board
+
+    execute_start = source.index("    def _execute_decision(self, decision: TradeDecision, symbol: str):")
+    execute_end = source.index("class ExchangeReconciliationSupervisor:", execute_start)
+    execute = source[execute_start:execute_end]
+    assert "safe_close_partial(symbol, ratio" in execute
+    assert "safe_close_position(symbol, close_reason=close_reason)" in execute
+    assert "_verified_market_reduce(" not in execute
+    assert "create_order(" not in execute
+
+
+def test_scalp_target_distance_is_measured_from_entry_not_moving_mark():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert 'build_scalp_target(side, entry, _pool.get("level"))' in source
+    assert 'STATE.get("scalp_target_price")' in source
+    assert '"scalp_target_price": safe_float(STATE.get("scalp_target_price"), 0.0)' in source
