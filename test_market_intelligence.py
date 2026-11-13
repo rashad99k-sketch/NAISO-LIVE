@@ -762,3 +762,23 @@ def test_failed_breakout_is_not_confirmed_until_two_closed_candles():
     assert is_confirmed_failed_breakout_evidence({**evidence,
         "zone_event_confirmed": True, "failed_breakout_streak": streak}, "BUY")
 
+
+
+def test_state_has_unique_opposing_liquidity_defaults():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    start = source.index("STATE = {")
+    end = source.index("\npaper = ", start)
+    state = source[start:end]
+    assert state.count('"opposing_liquidity_status":') == 1
+    assert state.count('"opposing_liquidity_level":') == 1
+    assert state.count('"scalp_target_selected_pct":') == 1
+
+
+def test_trade_entry_modes_remain_distinct_from_profit_management_modes():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert '"trading_mode": str(institutional_entry_ctx.get("trading_mode")' in source
+    assert '"profit_mode": STATE.get("profit_mode", STANDARD_MODE)' in source
+    assert '"opposing_liquidity": {' in source
+
