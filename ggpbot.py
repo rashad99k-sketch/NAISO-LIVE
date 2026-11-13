@@ -3351,6 +3351,19 @@ class LiveTradeManager:
                         if _event_ts > _zts:
                             STATE["zone_event"] = _zr["event"]
                             STATE["zone_event_last_candle_ts"] = _event_ts
+                            _previous_zone_event = str(STATE.get("zone_event") or "").upper()
+                            _previous_zone_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+                            _same_failed_event = (
+                                _previous_zone_event == "FAILED_BREAKOUT"
+                                and _zr["event"] == "FAILED_BREAKOUT"
+                                and _previous_zone_ts > 0
+                                and (_event_ts - _previous_zone_ts) <= _timeframe_seconds(INTERVAL) * 1.5
+                            )
+                            _failure_streak = int(safe_float(STATE.get("failed_breakout_streak"), 0))
+                            if _zr["event"] == "FAILED_BREAKOUT":
+                                STATE["failed_breakout_streak"] = _failure_streak + 1 if _same_failed_event else 1
+                            else:
+                                STATE["failed_breakout_streak"] = 0
                             STATE["market_intelligence"] = {
                                 **(STATE.get("market_intelligence") or {}),
                                 "zone_event": _zr["event"],
