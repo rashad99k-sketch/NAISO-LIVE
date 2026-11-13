@@ -59,6 +59,9 @@ class TradeJournal:
             CREATE TABLE IF NOT EXISTS consumed_events (
                 event_id TEXT PRIMARY KEY, trade_id TEXT NOT NULL, created_ts REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                state_key TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_ts REAL NOT NULL
+            );
             """)
             # Upgrade databases created by earlier releases without discarding rows.
             existing = {row[1] for row in db.execute("PRAGMA table_info(trades)")}
@@ -80,6 +83,49 @@ class TradeJournal:
                 if name not in existing:
                     db.execute(f"ALTER TABLE trades ADD COLUMN {name} {ddl}")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_client_order_id ON trades(client_order_id) WHERE client_order_id IS NOT NULL")
+
+    def checkpoint_wal(self, mode: str = "PASSIVE") -> Dict[str, Any]:
+        """Run a bounded SQLite WAL checkpoint without blocking active writers.
+
+        PASSIVE is the only mode used by runtime maintenance. Other documented
+        SQLite modes are accepted for explicit offline/operator maintenance.
+        """
+        normalized = str(mode or "PASSIVE").upper()
+        if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            raise ValueError(f"Unsupported WAL checkpoint mode: {mode}")
+        with self._db() as db:
+            row = db.execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
+        busy, log_frames, checkpointed_frames = (list(row) + [0, 0, 0])[:3]
+        return {
+            "mode": normalized,
+            "busy": int(busy),
+            "log_frames": int(log_frames),
+            "checkpointed_frames": int(checkpointed_frames),
+            "complete": int(busy) == 0 and int(checkpointed_frames) >= int(log_frames),
+        }
+
+    def get_runtime_state(self, state_key: str, default: Any = None) -> Any:
+        """Read an independent runtime safety record without touching trade rows."""
+        with self._db() as db:
+            row = db.execute("SELECT state_json FROM runtime_state WHERE state_key=?",
+                             (str(state_key),)).fetchone()
+            if not row:
+                return default
+            try:
+                return json.loads(row[0])
+            except (TypeError, ValueError):
+                return default
+
+    def set_runtime_state(self, state_key: str, value: Any) -> None:
+        """Atomically persist runtime safety state in the journal's WAL database."""
+        payload = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""INSERT INTO runtime_state(state_key,state_json,updated_ts)
+                VALUES(?,?,?) ON CONFLICT(state_key) DO UPDATE SET
+                state_json=excluded.state_json, updated_ts=excluded.updated_ts""",
+                (str(state_key), payload, time.time()))
+            db.execute("COMMIT")
 
     def persist_entry_pending(self, *, trade_id: str, client_order_id: str, symbol: str,
                               side: str, position_mode: str, position_side: str,

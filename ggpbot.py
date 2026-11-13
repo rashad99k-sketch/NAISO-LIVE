@@ -5444,6 +5444,10 @@ def record_entry_data_rejection(symbol, side, diagnostic, *, stage="INSTITUTIONA
 
 
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
+    if daily_loss_cooldown_active():
+        log_execution(f"[ENTRY_BLOCKED] drawdown cooldown active; {symbol} {side} rejected", "WARN",
+                      debounce_key=f"loss_cooldown_entry:{symbol}", debounce_sec=15)
+        return False
     # Canonicalize once at the strategy/execution boundary so every downstream
     # risk, position, SL/TP and management branch sees the same direction token.
     side = str(side or "").strip().upper()
@@ -5840,6 +5844,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "entry_time": time.time(), "tp1_hit": False, "tp2_hit": False,
         "trail_activated": False, "be_done": False,
     }
+    if daily_loss_cooldown_active():
+        log_execution(f"[ENTRY_BLOCKED] cooldown activated during validation; order not submitted for {symbol}", "WARN")
+        return False
     order = open_position(side, qty, symbol, stop_loss=sl, trade_id=trade_id,
                           management_state=pending_management_state)
     if order:
@@ -7581,26 +7588,8 @@ def cooldown_active():
     return STATE["cooldown_until"] and datetime.now(timezone.utc) < STATE["cooldown_until"]
 
 def emergency_kill_switch_active():
-    if STATE["daily_loss_limit_hit"]:
-        return True
-    bal = get_balance_safe()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if STATE["last_trade_day"] != today:
-        STATE["daily_peak_balance"] = bal
-        STATE["daily_loss_limit_hit"] = False
-        STATE["last_trade_day"] = today
-    else:
-        if STATE["daily_peak_balance"] is None:
-            STATE["daily_peak_balance"] = bal
-        else:
-            if bal > STATE["daily_peak_balance"]:
-                STATE["daily_peak_balance"] = bal
-            loss_pct = (STATE["daily_peak_balance"] - bal) / STATE["daily_peak_balance"] * 100
-            if loss_pct >= MAX_DAILY_LOSS_PCT:
-                STATE["daily_loss_limit_hit"] = True
-                log_execution(f"Daily loss limit hit: {loss_pct:.1f}%", "ERROR")
-                return True
-    return False
+    """Compatibility alias; drawdown now pauses entries instead of liquidating."""
+    return daily_loss_cooldown_active()
 
 def trailing_stop_new(price, atr):
     return False
@@ -8722,6 +8711,8 @@ def data():
 
 @app.route("/trade", methods=["POST"])
 def manual_trade():
+    if daily_loss_cooldown_active():
+        return jsonify({"error": "New entries paused by daily drawdown cooldown"}), 423
     if RECOVERY_BLOCK_ENTRIES or STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
         return jsonify({"error": "Entry blocked until existing exchange/recovery state is reconciled"}), 409
     data = request.json or {}
@@ -8825,10 +8816,6 @@ def hourly_cleanup():
             for _, key in dated[:max(0, len(CACHE) - CACHE_MAX_ITEMS)]:
                 CACHE.pop(key, None)
                 removed += 1
-    try:
-        gc.collect()
-    except Exception:
-        pass
     manager = globals().get("INSTITUTIONAL_RESOURCE_MANAGER")
     if manager:
         try:
@@ -8837,6 +8824,34 @@ def hourly_cleanup():
                                           "cleanup_result": result.get("result")}
         except Exception as exc:
             log_execution(f"[RESOURCE] cleanup/metrics unavailable: {exc}", "WARN")
+            # Fall back to one collection only when the resource manager failed.
+            try:
+                gc.collect()
+            except Exception:
+                pass
+    else:
+        try:
+            gc.collect()
+        except Exception:
+            pass
+    # PASSIVE checkpoint is bounded and does not force active readers/writers
+    # to stop. Keep it on the same five-minute maintenance cadence.
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is not None and callable(getattr(journal, "checkpoint_wal", None)):
+        try:
+            checkpoint = journal.checkpoint_wal("PASSIVE")
+            MEMORY["journal_maintenance"] = {
+                **checkpoint,
+                "checked_at": now,
+            }
+            if checkpoint.get("busy"):
+                log_execution(
+                    f"[JOURNAL] WAL checkpoint deferred by active connection: {checkpoint}",
+                    "WARN",
+                )
+        except Exception as exc:
+            log_execution(f"[JOURNAL] passive WAL checkpoint failed: {type(exc).__name__}: {exc}", "WARN")
+
     _last_cleanup = now
     log_execution(f"[RESOURCE] bounded cleanup removed={removed} cache={len(CACHE)}", "INFO")
 
@@ -9313,6 +9328,10 @@ def _sniper_v2_structural_stop(side, zone, atr_value, roro_stop):
 
 def sniper_engine_v2():
     """One bounded scan cycle; execution stays on the unified GGP/RORO path."""
+    if daily_loss_cooldown_active():
+        SNIPER_V2_METRICS["state"] = "PAUSED_DAILY_LOSS_COOLDOWN"
+        return False
+
     if not SNIPER_V2_ENABLED:
         SNIPER_V2_METRICS["state"] = "DISABLED"
         return False
@@ -9686,6 +9705,13 @@ def main_loop_sniper():
         try:
             now = time.time()
             sync_all_states()
+            cooldown_active_now = daily_loss_cooldown_active()
+            if cooldown_active_now and not (STATE.get("open") or TRADE_STATE.get("in_position")):
+                # Keep the normal bounded TTL/resource cleanup alive while entry scanning is paused.
+                # Do not force full GC on every one-second cooldown poll.
+                hourly_cleanup()
+                time.sleep(1)
+                continue
 
             if now - last_flow_update > 60:
                 update_institutional_flow_scanner()
@@ -9736,21 +9762,9 @@ def main_loop_sniper():
                         scaling_logic(sym, df, None)
                         current_pnl = STATE.get("roe_pct", 0.0)
                         update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
-            if emergency_kill_switch_active():
-                if STATE.get("open"):
-                    closed = close_position_full(close_reason="EMERGENCY_KILL_SWITCH")
-                    if not closed:
-                        RECOVERY_BLOCK_ENTRIES = True
-                        log_execution("[KILL_SWITCH] Close not verified; preserving the open position state and retrying reconciliation", "ERROR")
-                        try:
-                            sync_position_state(STATE.get("current_symbol"))
-                        except Exception as exc:
-                            log_execution(f"[KILL_SWITCH] position reconciliation failed: {exc}", "ERROR")
-                    else:
-                        clear_position_dashboard()
-                        TRADE_STATE["in_position"] = False
-                time.sleep(5 if STATE.get("open") else 30)
-                continue
+            # Drawdown cooldown never force-closes exposure; LiveTradeManager owns exits.
+            # Cooldown does not own cleanup; the existing bounded lifecycle cleanup does.
+            daily_loss_cooldown_active()
             print_snapshot()
             hourly_cleanup()
             time.sleep(BASE_SLEEP)
@@ -9788,6 +9802,133 @@ except Exception as _integration_init_error:
     INSTITUTIONAL_RESOURCE_MANAGER = None
     INSTITUTIONAL_TRADE_JOURNAL = None
     log_execution(f"[INTEGRATION] optional persistence unavailable: {_integration_init_error}", "WARN")
+
+# Daily drawdown pause: separate from trade lifecycle and persisted independently.
+LOSS_COOLDOWN_SECONDS = _env_int_range("LOSS_COOLDOWN_SECONDS", 600, 60, 3600)
+_LOSS_COOLDOWN_LOCK = threading.RLock()
+_LOSS_COOLDOWN_STATE_KEY = "daily_drawdown_cooldown_v1"
+_LOSS_COOLDOWN_STATE = {"until": 0.0, "triggered_at": 0.0, "trigger_balance": None,
+                        "utc_day": None, "peak_balance": None, "trigger_count": 0}
+_LOSS_COOLDOWN_STORE_READY = False
+
+
+def _persist_loss_cooldown_state():
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is None:
+        raise RuntimeError("trade journal unavailable; loss cooldown cannot be persisted")
+    journal.set_runtime_state(_LOSS_COOLDOWN_STATE_KEY, dict(_LOSS_COOLDOWN_STATE))
+
+
+def _load_loss_cooldown_state():
+    global _LOSS_COOLDOWN_STORE_READY
+    with _LOSS_COOLDOWN_LOCK:
+        if _LOSS_COOLDOWN_STORE_READY:
+            return True
+        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        if journal is None:
+            STATE["loss_cooldown_persistence_failed"] = True
+            return False
+        try:
+            saved = journal.get_runtime_state(_LOSS_COOLDOWN_STATE_KEY, {})
+            if isinstance(saved, dict):
+                for key in _LOSS_COOLDOWN_STATE:
+                    if key in saved:
+                        _LOSS_COOLDOWN_STATE[key] = saved[key]
+            _LOSS_COOLDOWN_STORE_READY = True
+            STATE["daily_peak_balance"] = _LOSS_COOLDOWN_STATE.get("peak_balance")
+            STATE["last_trade_day"] = _LOSS_COOLDOWN_STATE.get("utc_day")
+            STATE["loss_cooldown_until"] = float(_LOSS_COOLDOWN_STATE.get("until") or 0.0)
+            return True
+        except Exception as exc:
+            STATE["loss_cooldown_persistence_failed"] = True
+            log_execution(f"[LOSS_COOLDOWN] persisted state load failed; entries fail-closed: {exc}", "ERROR")
+            return False
+
+
+def _loss_cooldown_readiness():
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        return False, "POSITION_STILL_OPEN"
+    if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
+        return False, "EXECUTION_UNRESOLVED"
+    if STATE.get("recovery_hold") or globals().get("RECOVERY_BLOCK_ENTRIES", False):
+        return False, "RECOVERY_HOLD"
+    if MEMORY.get("position_status") not in {"FLAT", "CLOSED", "PAPER_RECONCILED_FLAT", "RECONCILED_FLAT"}:
+        return False, f"POSITION_STATUS_{MEMORY.get('position_status', 'UNKNOWN')}"
+    return True, "READY"
+
+
+def daily_loss_cooldown_active():
+    """Pause new entries after a 5% balance drawdown; never liquidate an open trade."""
+    now = time.time()
+    if not _load_loss_cooldown_state():
+        return True
+    with _LOSS_COOLDOWN_LOCK:
+        until = float(_LOSS_COOLDOWN_STATE.get("until") or 0.0)
+        if now < until:
+            return True
+        if until > 0:
+            ready, reason = _loss_cooldown_readiness()
+            if not ready:
+                log_execution(f"[LOSS_COOLDOWN] elapsed; entries remain blocked: {reason}", "WARN",
+                              debounce_key=f"loss_cooldown_readiness:{reason}", debounce_sec=30)
+                return True
+            bal = get_balance_safe()
+            if not bal or not math.isfinite(float(bal)) or float(bal) <= 0:
+                log_execution("[LOSS_COOLDOWN] cannot rebase: exchange balance unavailable; entries remain blocked", "ERROR")
+                return True
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            _LOSS_COOLDOWN_STATE.update({"until": 0.0, "peak_balance": float(bal),
+                                         "utc_day": today, "trigger_balance": None})
+            STATE.update({"loss_cooldown_until": 0.0, "daily_peak_balance": float(bal),
+                          "last_trade_day": today, "daily_loss_limit_hit": False})
+            try:
+                _persist_loss_cooldown_state()
+            except Exception as exc:
+                STATE["loss_cooldown_persistence_failed"] = True
+                log_execution(f"[LOSS_COOLDOWN] rebase persistence failed; entries fail-closed: {exc}", "ERROR")
+                return True
+            log_execution(f"[LOSS_COOLDOWN] pause complete; new drawdown reference={float(bal):.4f} USDT", "SUCCESS")
+        bal = get_balance_safe()
+        if not bal or not math.isfinite(float(bal)) or float(bal) <= 0:
+            log_execution("[LOSS_COOLDOWN] balance unavailable; no new entries authorized", "WARN",
+                          debounce_key="loss_cooldown_balance_unavailable", debounce_sec=30)
+            return True
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        state_changed = False
+        if _LOSS_COOLDOWN_STATE.get("utc_day") != today or not _LOSS_COOLDOWN_STATE.get("peak_balance"):
+            _LOSS_COOLDOWN_STATE.update({"utc_day": today, "peak_balance": float(bal)})
+            state_changed = True
+        elif float(bal) > float(_LOSS_COOLDOWN_STATE["peak_balance"]):
+            _LOSS_COOLDOWN_STATE["peak_balance"] = float(bal)
+            state_changed = True
+        peak = float(_LOSS_COOLDOWN_STATE.get("peak_balance") or bal)
+        loss_pct = max(0.0, (peak - float(bal)) / peak * 100.0) if peak > 0 else 0.0
+        STATE["daily_peak_balance"] = peak
+        STATE["last_trade_day"] = today
+        if state_changed:
+            try:
+                _persist_loss_cooldown_state()
+            except Exception as exc:
+                STATE["loss_cooldown_persistence_failed"] = True
+                log_execution(f"[LOSS_COOLDOWN] state persistence failed; entries fail-closed: {exc}", "ERROR")
+                return True
+        if loss_pct >= MAX_DAILY_LOSS_PCT:
+            until = now + LOSS_COOLDOWN_SECONDS
+            _LOSS_COOLDOWN_STATE.update({"until": until, "triggered_at": now,
+                "trigger_balance": float(bal), "utc_day": today,
+                "trigger_count": int(_LOSS_COOLDOWN_STATE.get("trigger_count") or 0) + 1})
+            STATE["loss_cooldown_until"] = until
+            try:
+                _persist_loss_cooldown_state()
+            except Exception as exc:
+                STATE["loss_cooldown_persistence_failed"] = True
+                log_execution(f"[LOSS_COOLDOWN] trigger persistence failed; entries fail-closed: {exc}", "ERROR")
+                return True
+            log_execution(f"[LOSS_COOLDOWN] drawdown={loss_pct:.2f}% reached {MAX_DAILY_LOSS_PCT:.2f}%; "
+                f"new entries paused for {LOSS_COOLDOWN_SECONDS // 60} minutes; open trade management remains active", "ERROR")
+            return True
+        return False
+
 
 def _integration_fetch_frame(symbol):
     return _get_scanner_frame(roro_exchange_symbol(symbol), 150)
@@ -9965,6 +10106,8 @@ RECOVERY_BLOCK_ENTRIES = False
 def smart_opportunity_selection():
     """Unified Watchlist -> institutional engines -> one existing GGP execution path."""
     global _INSTITUTIONAL_ENTRY_CONTEXT
+    if daily_loss_cooldown_active():
+        return False
     refresh_unified_institutional_watchlist()
     if STATE.get("open") or TRADE_STATE.get("in_position"):
         return False
