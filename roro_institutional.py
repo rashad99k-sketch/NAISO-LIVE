@@ -137,7 +137,15 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
     if isinstance(ob, dict):
         try:
             # An OB only becomes actionable after its confirming displacement.
+            # Strict mode also verifies the OB's actual directional definition.
             available_ts = ob.get("impulse_timestamp", ob.get("timestamp"))
+            if location_first:
+                expected_definition = "BULLISH_LOW_TO_OPEN" if direction == "BUY" else "BEARISH_OPEN_TO_HIGH"
+                zone_definition = str(ob.get("zone_definition") or "").upper()
+                ob_direction = str(ob.get("direction") or "").upper()
+                expected_direction = "BULLISH" if direction == "BUY" else "BEARISH"
+                if zone_definition != expected_definition and ob_direction != expected_direction:
+                    raise ValueError("order_block_direction_unconfirmed")
             levels.append((float(ob["low"]), float(ob["high"]), "ORDER_BLOCK",
                            int(available_ts) if available_ts is not None else None))
         except (KeyError, TypeError, ValueError):
@@ -146,6 +154,10 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
     if isinstance(fvg, dict) and fvg.get("status") not in ("INVALIDATED", "FULLY_FILLED"):
         try:
             available_ts = fvg.get("timestamp")
+            if location_first:
+                expected_direction = "BULLISH" if direction == "BUY" else "BEARISH"
+                if str(fvg.get("direction") or "").upper() != expected_direction:
+                    raise ValueError("fvg_direction_mismatch")
             levels.append((float(fvg["lower"]), float(fvg["upper"]), "FVG",
                            int(available_ts) if available_ts is not None else None))
         except (KeyError, TypeError, ValueError):
@@ -205,7 +217,10 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
                     continue
             timeframe_ms = max(1, int(context.get("timeframe_ms", 900_000)))
             latest_ts = int(context.get("latest_timestamp", available_ts))
-            if max(0, latest_ts - int(available_ts)) / timeframe_ms > 48:
+            # Future-dated evidence is look-ahead, not a fresh zone.
+            if int(available_ts) > latest_ts:
+                continue
+            if (latest_ts - int(available_ts)) / timeframe_ms > 48:
                 continue
             if reference_price is not None:
                 try:
