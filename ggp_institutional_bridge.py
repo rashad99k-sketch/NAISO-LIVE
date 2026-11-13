@@ -87,7 +87,7 @@ def _atr(df: pd.DataFrame, period: int = 14) -> float:
 
 
 def _adx(df: pd.DataFrame, period: int = 14) -> float:
-    """Wilder ADX from completed OHLC candles; NaN means insufficient evidence."""
+    """Standard Wilder ADX with SMA-seeded Wilder smoothing; NaN means insufficient evidence."""
     if (
         not isinstance(df, pd.DataFrame)
         or not isinstance(period, int) or period < 2
@@ -95,31 +95,62 @@ def _adx(df: pd.DataFrame, period: int = 14) -> float:
         or not {"high", "low", "close"}.issubset(df.columns)
     ):
         return float("nan")
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    close = pd.to_numeric(df["close"], errors="coerce")
+    high = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
     if not (np.isfinite(high).all() and np.isfinite(low).all() and np.isfinite(close).all()):
         return float("nan")
-    if ((high < low).any() or (close > high).any() or (close < low).any()):
+    if np.any(high < low) or np.any(close > high) or np.any(close < low):
         return float("nan")
-    up = high.diff()
-    down = -low.diff()
-    plus_dm = up.where((up > down) & (up > 0), 0.0)
-    minus_dm = down.where((down > up) & (down > 0), 0.0)
-    previous_close = close.shift(1)
-    tr = pd.concat([
+
+    up = np.diff(high, prepend=np.nan)
+    down = -np.diff(low, prepend=np.nan)
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    previous_close = np.roll(close, 1)
+    previous_close[0] = np.nan
+    tr = np.nanmax(np.column_stack((
         high - low,
-        (high - previous_close).abs(),
-        (low - previous_close).abs(),
-    ], axis=1).max(axis=1)
-    alpha = 1.0 / float(period)
-    atr_wilder = tr.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
-    plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr_wilder.replace(0, np.nan)
-    minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr_wilder.replace(0, np.nan)
-    denominator = (plus_di + minus_di).replace(0, np.nan)
-    dx = 100.0 * (plus_di - minus_di).abs() / denominator
-    value = dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean().iloc[-1]
-    return float(value) if pd.notna(value) and np.isfinite(value) else float("nan")
+        np.abs(high - previous_close),
+        np.abs(low - previous_close),
+    )), axis=1)
+
+    def _wilder_rma(values: np.ndarray) -> np.ndarray:
+        out = np.full(len(values), np.nan, dtype=float)
+        finite = np.isfinite(values)
+        starts = np.flatnonzero(finite)
+        if len(starts) < period:
+            return out
+        seed_start = None
+        for candidate in starts:
+            if candidate + period <= len(values) and finite[candidate:candidate + period].all():
+                seed_start = int(candidate)
+                break
+        if seed_start is None:
+            return out
+        seed_index = seed_start + period - 1
+        out[seed_index] = float(np.mean(values[seed_start:seed_index + 1]))
+        for idx in range(seed_index + 1, len(values)):
+            if not np.isfinite(values[idx]):
+                return out
+            out[idx] = (out[idx - 1] * (period - 1) + values[idx]) / period
+        return out
+
+    atr = _wilder_rma(tr)
+    plus_smoothed = _wilder_rma(plus_dm)
+    minus_smoothed = _wilder_rma(minus_dm)
+    plus_di = np.divide(100.0 * plus_smoothed, atr, out=np.full(len(atr), np.nan), where=atr > 0)
+    minus_di = np.divide(100.0 * minus_smoothed, atr, out=np.full(len(atr), np.nan), where=atr > 0)
+    denominator = plus_di + minus_di
+    dx = np.divide(
+        100.0 * np.abs(plus_di - minus_di),
+        denominator,
+        out=np.full(len(denominator), np.nan),
+        where=denominator > 0,
+    )
+    adx = _wilder_rma(dx)
+    value = adx[-1] if len(adx) else np.nan
+    return float(value) if np.isfinite(value) else float("nan")
 
 
 def build_liquidity_pools(df: pd.DataFrame) -> Dict[str, List[float]]:
