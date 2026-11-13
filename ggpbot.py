@@ -2533,9 +2533,33 @@ class TradeManagementBoard:
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
 
+        # A failed breakout is supporting thesis evidence, not an independent
+        # exit signal. Require a fresh same-side event and two adjacent closed
+        # candles confirming price remained back inside the causal zone.
+        mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
+        zone_event = str(mi.get("zone_event") or "").upper()
+        zone_confirmed = bool(mi.get("zone_event_confirmed", False))
+        zone_confidence = safe_float(mi.get("zone_event_confidence"), 0.0)
+        zone_side = str(mi.get("zone_side") or side).upper()
+        zone_fresh = bool(mi.get("zone_event_fresh", False))
+        zone_streak = int(max(0, safe_float(mi.get("failed_breakout_streak"), 0)))
+        zone_evidence_valid = (
+            not bool(mi.get("failed_breakout_thesis_credit_applied", False))
+            and zone_event == "FAILED_BREAKOUT"
+            and zone_confirmed and zone_fresh
+            and zone_side == side and side in {"BUY", "SELL"}
+            and zone_confidence >= 0.75
+            and zone_streak >= 2
+        )
+        thesis_reasons = list(ctx.get("thesis_failure_reasons") or [])
         thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
+        if zone_evidence_valid:
+            thesis_score = min(100.0, thesis_score + 18.0)
+            thesis_reasons.append("confirmed_failed_breakout_reentry")
+            STATE["failed_breakout_thesis_credit_applied"] = True
+
         thesis_action, thesis_reason = thesis_failure_action(
-            side, roe, thesis_score, ctx.get("thesis_failure_reasons") or [],
+            side, roe, thesis_score, thesis_reasons,
             structural_invalidation=bool(ctx.get("structural_invalidation")))
         if thesis_action == "EXIT":
             return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
@@ -3400,6 +3424,18 @@ class LiveTradeManager:
             # independent weakness/thin-liquidity observations. Missing data is NOT range.
             mode_context = {
                 "side": side, "regime": regime, "trade_state": trade_state,
+            "market_intelligence": {
+                **(STATE.get("market_intelligence") or {}),
+                "zone_side": str(STATE.get("side") or "").upper(),
+                "zone_event_fresh": (
+                    safe_float(STATE.get("zone_event_last_candle_ts"), 0.0) > 0
+                    and 0 <= time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+                    <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                ),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_last_candle_ts": safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0),
+                "failed_breakout_thesis_credit_applied": bool(STATE.get("failed_breakout_thesis_credit_applied", False)),
+            },
                 "adx": adx_now, "adx_slope": adx_slope,
                 "continuation_probability": continuation_eval.continuation_probability,
                 "di_plus": plus_di, "di_minus": minus_di,
