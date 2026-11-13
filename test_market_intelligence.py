@@ -802,11 +802,16 @@ def test_paper_and_live_entry_reset_liquidity_state_once_each():
     paper_end = source.index("        TRADE_STATE.update({", paper_start)
     paper = source[paper_start:paper_end]
     assert paper.count('"opposing_liquidity_status":') == 1
+    assert paper.count('"scalp_target_price": 0.0') == 1
+    assert paper.count('"scalp_target_status": "UNKNOWN"') == 1
     live_start = source.index('        STATE.update({\n            "open": True, "side": side, "entry": price', source.index("pending_management_state"))
     live_end = source.index("        TRADE_STATE.update({", live_start)
     live = source[live_start:live_end]
     assert live.count('"entry_zone_low":') == 1
     assert live.count('"trading_mode":') == 1
+    assert live.count('"opposing_liquidity_status": "UNKNOWN"') == 1
+    assert live.count('"scalp_target_price": 0.0') == 1
+    assert live.count('"scalp_target_status": "UNKNOWN"') == 1
 
 
 
