@@ -246,6 +246,28 @@ def build_intelligence_decision(*, regime: str = "UNKNOWN", adx: Any = None,
         source_timestamp=None)
 
 
+
+def is_confirmed_failed_breakout_evidence(market_intelligence: Any, side: str) -> bool:
+    """Return whether a fresh, same-side, two-candle failed-breakout proof is usable.
+
+    This is an evidence gate only. It never issues or authorizes an exchange order.
+    """
+    if not isinstance(market_intelligence, dict):
+        return False
+    expected_side = str(side or "").upper()
+    confidence = _num(market_intelligence.get("zone_event_confidence"))
+    streak = _num(market_intelligence.get("failed_breakout_streak"))
+    return bool(
+        expected_side in {"BUY", "SELL"}
+        and str(market_intelligence.get("zone_event") or "").upper() == ZoneEvent.FAILED_BREAKOUT.value
+        and market_intelligence.get("zone_event_confirmed") is True
+        and market_intelligence.get("zone_event_fresh") is True
+        and str(market_intelligence.get("zone_side") or "").upper() == expected_side
+        and confidence is not None and confidence >= 0.75
+        and streak is not None and int(streak) >= 2
+        and not bool(market_intelligence.get("failed_breakout_thesis_credit_applied", False))
+    )
+
 def advance_failed_breakout_confirmation(*, previous_event: str,
                                           previous_timestamp: Any,
                                           previous_streak: Any,
