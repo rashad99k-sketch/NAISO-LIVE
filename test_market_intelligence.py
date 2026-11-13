@@ -5,7 +5,8 @@ from ggp_market_intelligence import (
     classify_trading_mode, classify_entry_behavior, classify_zone_event,
     build_intelligence_decision, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, select_opposing_liquidity_pool,
-    select_scalp_target_pct, build_scalp_target, classify_price_pattern,\n    build_support_resistance_zones, validate_order_block_zone,
+    select_scalp_target_pct, build_scalp_target, classify_price_pattern,
+    build_support_resistance_zones, validate_order_block_zone,
 )
 
 
