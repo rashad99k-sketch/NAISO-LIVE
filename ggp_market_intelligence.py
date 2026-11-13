@@ -329,6 +329,140 @@ def build_scalp_target(side, entry_price, opposing_pool_level,
             "reason": reason + "_entry_anchored_two_stage_50_50_before_opposing_pool"}
 
 
+
+def validate_entry_behavior_trigger(*, side: str, behavior: str, candles: Sequence[Dict[str, Any]],
+                                     entry_price: Any, atr: Any,
+                                     zone_low: Any = None, zone_high: Any = None,
+                                     reference_level: Any = None,
+                                     origin_timestamp: Any = None,
+                                     max_entry_drift_atr: float = 1.5) -> Dict[str, Any]:
+    """Validate the selected entry behavior against completed candles at execution time.
+
+    This is a fail-closed execution gate, not a signal generator. The caller must
+    supply a chronologically ordered, already-closed candle frame. It verifies
+    the chosen behavior only; it never silently substitutes another behavior.
+    """
+    direction = str(side or "").strip().upper()
+    mode = str(behavior or "").strip().upper()
+    entry = _num(entry_price)
+    atr_v = _num(atr)
+    max_drift = _num(max_entry_drift_atr)
+    if direction not in {"BUY", "SELL"} or mode not in {
+        "RETEST", "PULLBACK", "MICRO_PULLBACK"
+    }:
+        return {"valid": False, "status": "WAIT_FOR_STRUCTURE",
+                "reason": "unsupported_or_unclassified_entry_behavior"}
+    if entry is None or entry <= 0 or atr_v is None or atr_v <= 0 or max_drift is None or max_drift <= 0:
+        return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "invalid_entry_or_atr"}
+    rows = list(candles or [])
+    if len(rows) < 4:
+        return {"valid": False, "status": "WAITING_FOR_CONFIRMATION",
+                "reason": "insufficient_closed_candles"}
+    normalized = []
+    for row in rows[-12:]:
+        if not isinstance(row, dict):
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "invalid_candle"}
+        values = {key: _num(row.get(key)) for key in ("open", "high", "low", "close", "timestamp")}
+        if any(value is None for value in values.values()):
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "incomplete_candle"}
+        if (values["high"] < max(values["open"], values["close"], values["low"])
+                or values["low"] > min(values["open"], values["close"], values["high"])):
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "invalid_ohlc"}
+        if normalized and values["timestamp"] <= normalized[-1]["timestamp"]:
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "non_monotonic_candles"}
+        normalized.append(values)
+
+    origin = _num(origin_timestamp)
+    if origin is not None and origin > 0:
+        normalized = [row for row in normalized if row["timestamp"] > origin]
+    if len(normalized) < 3:
+        return {"valid": False, "status": "WAITING_FOR_CONFIRMATION",
+                "reason": "no_post_setup_closed_candles"}
+
+    last = normalized[-1]
+    body = abs(last["close"] - last["open"])
+    if mode == "RETEST":
+        level = _num(reference_level)
+        if level is None and _num(zone_low) is not None and _num(zone_high) is not None:
+            level = (_num(zone_low) + _num(zone_high)) / 2.0
+        if level is None or level <= 0:
+            return {"valid": False, "status": "WAITING_FOR_RETEST",
+                    "reason": "retest_reference_level_missing"}
+        tolerance = 0.15 * atr_v
+        recent = normalized[-4:]
+        if direction == "SELL":
+            touched = any(row["high"] >= level - tolerance for row in recent)
+            rejected = last["close"] < level and last["close"] < last["open"]
+            distance = max(0.0, level - entry) if entry <= level else entry - level
+        else:
+            touched = any(row["low"] <= level + tolerance for row in recent)
+            rejected = last["close"] > level and last["close"] > last["open"]
+            distance = max(0.0, entry - level) if entry >= level else level - entry
+        if not touched:
+            return {"valid": False, "status": "WAITING_FOR_RETEST",
+                    "reason": "reference_level_not_retested_after_setup", "reference_level": level}
+        if not rejected:
+            return {"valid": False, "status": "WAITING_FOR_CONFIRMATION",
+                    "reason": "retest_rejection_not_confirmed_by_latest_close", "reference_level": level}
+        if distance > max_drift * atr_v:
+            return {"valid": False, "status": "ENTRY_WINDOW_MISSED",
+                    "reason": "execution_price_chased_after_retest", "reference_level": level,
+                    "distance_atr": round(distance / atr_v, 4)}
+        return {"valid": True, "status": "CONFIRMED", "reason": "closed_candle_retest_rejection",
+                "reference_level": level, "confirmation_timestamp": int(last["timestamp"]),
+                "distance_atr": round(distance / atr_v, 4)}
+
+    if mode == "PULLBACK":
+        low, high = _num(zone_low), _num(zone_high)
+        if low is None or high is None or low <= 0 or high <= low:
+            return {"valid": False, "status": "WAITING_FOR_PULLBACK",
+                    "reason": "causal_entry_zone_missing"}
+        gap = max(low - entry, 0.0, entry - high)
+        if gap > max_drift * atr_v:
+            return {"valid": False, "status": "ENTRY_WINDOW_MISSED",
+                    "reason": "execution_price_outside_pullback_window",
+                    "distance_atr": round(gap / atr_v, 4)}
+        touched = any(
+            row["high"] >= low - 0.10 * atr_v and row["low"] <= high + 0.10 * atr_v
+            for row in normalized[-4:]
+        )
+        midpoint = (low + high) / 2.0
+        if direction == "SELL":
+            rejected = last["close"] < last["open"] and last["close"] < midpoint
+        else:
+            rejected = last["close"] > last["open"] and last["close"] > midpoint
+        if not touched:
+            return {"valid": False, "status": "WAITING_FOR_PULLBACK",
+                    "reason": "causal_zone_not_reached"}
+        if not rejected:
+            return {"valid": False, "status": "WAITING_FOR_CONFIRMATION",
+                    "reason": "pullback_rejection_not_confirmed"}
+        return {"valid": True, "status": "CONFIRMED", "reason": "causal_zone_touch_and_closed_rejection",
+                "zone_low": low, "zone_high": high, "confirmation_timestamp": int(last["timestamp"]),
+                "distance_atr": round(gap / atr_v, 4)}
+
+    # MICRO_PULLBACK: impulse -> shallow counter-trend pause -> closed continuation break.
+    impulse, pullback, trigger = normalized[-3], normalized[-2], normalized[-1]
+    if direction == "SELL":
+        impulse_ok = impulse["close"] < impulse["open"] and abs(impulse["close"] - impulse["open"]) >= 1.0 * atr_v
+        pause_ok = pullback["close"] > pullback["open"] and pullback["high"] - impulse["low"] <= 0.65 * atr_v
+        trigger_ok = trigger["close"] < trigger["open"] and trigger["close"] < pullback["low"]
+        distance = max(0.0, entry - trigger["close"])
+    else:
+        impulse_ok = impulse["close"] > impulse["open"] and abs(impulse["close"] - impulse["open"]) >= 1.0 * atr_v
+        pause_ok = pullback["close"] < pullback["open"] and impulse["high"] - pullback["low"] <= 0.65 * atr_v
+        trigger_ok = trigger["close"] > trigger["open"] and trigger["close"] > pullback["high"]
+        distance = max(0.0, trigger["close"] - entry)
+    if not impulse_ok or not pause_ok or not trigger_ok:
+        return {"valid": False, "status": "WAITING_FOR_MICRO_PULLBACK",
+                "reason": "impulse_pause_continuation_sequence_not_confirmed"}
+    if distance > max_drift * atr_v:
+        return {"valid": False, "status": "ENTRY_WINDOW_MISSED",
+                "reason": "micro_pullback_entry_chased", "distance_atr": round(distance / atr_v, 4)}
+    return {"valid": True, "status": "CONFIRMED", "reason": "impulse_micro_pullback_closed_continuation",
+            "confirmation_timestamp": int(trigger["timestamp"]),
+            "distance_atr": round(distance / atr_v, 4)}
+
 def is_confirmed_failed_breakout_evidence(market_intelligence: Any, side: str) -> bool:
     """Return whether a fresh, same-side, two-candle failed-breakout proof is usable.
 
