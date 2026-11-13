@@ -80,7 +80,7 @@ from ggp_market_data import (
     FETCH_MIN_CANDLES,
     timeframe_seconds as _timeframe_seconds,
 )
-from ggp_market_intelligence import classify_zone_event, advance_failed_breakout_confirmation
+from ggp_market_intelligence import (\n    classify_zone_event, advance_failed_breakout_confirmation,\n    is_confirmed_failed_breakout_evidence,\n)
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -2484,20 +2484,7 @@ class TradeManagementBoard:
         # exit signal. Require a fresh same-side event and two adjacent closed
         # candles confirming price remained back inside the causal zone.
         mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
-        zone_event = str(mi.get("zone_event") or "").upper()
-        zone_confirmed = bool(mi.get("zone_event_confirmed", False))
-        zone_confidence = safe_float(mi.get("zone_event_confidence"), 0.0)
-        zone_side = str(mi.get("zone_side") or side).upper()
-        zone_fresh = bool(mi.get("zone_event_fresh", False))
-        zone_streak = int(max(0, safe_float(mi.get("failed_breakout_streak"), 0)))
-        zone_evidence_valid = (
-            not bool(mi.get("failed_breakout_thesis_credit_applied", False))
-            and zone_event == "FAILED_BREAKOUT"
-            and zone_confirmed and zone_fresh
-            and zone_side == side and side in {"BUY", "SELL"}
-            and zone_confidence >= 0.75
-            and zone_streak >= 2
-        )
+        zone_evidence_valid = is_confirmed_failed_breakout_evidence(mi, side)
         thesis_reasons = list(ctx.get("thesis_failure_reasons") or [])
         thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
         if zone_evidence_valid:
