@@ -10492,7 +10492,33 @@ def smart_opportunity_selection():
     watchlist = MEMORY.get("watchlist", {})
     ready = [(sym, item) for sym, item in watchlist.items()
              if isinstance(item, dict) and item.get("decision_state") == "ENTRY_READY"]
-    ready.sort(key=lambda pair: float(pair[1].get("score", pair[1].get("discovery_score", 0)) or 0), reverse=True)
+    def _location_first_rank(pair):
+        _, candidate = pair
+        atr_value = candidate.get("atr")
+        price_value = candidate.get("price")
+        distances = []
+        ob = candidate.get("order_block")
+        if isinstance(ob, dict) and ob.get("valid", True):
+            try:
+                distances.append(float(ob.get("distance_atr")))
+            except (TypeError, ValueError):
+                pass
+        fvg = candidate.get("fvg")
+        if isinstance(fvg, dict) and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"):
+            try:
+                low, high = float(fvg.get("lower")), float(fvg.get("upper"))
+                if atr_value and float(atr_value) > 0 and price_value and low > 0 and high >= low:
+                    distances.append(max(low - float(price_value), 0.0, float(price_value) - high) / float(atr_value))
+            except (TypeError, ValueError):
+                pass
+        golden = candidate.get("golden_zone") if isinstance(candidate.get("golden_zone"), dict) else {}
+        location_distance = min(distances) if distances else 999.0
+        location_quality = float(golden.get("score", 0) or 0)
+        score = float(candidate.get("score", candidate.get("discovery_score", 0)) or 0)
+        # Location proximity and quality lead; score is only the final tie-breaker.
+        return (location_distance <= 1.5, -location_distance, location_quality, score)
+
+    ready.sort(key=_location_first_rank, reverse=True)
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
