@@ -380,7 +380,6 @@ def validate_entry_behavior_trigger(*, side: str, behavior: str, candles: Sequen
                 "reason": "no_post_setup_closed_candles"}
 
     last = normalized[-1]
-    body = abs(last["close"] - last["open"])
     if mode == "RETEST":
         level = _num(reference_level)
         if level is None and _num(zone_low) is not None and _num(zone_high) is not None:
@@ -447,12 +446,12 @@ def validate_entry_behavior_trigger(*, side: str, behavior: str, candles: Sequen
         impulse_ok = impulse["close"] < impulse["open"] and abs(impulse["close"] - impulse["open"]) >= 1.0 * atr_v
         pause_ok = pullback["close"] > pullback["open"] and pullback["high"] - impulse["low"] <= 0.65 * atr_v
         trigger_ok = trigger["close"] < trigger["open"] and trigger["close"] < pullback["low"]
-        distance = max(0.0, entry - trigger["close"])
+        distance = abs(entry - trigger["close"])
     else:
         impulse_ok = impulse["close"] > impulse["open"] and abs(impulse["close"] - impulse["open"]) >= 1.0 * atr_v
         pause_ok = pullback["close"] < pullback["open"] and impulse["high"] - pullback["low"] <= 0.65 * atr_v
         trigger_ok = trigger["close"] > trigger["open"] and trigger["close"] > pullback["high"]
-        distance = max(0.0, trigger["close"] - entry)
+        distance = abs(entry - trigger["close"])
     if not impulse_ok or not pause_ok or not trigger_ok:
         return {"valid": False, "status": "WAITING_FOR_MICRO_PULLBACK",
                 "reason": "impulse_pause_continuation_sequence_not_confirmed"}
