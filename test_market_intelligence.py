@@ -992,3 +992,27 @@ def test_price_patterns_are_exposed_by_institutional_bridge_as_observational_con
     assert "classify_price_pattern" in source
     assert '_intelligence["price_pattern"]' in source
     assert "closed.to_dict(\"records\")" in source
+
+
+def test_fvg_direction_gate_is_explicit_and_fails_closed_for_both_sides():
+    from ggp_institutional_bridge import _fvg_matches_side
+
+    bullish = {"direction": "BULLISH", "status": "UNFILLED"}
+    bearish = {"direction": "BEARISH", "status": "PARTIALLY_FILLED"}
+    invalidated = {"direction": "BULLISH", "status": "INVALIDATED"}
+
+    assert _fvg_matches_side(bullish, "BUY")
+    assert _fvg_matches_side(bearish, "SELL")
+    assert not _fvg_matches_side(bullish, "SELL")
+    assert not _fvg_matches_side(bearish, "BUY")
+    assert not _fvg_matches_side(invalidated, "BUY")
+    assert not _fvg_matches_side(None, "BUY")
+    assert not _fvg_matches_side(bullish, "UNKNOWN")
+
+
+def test_institutional_analyzer_uses_local_side_aware_fvg_gate():
+    from pathlib import Path
+
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert "fvg_ok = _fvg_matches_side(fvg, side)" in source
+    assert "fvg.get(\"direction\") == expected" not in source
