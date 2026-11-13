@@ -457,6 +457,13 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
         "volume_ratio": volume_ratio,
         "volume_confirmed": bool(volume_ratio is not None and volume_ratio >= 1.1),
         "golden_zone": golden,
+        # Strict entry policy: engines must retest a fresh, nearby institutional zone.
+        # This metadata stays internal and does not alter Telegram/dashboard/API schemas.
+        "location_first_required": True,
+        "reference_price": price,
+        "latest_timestamp": int(df.timestamp.iloc[-1]),
+        "timeframe_ms": int(TIMEFRAME_SECONDS * 1000),
+        "max_location_distance_atr": 1.5,
     }
 
 
