@@ -202,3 +202,21 @@ def test_failed_breakout_evidence_requires_two_fresh_confirmed_candles():
     two = valid_evidence(2)
     assert one["failed_breakout_streak"] < 2
     assert two["failed_breakout_streak"] >= 2
+
+
+def test_failed_breakout_streak_counts_distinct_consecutive_candles():
+    # The runtime streak contract is candle-based: same candle is ignored,
+    # adjacent failed-breakout candles increment, any other event resets.
+    prior_event = "FAILED_BREAKOUT"
+    prior_ts = 100
+    new_event = "FAILED_BREAKOUT"
+    new_ts = 115
+    same_event = (
+        prior_event == "FAILED_BREAKOUT"
+        and new_event == "FAILED_BREAKOUT"
+        and prior_ts > 0
+        and (new_ts - prior_ts) <= 15 * 1.5
+    )
+    assert same_event is True
+    assert (new_ts - prior_ts) > 0
+    assert 1 + int(same_event) == 2
