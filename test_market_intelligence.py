@@ -316,3 +316,76 @@ def test_breakout_retest_requires_touch_after_initial_acceptance():
     ]
     result = classify_zone_event(rows, side="BUY", zone_low=99, zone_high=102, atr=1)
     assert result["event"] == ZoneEvent.BREAKOUT_RETEST.value
+
+
+
+def test_intelligence_decision_retains_real_causal_zone_and_mode():
+    decision = build_intelligence_decision(
+        regime="STRONG_TREND",
+        adx=28.0,
+        continuation_probability=0.82,
+        liquidity_quality="GOOD",
+        displacement_atr=1.5,
+        setup_type="CONTINUATION",
+        causal_zone_valid=True,
+        bos_level=105.0,
+        reference_low=101.0,
+        reference_high=103.0,
+        volatility_atr=1.1,
+        data_quality="VALID_CLOSED_CANDLES",
+    ).to_dict()
+    assert decision["mode"] == TradingMode.TREND.value
+    assert decision["entry_behavior"] == EntryBehavior.MICRO_PULLBACK.value
+    assert decision["reference_low"] == 101.0
+    assert decision["reference_high"] == 103.0
+
+
+def test_bridge_adx_is_finite_on_directional_closed_candles():
+    import numpy as np
+    import pandas as pd
+    from ggp_institutional_bridge import _adx
+
+    n = 60
+    close = np.linspace(100.0, 130.0, n)
+    frame = pd.DataFrame({
+        "open": close - 0.2,
+        "high": close + 0.5,
+        "low": close - 0.5,
+        "close": close,
+        "volume": np.full(n, 1000.0),
+        "timestamp": np.arange(n, dtype=float) * 900.0,
+    })
+    value = _adx(frame, period=14)
+    assert np.isfinite(value)
+    assert 0.0 <= value <= 100.0
+
+
+def test_live_trade_observer_uses_last_closed_timestamp_and_never_live_bar():
+    source = open("ggpbot.py", encoding="utf-8").read()
+    start = source.index("# Closed-candle zone lifecycle; context only, no order side effects.")
+    end = source.index("# ========== GET DECISION FROM BOARD ==========", start)
+    observer = source[start:end]
+    assert "last_closed_ts" in observer
+    assert "closed_candle_ts" not in observer
+    assert "_closed_candle_frame(raw_frame, INTERVAL)" in source
+
+
+def test_execution_state_has_one_canonical_market_intelligence_key_set():
+    source = open("ggpbot.py", encoding="utf-8").read()
+    start = source.index("STATE = {", source.index("# ========== EXECUTION LAYER =========="))
+    end = source.index("\npaper =", start)
+    state = source[start:end]
+    for key in (
+        "native_sl_policy", "zone_event_last_candle_ts",
+        "failed_breakout_streak", "failed_breakout_thesis_credit_applied",
+        "entry_zone_low", "entry_zone_high",
+    ):
+        assert state.count(f'"{key}":') == 1
+
+
+def test_entry_context_passes_mode_behavior_and_zone_to_trade_state():
+    source = open("ggpbot.py", encoding="utf-8").read()
+    assert '"trading_mode": str(item.get("trading_mode") or market_intelligence.get("mode")' in source
+    assert '"entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low"))' in source
+    assert '"entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high"))' in source
+    assert '"trading_mode": "SNIPER"' in source
