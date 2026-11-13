@@ -83,7 +83,8 @@ from ggp_market_data import (
 from ggp_market_intelligence import (
     classify_zone_event, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence,
-)from ggp_institutional_bridge import build_liquidity_pools
+)
+from ggp_institutional_bridge import build_liquidity_pools
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
