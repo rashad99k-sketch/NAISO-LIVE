@@ -19,7 +19,8 @@ from roro_institutional import (
 )
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
-from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,\n                                     build_support_resistance_zones, validate_order_block_zone)
+from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
+                                     build_support_resistance_zones, validate_order_block_zone)
 
 
 REVERSAL = ReversalEngine()
@@ -443,14 +444,16 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
         golden_state = "NO_GOLDEN_ZONE"
     golden = {
         "state": golden_state, "direction": expected, "value_zone": value_zone,
-        "ob_valid": ob_valid, "fvg_valid": fvg_valid, "ob_fvg_overlap": ob_fvg_overlap,\n        "support_resistance_aligned": sr_aligned, "aligned_sr_zone": sr_aligned_zone,
+        "ob_valid": ob_valid, "fvg_valid": fvg_valid, "ob_fvg_overlap": ob_fvg_overlap,
+        "support_resistance_aligned": sr_aligned, "aligned_sr_zone": sr_aligned_zone,
         "liquidity_aligned_near": liq_near, "aligned_reference_count": ref_count,
         "score": golden_score,
         "source_definition": "OB/FVG/value/liquidity confluence; not a Fibonacci 61.8% claim",
     }
     return {
         "atr": atr, "price": price, "regime": regime, "structure": structure,
-        "liquidity": liquidity, "order_block": ob, "fvg": fvg,\n        "support_resistance": support_resistance, "support_resistance_aligned": sr_aligned,
+        "liquidity": liquidity, "order_block": ob, "fvg": fvg,
+        "support_resistance": support_resistance, "support_resistance_aligned": sr_aligned,
         "volume_ratio": volume_ratio,
         "volume_confirmed": bool(volume_ratio is not None and volume_ratio >= 1.1),
         "golden_zone": golden,
