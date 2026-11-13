@@ -505,3 +505,19 @@ def test_sniper_requires_all_three_structural_conditions():
         data_quality="VALID_CLOSED_CANDLES",
     )
     assert mode == TradingMode.SNIPER.value
+
+
+def test_bos_continuation_is_not_mislabeled_as_mss(monkeypatch):
+    import pandas as pd
+    import ggp_institutional_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "confirmed_swings",
+        lambda frame, left_right=2: ([(1, 100.0), (2, 110.0)], [(1, 90.0), (2, 100.0)]),
+    )
+    frame = pd.DataFrame({"close": [111.0]})
+    structure = bridge.detect_structure(frame)
+    assert structure["bos"] == "BULLISH_BOS"
+    assert structure["choch"] is None
+    assert structure["mss"] is None
