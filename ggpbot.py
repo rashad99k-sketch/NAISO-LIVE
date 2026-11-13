@@ -106,7 +106,7 @@ def record_trade_management_event(event_type, status="INFO", *, log_level=None,
     logger = globals().get("log_execution")
     if logger and (log_level or event_type not in {"BOARD_DECISION"}):
         details = []
-        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "reason", "order_id"):
+        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "entry_mode", "entry_behavior", "reason", "order_id"):
             value = event.get(key)
             if value not in (None, ""):
                 details.append(f"{key}={value}")
@@ -2451,7 +2451,12 @@ class TradeManagementBoard:
                 "action": action.value, "reason": str(reason), "symbol": symbol,
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
-                "profit_mode": profit_mode, "tp1_hit": bool(ctx.get("tp1_hit")),
+                "profit_mode": profit_mode,
+                "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
+                "market_regime": str(ctx.get("regime") or "UNKNOWN"),
+                "tp1_hit": bool(ctx.get("tp1_hit")),
                 "tp2_hit": bool(ctx.get("tp2_hit")),
                 "tp1_price": safe_float(ctx.get("tp1_price")),
                 "tp2_price": safe_float(ctx.get("tp2_price")),
@@ -3441,7 +3446,10 @@ class LiveTradeManager:
                 elif current_mode != RANGE_MODE:
                     STATE["range_target_price"] = 0.0
                     STATE["range_target_move_pct"] = 0.0
-                log_execution(f"[PROFIT_MODE] {symbol} mode={current_mode} candidate={candidate_mode} reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
+                log_execution(
+                    f"[PROFIT_MODE] {symbol} entry_mode={STATE.get('trading_mode', 'UNCLASSIFIED')} "
+                    f"management_mode={current_mode} candidate={candidate_mode} "
+                    f"reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
 
             # Thesis failure check
             failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
@@ -3608,6 +3616,9 @@ class LiveTradeManager:
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
+            "entry_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "entry_mode_confidence": safe_float(STATE.get("entry_behavior_confidence"), 0.0),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
