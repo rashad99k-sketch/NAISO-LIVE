@@ -153,3 +153,34 @@ def test_unknown_and_nan_values_never_produce_actionable_mode():
     )
     assert mode == TradingMode.UNCLASSIFIED.value
     assert confidence == 0
+
+
+def test_trade_state_default_keeps_existing_protection_and_reconciliation_keys():
+    # Structural regression guard: these defaults are consumed by the existing
+    # TradeManagementBoard, native-protection path, and close reconciliation.
+    import ast
+    from pathlib import Path
+
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    state_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "STATE" for target in node.targets)
+    )
+    assert isinstance(state_node.value, ast.Dict)
+    keys = {
+        key.value for key in state_node.value.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    required = {
+        "profit_mode", "native_sl_policy", "execution_unresolved",
+        "close_reconciliation_required", "close_verified",
+        "last_close_verified", "pending_close_order_id",
+        "pending_close_requested_qty", "structural_invalidation",
+        "thesis_failure_reasons", "emergency_exit", "emergency_reason",
+        "emergency_source", "emergency_ts", "tp1_filled_qty",
+        "tp2_filled_qty", "tp1_execution_price",
+    }
+    assert required <= keys
+    assert {"entry_zone_low", "entry_zone_high", "zone_event_last_candle_ts"} <= keys
