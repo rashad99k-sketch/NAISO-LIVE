@@ -715,7 +715,7 @@ def test_opposing_liquidity_analysis_is_wired_to_closed_candle_management():
     source = Path("ggpbot.py").read_text(encoding="utf-8")
     assert "build_liquidity_pools(df_live.tail(120).reset_index(drop=True))" in source
     assert '"opposing_liquidity": {' in source
-    assert "select_scalp_target_pct(" in source
+    assert "build_scalp_target(" in source
     assert '"scalp_target_selected_pct"' in source
 
 
@@ -737,7 +737,7 @@ def test_opposing_liquidity_and_scalp_target_are_connected_to_management():
     source = Path("ggpbot.py").read_text(encoding="utf-8")
     assert "build_liquidity_pools(df_live.tail(120).reset_index(drop=True))" in source
     assert '"opposing_liquidity": {' in source
-    assert "select_scalp_target_pct(" in source
+    assert "build_scalp_target(" in source
 
 
 def test_failed_breakout_is_not_confirmed_until_two_closed_candles():
@@ -766,17 +766,27 @@ def test_failed_breakout_is_not_confirmed_until_two_closed_candles():
 
 
 def test_state_has_unique_opposing_liquidity_defaults():
+    import ast
     from pathlib import Path
+
     source = Path("ggpbot.py").read_text(encoding="utf-8")
-    start = source.index("STATE = {")
-    end = source.index("\npaper = ", start)
-    state = source[start:end]
-    assert state.count('"opposing_liquidity_status":') == 1
-    assert state.count('"opposing_liquidity_level":') == 1
-    assert state.count('"scalp_target_selected_pct":') == 1
-    assert state.count('"scalp_target_price":') == 1
-    assert state.count('"scalp_target_tp1_price":') == 1
-    assert state.count('"scalp_target_status":') == 1
+    tree = ast.parse(source)
+    state_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "STATE" for target in node.targets)
+    )
+    assert isinstance(state_node.value, ast.Dict)
+    keys = [
+        key.value for key in state_node.value.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    ]
+    for key in (
+        "opposing_liquidity_status", "opposing_liquidity_level",
+        "scalp_target_selected_pct", "scalp_target_price",
+        "scalp_target_tp1_price", "scalp_target_status",
+    ):
+        assert keys.count(key) == 1, f"STATE default {key!r} must be unique"
 
 
 def test_trade_entry_modes_remain_distinct_from_profit_management_modes():
