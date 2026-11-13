@@ -3471,10 +3471,13 @@ class LiveTradeManager:
                         STATE["opposing_liquidity_status"] = "UNKNOWN"
                         STATE["opposing_liquidity_level"] = 0.0
                         STATE["opposing_liquidity_distance_pct"] = 0.0
-                        STATE["scalp_target_status"] = "UNKNOWN"
-                        STATE["scalp_target_price"] = 0.0
-                        STATE["scalp_target_selected_pct"] = 0.0
-                        STATE["scalp_target_selection_reason"] = "pool_analysis_error"
+                        # Keep a previously latched target through transient pool-data errors.
+                        if not (str(STATE.get("scalp_target_status") or "").upper() == "VALID"
+                                and safe_float(STATE.get("scalp_target_price"), 0.0) > 0):
+                            STATE["scalp_target_status"] = "UNKNOWN"
+                            STATE["scalp_target_price"] = 0.0
+                            STATE["scalp_target_selected_pct"] = 0.0
+                            STATE["scalp_target_selection_reason"] = "pool_analysis_error"
                         log_execution(
                             f"[OPPOSING_LIQUIDITY] {symbol}: {type(_pool_error).__name__}: {_pool_error}",
                             "WARN", debounce_key=f"opposing_pool_{symbol}", debounce_sec=60
