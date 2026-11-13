@@ -220,6 +220,7 @@ def build_intelligence_decision(*, regime: str = "UNKNOWN", adx: Any = None,
                                 setup_type: str = "", sweep_confirmed: bool = False,
                                 mss_confirmed: bool = False, causal_zone_valid: bool = False,
                                 bos_level: Any = None, volatility_atr: Any = None,
+                                reference_low: Any = None, reference_high: Any = None,
                                 data_quality: str = "UNKNOWN") -> IntelligenceDecision:
     mode, mode_conf, mode_reasons = classify_trading_mode(
         regime=regime, adx=adx, continuation_probability=continuation_probability,
@@ -235,7 +236,7 @@ def build_intelligence_decision(*, regime: str = "UNKNOWN", adx: Any = None,
     return IntelligenceDecision(
         mode=mode, entry_behavior=behavior, zone_event=ZoneEvent.INSUFFICIENT_DATA.value,
         confidence=round(confidence, 3), reference_level=_num(bos_level),
-        reference_low=None, reference_high=None,
+        reference_low=_num(reference_low), reference_high=_num(reference_high),
         reason_codes=tuple(mode_reasons + behavior_reasons), confirmed=False,
         source_timestamp=None)
 
