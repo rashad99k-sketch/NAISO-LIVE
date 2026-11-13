@@ -1095,39 +1095,73 @@ def test_support_resistance_fails_closed_on_invalid_or_non_monotonic_candles():
 
 
 def test_bullish_order_block_validation_tracks_partial_mitigation_and_invalidation():
-    zone = {"low": 9.0, "high": 9.8, "strength": 7.0,
+    zone = {"low": 9.0, "high": 9.5, "strength": 7.0,
             "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
     candles = [
         candle(1000, 9.5, 9.9, 9.0, 9.2),
         candle(2000, 9.2, 10.2, 9.1, 10.1),
-        candle(3000, 10.1, 10.5, 9.5, 10.2),
+        candle(3000, 10.1, 10.5, 9.2, 10.2),
     ]
-    valid = validate_order_block_zone(
-        side="BUY", zone=zone, candles=candles, atr=1.0,
-    )
+    valid = validate_order_block_zone(side="BUY", zone=zone, candles=candles, atr=1.0)
     assert valid["valid"] is True
     assert valid["status"] == "PARTIALLY_MITIGATED"
-    broken = candles + [candle(4000, 9.5, 9.7, 8.8, 8.9)]
-    invalid = validate_order_block_zone(
-        side="BUY", zone=zone, candles=broken, atr=1.0,
-    )
+    assert valid["fill_pct"] == pytest.approx(60.0)
+
+    fully_mitigated = candles + [candle(4000, 10.2, 10.4, 9.0, 10.1)]
+    consumed = validate_order_block_zone(side="BUY", zone=zone, candles=fully_mitigated, atr=1.0)
+    assert consumed["valid"] is False
+    assert consumed["status"] == "FULLY_MITIGATED"
+
+    broken = fully_mitigated + [candle(5000, 9.5, 9.7, 8.8, 8.9)]
+    invalid = validate_order_block_zone(side="BUY", zone=zone, candles=broken, atr=1.0)
     assert invalid["valid"] is False
     assert invalid["status"] == "INVALIDATED"
 
 
 def test_bearish_order_block_validation_is_directionally_symmetric():
-    zone = {"low": 10.2, "high": 11.0, "strength": 7.0,
+    zone = {"low": 10.5, "high": 11.0, "strength": 7.0,
             "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
     candles = [
         candle(1000, 10.5, 11.0, 10.1, 10.8),
         candle(2000, 10.8, 10.9, 9.8, 9.9),
-        candle(3000, 9.9, 10.5, 9.5, 9.8),
+        candle(3000, 9.9, 10.8, 9.5, 9.8),
     ]
     valid = validate_order_block_zone(side="SELL", zone=zone, candles=candles, atr=1.0)
     assert valid["valid"] is True
-    broken = candles + [candle(4000, 10.7, 11.2, 10.6, 11.1)]
+    assert valid["status"] == "PARTIALLY_MITIGATED"
+    assert valid["fill_pct"] == pytest.approx(60.0)
+
+    fully_mitigated = candles + [candle(4000, 9.8, 11.0, 9.6, 10.0)]
+    consumed = validate_order_block_zone(side="SELL", zone=zone, candles=fully_mitigated, atr=1.0)
+    assert consumed["valid"] is False
+    assert consumed["status"] == "FULLY_MITIGATED"
+
+    broken = fully_mitigated + [candle(5000, 10.7, 11.2, 10.6, 11.1)]
     invalid = validate_order_block_zone(side="SELL", zone=zone, candles=broken, atr=1.0)
     assert invalid["status"] == "INVALIDATED"
+
+
+def test_order_block_validator_rejects_malformed_or_noncausal_candles():
+    zone = {"low": 9.0, "high": 9.5, "strength": 7.0,
+            "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
+    malformed = [
+        candle(1000, 9.5, 9.9, 9.0, 9.2),
+        candle(2000, 9.2, 9.1, 9.0, 10.1),
+        candle(3000, 10.1, 10.5, 9.2, 10.2),
+    ]
+    result = validate_order_block_zone(side="BUY", zone=zone, candles=malformed, atr=1.0)
+    assert result["valid"] is False
+    assert result["status"] == "DATA_UNAVAILABLE"
+
+    bad_geometry = {**zone, "high": 9.8}
+    causal_rows = [
+        candle(1000, 9.5, 9.9, 9.0, 9.2),
+        candle(2000, 9.2, 10.2, 9.1, 10.1),
+        candle(3000, 10.1, 10.5, 9.2, 10.2),
+    ]
+    result = validate_order_block_zone(side="BUY", zone=bad_geometry, candles=causal_rows, atr=1.0)
+    assert result["valid"] is False
+    assert result["status"] == "INVALID"
 
 
 def test_institutional_bridge_publishes_directional_support_resistance_and_validated_ob():
@@ -1139,6 +1173,20 @@ def test_institutional_bridge_publishes_directional_support_resistance_and_valid
     assert '"support_resistance": support_resistance' in source
     assert '"support_resistance_aligned": sr_aligned' in source
     assert 'sr.get("supports" if side == "BUY" else "resistances", [])' in source
+
+
+def test_institutional_bridge_uses_one_authoritative_ob_validation_state():
+    from pathlib import Path
+
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    analyze_start = source.index("def analyze_symbol(")
+    analyze_end = source.index("\ndef analyze_symbol_both(", analyze_start)
+    analyzer = source[analyze_start:analyze_end]
+    assert 'validation.get("valid") is True' in analyzer
+    assert 'validation.get("status")' in analyzer
+    assert 'ob["status"] = ob_state' in analyzer
+    assert "post_impulse.low.min()" not in analyzer
+    assert "post_impulse.high.max()" not in analyzer
 
 
 def test_legacy_scanner_support_resistance_wrapper_uses_confirmed_zone_engine():
