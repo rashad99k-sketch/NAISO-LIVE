@@ -3297,6 +3297,37 @@ class LiveTradeManager:
             STATE["adx_slope"] = adx_slope
             STATE["volume_ratio"] = volume_ratio
             STATE["last_management_closed_candle_ts"] = closed_candle_ts
+            # Observational closed-candle zone lifecycle; no exchange I/O or order actions.
+            try:
+                _zone_low = safe_float(STATE.get("entry_zone_low"), 0.0)
+                _zone_high = safe_float(STATE.get("entry_zone_high"), 0.0)
+                _zone_ts = int(safe_float(STATE.get("zone_event_last_candle_ts"), 0))
+                if (_zone_low > 0 and _zone_high > _zone_low and len(df_live) >= 3
+                        and int(safe_float(closed_candle_ts, 0)) > _zone_ts):
+                    _zone_result = classify_zone_event(
+                        df_live.tail(12).to_dict("records"), side=side,
+                        zone_low=_zone_low, zone_high=_zone_high, atr=atr)
+                    if _zone_result.get("event") != "INSUFFICIENT_DATA":
+                        STATE["zone_event"] = _zone_result.get("event")
+                        STATE["zone_event_last_candle_ts"] = int(_zone_result.get("timestamp") or closed_candle_ts)
+                        STATE["market_intelligence"] = {
+                            **(STATE.get("market_intelligence") or {}),
+                            "zone_event": _zone_result.get("event"),
+                            "zone_event_confirmed": bool(_zone_result.get("confirmed")),
+                            "zone_event_confidence": safe_float(_zone_result.get("confidence"), 0.0),
+                            "zone_reference_level": safe_float(_zone_result.get("level"), 0.0),
+                            "zone_event_reasons": list(_zone_result.get("reason_codes") or []),
+                            "zone_event_timestamp": STATE["zone_event_last_candle_ts"],
+                        }
+                        record_trade_management_event(
+                            "MARKET_STRUCTURE_EVENT", "CONFIRMED" if _zone_result.get("confirmed") else "OBSERVED",
+                            dedupe_key=f"zone:{symbol}:{_zone_result.get('event')}:{STATE['zone_event_last_candle_ts']}",
+                            dedupe_seconds=0, symbol=symbol, side=side, reason=_zone_result.get("event"),
+                            price=mark_price, reference_level=_zone_result.get("level"),
+                            confidence=_zone_result.get("confidence"))
+            except Exception as _zone_exc:
+                log_execution(f"[MARKET_INTELLIGENCE] {symbol}: {type(_zone_exc).__name__}",
+                              "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60)
             STATE["di_plus_live"] = plus_di
             STATE["di_minus_live"] = minus_di
             STATE["smart_money"] = smart_money
@@ -4888,6 +4919,8 @@ STATE = {
     "peak_drawdown_roe": 0.0,
     "ema_profit_state": "INSUFFICIENT_DATA",
             "market_intelligence": {},
+            "entry_zone_low": 0.0, "entry_zone_high": 0.0,
+            "entry_closed_candle_frame": pd.DataFrame(),
             "entry_trading_mode": str((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("mode", "UNCLASSIFIED")),
             "entry_behavior": str((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("entry_behavior", "WAIT_FOR_STRUCTURE")),
             "entry_behavior_confidence": safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("confidence", 0.0), 0.0),
@@ -10215,6 +10248,9 @@ def smart_opportunity_selection():
                 "closed_candle_frame": closed_df.copy(),
                 "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
                 "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
+                "entry_zone_low": safe_float((item.get("order_block") or {}).get("low"), 0.0),
+                "entry_zone_high": safe_float((item.get("order_block") or {}).get("high"), 0.0),
+                "entry_closed_candle_frame": closed_df.copy(),
                 "market_intelligence": dict(item.get("market_intelligence") or {}),
                 "trading_mode": str((item.get("market_intelligence") or {}).get("mode", "UNCLASSIFIED")),
                 "entry_behavior": str((item.get("market_intelligence") or {}).get("entry_behavior", "WAIT_FOR_STRUCTURE")),
