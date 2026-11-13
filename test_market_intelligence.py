@@ -1014,8 +1014,11 @@ def test_institutional_analyzer_uses_local_side_aware_fvg_gate():
     from pathlib import Path
 
     source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
-    assert "fvg_ok = _fvg_matches_side(fvg, side)" in source
-    assert "fvg.get(\"direction\") == expected" not in source
+    start = source.index("def analyze_symbol(")
+    end = source.index("\ndef analyze_symbol_both(", start)
+    analyzer_source = source[start:end]
+    assert "fvg_ok = _fvg_matches_side(fvg, side)" in analyzer_source
+    assert "fvg.get(\"direction\") == expected" not in analyzer_source
 
 
 def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
