@@ -3679,6 +3679,14 @@ class LiveTradeManager:
                             "zone_reference_level": safe_float(_zone_result.get("level"), 0.0),
                             "zone_event_reasons": list(_zone_result.get("reason_codes") or []),
                             "zone_event_timestamp": _event_ts,
+                            "zone_event_fresh": (
+                                0 <= time.time() - _event_ts
+                                <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                            ),
+                            "zone_side": str(side or "").upper(),
+                            "failed_breakout_streak": _failure_streak,
+                            "failed_breakout_last_candle_ts": _event_ts if _failure_active else 0.0,
+                            "failed_breakout_thesis_credit_applied": bool(STATE.get("failed_breakout_thesis_credit_applied", False)),
                         }
                         record_trade_management_event(
                             "MARKET_STRUCTURE_EVENT",
