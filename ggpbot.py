@@ -2522,9 +2522,9 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP is an intentional exception: it is enabled only by the
-        # multi-evidence policy. The single target closes the entire remaining
-        # exposure, while a previously verified TP1 remains recorded as a real fill.
+        # RANGE_SCALP is enabled only by the multi-evidence policy. It still
+        # follows the canonical two-stage 50/50 model: TP1 is a verified partial
+        # close; TP2 strictly closes the verified remaining runner.
         if profit_mode == "RANGE_SCALP":
             scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
             scalp_target = safe_float(ctx.get("scalp_target_price"), 0.0)
@@ -3485,6 +3485,7 @@ class LiveTradeManager:
                             distance_pct=STATE["opposing_liquidity_distance_pct"],
                             scalp_target_pct=STATE["scalp_target_selected_pct"],
                             scalp_target_price=STATE.get("scalp_target_price", 0.0),
+                            scalp_target_tp1_price=STATE.get("scalp_target_tp1_price", 0.0),
                             scalp_target_status=STATE.get("scalp_target_status", "UNKNOWN"),
                             reason=STATE["scalp_target_selection_reason"],
                         )
