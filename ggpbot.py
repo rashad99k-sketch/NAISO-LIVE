@@ -3642,7 +3642,13 @@ class LiveTradeManager:
             _zone_high = safe_float(STATE.get("entry_zone_high"), 0.0)
             _last_zone_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
             if last_closed_ts is not None and _zone_low > 0 and _zone_high > _zone_low and len(df_live) >= 3 and last_closed_ts > _last_zone_ts:
-                _zone_frame = df_live.tail(12).copy()
+                # Re-derive the completed-candle frame at the point of use. This
+                # prevents a live/in-progress tail row from entering the zone
+                # classifier even if the upstream fetch format changes.
+                _zone_frame = _closed_candle_frame(raw_frame, INTERVAL)
+                if _zone_frame is None or getattr(_zone_frame, "empty", True):
+                    _zone_frame = df_live.copy()
+                _zone_frame = _zone_frame.tail(12).copy()
                 if "timestamp" not in _zone_frame.columns:
                     _zone_frame["timestamp"] = _zone_frame.index
                 _zone_rows = []
