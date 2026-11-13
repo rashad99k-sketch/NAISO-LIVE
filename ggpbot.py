@@ -4669,13 +4669,23 @@ def get_clustered_zones(df, lookback=120, cluster_pct=0.002):
     if df is None or not isinstance(df, pd.DataFrame) or len(df) < 20:
         return [], []
     try:
-        atr_series = compute_atr(df)
+        validator = globals().get("roro_validate_closed_frame")
+        if not callable(validator):
+            return [], []
+        now_ms, _time_source = _entry_exchange_time_ms()
+        closed = validator(
+            df.copy(), now_ms=int(now_ms),
+            timeframe_s=int(_roro_timeframe_seconds(str(INTERVAL))),
+        )
+        if not isinstance(closed, pd.DataFrame) or len(closed) < 20:
+            return [], []
+        atr_series = compute_atr(closed)
         atr_value = safe_float(atr_series.iloc[-1], 0.0) if atr_series is not None and len(atr_series) else 0.0
-        price = safe_float(df["close"].iloc[-1], 0.0)
+        price = safe_float(closed["close"].iloc[-1], 0.0)
         if atr_value <= 0 or price <= 0:
             return [], []
         zones = build_support_resistance_zones(
-            df.tail(max(20, int(lookback))).to_dict("records"),
+            closed.tail(max(20, int(lookback))).to_dict("records"),
             price=price, atr=atr_value, lookback=lookback,
             pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=8,
         )
