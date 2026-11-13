@@ -111,3 +111,45 @@ def test_build_decision_never_grants_unproven_behavior():
     assert result.mode == TradingMode.UNCLASSIFIED.value
     assert result.entry_behavior == EntryBehavior.WAIT_FOR_STRUCTURE.value
     assert result.confidence == 0
+
+
+def test_zone_event_is_directional_for_sell_breakout():
+    rows = [
+        candle(1, 101, 102, 99, 100),
+        candle(2, 100, 101, 97, 98),
+        candle(3, 98, 99, 96, 97),
+    ]
+    result = classify_zone_event(rows, side="SELL", zone_low=98, zone_high=100, atr=1)
+    assert result["event"] == ZoneEvent.BREAKOUT_CONFIRMED.value
+    assert result["confirmed"] is True
+
+
+def test_zone_event_rejects_duplicate_or_out_of_order_timestamps():
+    rows = [
+        candle(3, 99, 101, 98, 100),
+        candle(2, 100, 103, 99, 100),
+        candle(1, 100, 104, 99, 100),
+    ]
+    result = classify_zone_event(rows, side="BUY", zone_low=99, zone_high=102, atr=1)
+    assert result["event"] == ZoneEvent.INSUFFICIENT_DATA.value
+    assert "timestamps_not_monotonic" in result["reason_codes"]
+
+
+def test_zone_event_requires_consecutive_acceptance_closes():
+    rows = [
+        candle(1, 100, 103, 99, 102.5),
+        candle(2, 102.5, 103, 100, 101.5),
+        candle(3, 101.5, 104, 101, 103),
+    ]
+    result = classify_zone_event(rows, side="BUY", zone_low=99, zone_high=102, atr=1)
+    assert result["event"] == ZoneEvent.BREAKOUT_PENDING.value
+    assert result["confirmed"] is False
+
+
+def test_unknown_and_nan_values_never_produce_actionable_mode():
+    mode, confidence, _ = classify_trading_mode(
+        regime="TREND", adx=float("nan"), continuation_probability=float("inf"),
+        liquidity_quality="UNKNOWN", data_quality="VALID",
+    )
+    assert mode == TradingMode.UNCLASSIFIED.value
+    assert confidence == 0
