@@ -71,6 +71,16 @@ def _event_id(symbol: str, side: str, setup: str, ts: Any) -> str:
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
+def _location_event_id(symbol: str, side: str, zone_name: str,
+                       zone_timestamp: Any, structure_timestamp: Any) -> str:
+    """Deduplicate one structural event at one zone, but allow a genuinely new BOS/sweep."""
+    raw = (
+        f"{symbol}|{side}|LOCATION|{zone_name}|"
+        f"{int(zone_timestamp)}|{int(structure_timestamp)}"
+    ).encode()
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
 def _closed(df: pd.DataFrame, now_ms: Optional[int] = None, timeframe_ms: int = 900_000) -> pd.DataFrame:
     if not _valid_frame(df):
         return pd.DataFrame()
@@ -399,7 +409,7 @@ class ReversalEngine:
         ts = int(x.timestamp.iloc[sweep_idx])
         score = 75.0 + (10.0 if context.get("volume_confirmed") else 0.0) + (5.0 if context.get("order_block") else 0.0)
         location_event_id = (
-            _event_id(symbol, side, f"LOCATION:{retest_zone}", int(retest_zone_ts))
+            _location_event_id(symbol, side, retest_zone, retest_zone_ts, ts)
             if context.get("location_first_required") and retest_zone_ts is not None
             else _event_id(symbol, side, setup_name, ts)
         )
@@ -539,7 +549,7 @@ class ContinuationEngine:
         ts = int(x.timestamp.iloc[bos_idx])
         score = 70.0 + (10.0 if context.get("volume_confirmed") else 0.0) + (5.0 if context.get("order_block") else 0.0)
         location_event_id = (
-            _event_id(symbol, side, f"LOCATION:{retest_zone}", int(retest_zone_ts))
+            _location_event_id(symbol, side, retest_zone, retest_zone_ts, ts)
             if context.get("location_first_required") and retest_zone_ts is not None
             else _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts)
         )
