@@ -550,3 +550,44 @@ def test_trade_management_context_exposes_entry_mode_separately_from_profit_mode
     assert '"profit_mode": STATE.get("profit_mode", STANDARD_MODE)' in source
     assert '"entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED")' in source
     assert 'management_mode={current_mode}' in source
+
+
+def test_bridge_adx_uses_sma_seeded_wilder_smoothing():
+    import numpy as np
+    import pandas as pd
+    from ggp_institutional_bridge import _adx
+
+    period = 5
+    close = np.array([100.0, 101.2, 100.7, 102.1, 101.8, 103.4, 104.0,
+                      103.1, 104.8, 105.2, 104.5, 106.1, 107.0, 106.4,
+                      108.2, 109.0, 108.5, 110.1, 111.0, 110.4, 112.2])
+    high = close + np.array([0.6, 0.8, 0.5, 0.7, 0.9, 0.6, 0.8, 0.5, 0.7, 0.9,
+                             0.6, 0.8, 0.5, 0.7, 0.9, 0.6, 0.8, 0.5, 0.7, 0.9, 0.6])
+    low = close - np.array([0.5, 0.6, 0.8, 0.5, 0.7, 0.9, 0.6, 0.8, 0.5, 0.7,
+                            0.9, 0.6, 0.8, 0.5, 0.7, 0.9, 0.6, 0.8, 0.5, 0.7, 0.9])
+    frame = pd.DataFrame({"high": high, "low": low, "close": close})
+
+    def rma(values):
+        out = np.full(len(values), np.nan)
+        valid = np.flatnonzero(np.isfinite(values))
+        first = int(valid[0])
+        seed = first + period - 1
+        out[seed] = np.mean(values[first:seed + 1])
+        for idx in range(seed + 1, len(values)):
+            out[idx] = (out[idx - 1] * (period - 1) + values[idx]) / period
+        return out
+
+    up = np.diff(high, prepend=np.nan)
+    down = -np.diff(low, prepend=np.nan)
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    prev_close = np.roll(close, 1)
+    prev_close[0] = np.nan
+    tr = np.nanmax(np.column_stack((high-low, abs(high-prev_close), abs(low-prev_close))), axis=1)
+    atr = rma(tr)
+    pdi = 100 * rma(plus_dm) / atr
+    mdi = 100 * rma(minus_dm) / atr
+    dx = 100 * abs(pdi-mdi) / (pdi+mdi)
+    expected = rma(dx)[-1]
+    assert np.isfinite(expected)
+    assert _adx(frame, period=period) == pytest.approx(expected, rel=1e-10, abs=1e-10)
