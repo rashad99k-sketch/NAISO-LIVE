@@ -19,6 +19,8 @@ from roro_institutional import (
 )
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
+from ggp_market_intelligence import build_intelligence_decision
+
 
 REVERSAL = ReversalEngine()
 CONTINUATION = ContinuationEngine()
@@ -402,6 +404,29 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
             ob_ok = False
     fvg_ok = bool(fvg and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
     d, golden = _decision_result(decision), context["golden_zone"]
+    # Explainable mode/entry-behavior classification. This is analytical metadata only;
+    # UnifiedEntryAuthority and execute_entry remain the sole entry authorization path.
+    _liq_conf = getattr(liq, "confidence", 0.0)
+    _disp_atr = None
+    try:
+        _last = closed.iloc[-1]
+        _prev = closed.iloc[-2]
+        _disp_atr = abs(float(_last.close) - float(_last.open)) / max(_atr(closed), 1e-12)
+    except Exception:
+        pass
+    _intelligence = build_intelligence_decision(
+        regime=reg.state, adx=None,
+        continuation_probability=(float(cont.score) / 100.0 if getattr(cont, "score", None) is not None else None),
+        liquidity_quality="GOOD" if float(_liq_conf or 0) >= 0.65 else "UNKNOWN",
+        displacement_atr=_disp_atr,
+        setup_type=decision.setup_type,
+        sweep_confirmed=liq_name in ("SWEEP", "GRAB"),
+        mss_confirmed=bool(context["structure"].get("mss") or context["structure"].get("bos")),
+        causal_zone_valid=bool(ob_ok or fvg_ok),
+        bos_level=(context["structure"].get("swing_high") if side == "BUY" else context["structure"].get("swing_low")),
+        volatility_atr=(_atr(closed) / float(context["price"]) if float(context["price"] or 0) > 0 else None),
+        data_quality="VALID_CLOSED_CANDLES",
+    ).to_dict()
     return {
         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
         "side": side, "price": context["price"], "market_regime": reg.state,
@@ -417,6 +442,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
                       "confidence": getattr(liq, "confidence", 0), "reasons": list(getattr(liq, "reasons", []))},
         "order_block": ob, "order_block_state": ob_state, "fvg": fvg, "golden_zone": golden,
         "volume_ratio": context["volume_ratio"], "volume_confirmed": context["volume_confirmed"],
+        "market_intelligence": _intelligence,
         "reversal": _decision_result(rev), "continuation": _decision_result(cont), "entry_status": decision.state,
         "icons": {
             "regime": "📈" if reg.direction == "BULLISH" else "📉" if reg.direction == "BEARISH" else "⚪",
