@@ -286,6 +286,42 @@ def select_scalp_target_pct(opposing_distance_pct, candidates=(0.25, 0.5, 1.0, 2
     return float(selected), f"largest_target_before_opposing_pool_{selected:g}pct"
 
 
+def build_scalp_target(side, entry_price, opposing_pool_level,
+                          candidates=(0.25, 0.5, 1.0, 2.0), pool_buffer_pct=0.05):
+    """Build a fixed entry-anchored target strictly before opposing liquidity.
+
+    The pool is selected beyond the live mark price; target distance is then
+    measured from immutable entry, so a moving mark cannot move the target away.
+    """
+    direction = str(side or "").strip().upper()
+    entry = _num(entry_price)
+    pool = _num(opposing_pool_level)
+    if direction not in {"BUY", "SELL"} or entry is None or entry <= 0 or pool is None or pool <= 0:
+        return {"status": "UNKNOWN", "target_price": 0.0, "target_pct": 0.0,
+                "entry_distance_pct": None, "reason": "invalid_side_entry_or_pool"}
+    distance = (pool - entry) if direction == "BUY" else (entry - pool)
+    if distance <= 0:
+        return {"status": "NO_TARGET", "target_price": 0.0, "target_pct": 0.0,
+                "entry_distance_pct": round(distance / entry * 100.0, 6),
+                "reason": "opposing_pool_not_beyond_entry"}
+    distance_pct = distance / entry * 100.0
+    selected, reason = select_scalp_target_pct(
+        distance_pct, candidates=candidates, pool_buffer_pct=pool_buffer_pct
+    )
+    if selected <= 0:
+        return {"status": "NO_TARGET", "target_price": 0.0, "target_pct": 0.0,
+                "entry_distance_pct": round(distance_pct, 6), "reason": reason}
+    target = entry * (1.0 + selected / 100.0) if direction == "BUY" else entry * (1.0 - selected / 100.0)
+    before_pool = target < pool if direction == "BUY" else target > pool
+    if not before_pool:
+        return {"status": "NO_TARGET", "target_price": 0.0, "target_pct": 0.0,
+                "entry_distance_pct": round(distance_pct, 6),
+                "reason": "target_geometry_crosses_opposing_pool"}
+    return {"status": "VALID", "target_price": round(float(target), 12),
+            "target_pct": float(selected), "entry_distance_pct": round(distance_pct, 6),
+            "reason": reason + "_entry_anchored_before_opposing_pool"}
+
+
 def is_confirmed_failed_breakout_evidence(market_intelligence: Any, side: str) -> bool:
     """Return whether a fresh, same-side, two-candle failed-breakout proof is usable.
 
