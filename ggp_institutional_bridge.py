@@ -19,7 +19,7 @@ from roro_institutional import (
 )
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
-from ggp_market_intelligence import build_intelligence_decision
+from ggp_market_intelligence import build_intelligence_decision, classify_price_pattern
 
 
 REVERSAL = ReversalEngine()
@@ -530,6 +530,11 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         volatility_atr=(_atr(closed) / float(context["price"]) * 100.0 if float(context["price"] or 0) > 0 else None),
         data_quality="VALID_CLOSED_CANDLES",
     ).to_dict()
+    # Chart-pattern recognition is observational metadata based exclusively on
+    # the validated closed-candle frame; it cannot authorize or submit orders.
+    _intelligence["price_pattern"] = classify_price_pattern(
+        closed.to_dict("records"), atr=_atr(closed)
+    )
     return {
         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
         "side": side, "price": context["price"], "market_regime": reg.state,
