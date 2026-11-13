@@ -19,7 +19,7 @@ from roro_institutional import (
 )
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
-from ggp_market_intelligence import build_intelligence_decision, classify_price_pattern
+from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,\n                                     build_support_resistance_zones, validate_order_block_zone)
 
 
 REVERSAL = ReversalEngine()
@@ -375,6 +375,25 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
         ob = find_causal_order_block(df, side, price, atr) if np.isfinite(atr) else None
     except Exception:
         ob = None
+    if isinstance(ob, dict):
+        ob_validation = validate_order_block_zone(
+            side=side, zone=ob, candles=df.to_dict("records"), atr=atr,
+            min_strength=5.0, max_distance_atr=1.5,
+        )
+        ob["validation"] = ob_validation
+        ob["status"] = ob_validation.get("status", "UNKNOWN")
+        ob["fill_pct"] = ob_validation.get("fill_pct", 0.0)
+        ob["valid"] = bool(ob_validation.get("valid"))
+        if not ob["valid"]:
+            ob = None
+    try:
+        support_resistance = build_support_resistance_zones(
+            df.to_dict("records"), price=price, atr=atr, lookback=120,
+            pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=6,
+        ) if np.isfinite(atr) else {"status": "UNKNOWN", "supports": [], "resistances": []}
+    except Exception as exc:
+        support_resistance = {"status": "UNKNOWN", "supports": [], "resistances": [],
+                              "reason": f"zone_analysis_error:{type(exc).__name__}"}
     fvg = detect_fvg(df, side=side, atr=atr if np.isfinite(atr) else None)
     volume_base = float(df.volume.iloc[-21:-1].mean()) if len(df) >= 21 else 0.0
     volume_ratio = float(df.volume.iloc[-1]) / volume_base if volume_base > 0 else None
@@ -424,7 +443,7 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     }
     return {
         "atr": atr, "price": price, "regime": regime, "structure": structure,
-        "liquidity": liquidity, "order_block": ob, "fvg": fvg,
+        "liquidity": liquidity, "order_block": ob, "fvg": fvg,\n        "support_resistance": support_resistance,
         "volume_ratio": volume_ratio,
         "volume_confirmed": bool(volume_ratio is not None and volume_ratio >= 1.1),
         "golden_zone": golden,
@@ -560,6 +579,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "liquidity": {"event": liq_name, "direction": liq_direction, "level": getattr(liq, "level", None),
                       "confidence": getattr(liq, "confidence", 0), "reasons": list(getattr(liq, "reasons", []))},
         "order_block": ob, "order_block_state": ob_state, "fvg": fvg, "golden_zone": golden,
+        "support_resistance": context.get("support_resistance", {"status": "UNKNOWN", "supports": [], "resistances": []}),
         "volume_ratio": context["volume_ratio"], "volume_confirmed": context["volume_confirmed"],
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
