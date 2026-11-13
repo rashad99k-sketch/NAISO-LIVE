@@ -494,25 +494,16 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     reg, liq, ob, fvg = context["regime"], context["liquidity"], context["order_block"], context["fvg"]
     ob_state = "UNKNOWN"
     if isinstance(ob, dict):
-        ob_low, ob_high = float(ob.get("low", 0) or 0), float(ob.get("high", 0) or 0)
-        width = max(0.0, ob_high - ob_low)
-        impulse_ts = int(ob.get("impulse_timestamp") or ob.get("timestamp") or 0)
-        post_impulse = closed[closed.timestamp > impulse_ts]
-        if width > 0 and not post_impulse.empty:
-            if side == "BUY":
-                penetration = max(0.0, min(width, ob_high - float(post_impulse.low.min())))
-                far_close = bool((post_impulse.close < ob_low).any())
-            else:
-                penetration = max(0.0, min(width, float(post_impulse.high.max()) - ob_low))
-                far_close = bool((post_impulse.close > ob_high).any())
-            fill_pct = max(0.0, min(100.0, penetration / width * 100.0))
-            ob_state = "INVALIDATED" if far_close else "MITIGATED" if fill_pct >= 99.9 else "TESTED" if fill_pct > 0 else "FRESH"
-            ob["fill_pct"] = round(fill_pct, 1)
+        validation = ob.get("validation") if isinstance(ob.get("validation"), dict) else {}
+        # The validator in _build_context is the single source of OB lifecycle state.
+        # Do not recompute the same mitigation metric here with a second label set.
+        if validation.get("valid") is True:
+            ob_state = str(validation.get("status") or ob.get("status") or "UNKNOWN").upper()
             ob["status"] = ob_state
+            ob["fill_pct"] = float(validation.get("fill_pct", ob.get("fill_pct", 0.0)) or 0.0)
         else:
-            ob_state = "FRESH"
-            ob["fill_pct"] = 0.0
-            ob["status"] = ob_state
+            ob = None
+
     liq_name, liq_direction = getattr(liq, "event", "UNKNOWN"), getattr(liq, "direction", "UNKNOWN")
     if decision.setup_type == "FAILED_AUCTION_REVERSAL":
         liq_name, liq_direction = "FAILED_AUCTION", "BULLISH" if side == "BUY" else "BEARISH"
