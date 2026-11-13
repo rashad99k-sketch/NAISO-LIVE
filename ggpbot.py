@@ -9868,20 +9868,24 @@ def daily_loss_cooldown_active():
                           debounce_key="loss_cooldown_balance_unavailable", debounce_sec=30)
             return True
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        state_changed = False
         if _LOSS_COOLDOWN_STATE.get("utc_day") != today or not _LOSS_COOLDOWN_STATE.get("peak_balance"):
             _LOSS_COOLDOWN_STATE.update({"utc_day": today, "peak_balance": float(bal)})
+            state_changed = True
         elif float(bal) > float(_LOSS_COOLDOWN_STATE["peak_balance"]):
             _LOSS_COOLDOWN_STATE["peak_balance"] = float(bal)
+            state_changed = True
         peak = float(_LOSS_COOLDOWN_STATE.get("peak_balance") or bal)
         loss_pct = max(0.0, (peak - float(bal)) / peak * 100.0) if peak > 0 else 0.0
         STATE["daily_peak_balance"] = peak
         STATE["last_trade_day"] = today
-        try:
-            _persist_loss_cooldown_state()
-        except Exception as exc:
-            STATE["loss_cooldown_persistence_failed"] = True
-            log_execution(f"[LOSS_COOLDOWN] state persistence failed; entries fail-closed: {exc}", "ERROR")
-            return True
+        if state_changed:
+            try:
+                _persist_loss_cooldown_state()
+            except Exception as exc:
+                STATE["loss_cooldown_persistence_failed"] = True
+                log_execution(f"[LOSS_COOLDOWN] state persistence failed; entries fail-closed: {exc}", "ERROR")
+                return True
         if loss_pct >= MAX_DAILY_LOSS_PCT:
             until = now + LOSS_COOLDOWN_SECONDS
             _LOSS_COOLDOWN_STATE.update({"until": until, "triggered_at": now,
