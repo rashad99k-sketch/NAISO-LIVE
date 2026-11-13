@@ -6059,10 +6059,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
             "scalp_target_selected_pct": 0.0, "scalp_target_selection_reason": "",
 
-            "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
-            "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
-            "scalp_target_selected_pct": 0.0, "scalp_target_selection_reason": "",
-
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
             "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
             "execution_unresolved": False, "close_reconciliation_required": False,
