@@ -171,6 +171,10 @@ def classify_zone_event(candles: Sequence[Dict[str, Any]], *, side: str,
     back_inside = last["close"] <= boundary and last["close"] >= lo if side == "BUY" else last["close"] >= boundary and last["close"] <= hi
     # A prior confirmed close outside, followed by close back inside = failed breakout.
     prior_out = prev["close"] > boundary if side == "BUY" else prev["close"] < boundary
+    prior_was_reentry = (
+        prev["close"] <= boundary and prev["close"] >= lo
+        if side == "BUY" else prev["close"] >= boundary and prev["close"] <= hi
+    )
     if prior_out and back_inside:
         return {"event": ZoneEvent.FAILED_BREAKOUT.value, "confirmed": True, "level": boundary,
                 "confidence": 0.78, "reason_codes": ["prior_close_outside", "subsequent_close_reentered_zone"], "timestamp": ts}
@@ -259,6 +263,15 @@ def advance_failed_breakout_confirmation(*, previous_event: str,
     streak_n = max(0, int(_num(previous_streak) or 0))
     timeframe = _num(timeframe_seconds)
     if event == ZoneEvent.FAILED_BREAKOUT.value:
+        if (
+            prev_event == ZoneEvent.FAILED_BREAKOUT.value
+            and prev_ts is not None and ts is not None
+            and timeframe is not None and timeframe > 0
+            and ts > prev_ts
+            and (ts - prev_ts) <= timeframe * 1.5
+            and streak_n >= 1
+        ):
+            return ZoneEvent.FAILED_BREAKOUT.value, streak_n + 1
         return ZoneEvent.FAILED_BREAKOUT.value, 1
     if (
         prev_event == ZoneEvent.FAILED_BREAKOUT.value
