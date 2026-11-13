@@ -3439,7 +3439,13 @@ class LiveTradeManager:
                         STATE["opposing_liquidity_level"] = safe_float(_pool.get("level"), 0.0)
                         STATE["opposing_liquidity_distance_pct"] = safe_float(_pool.get("distance_pct"), 0.0)
                         STATE["opposing_liquidity_timestamp"] = closed_candle_ts
-                        if _pool.get("status") == "VALID":
+                        _existing_scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
+                        _existing_scalp_status = str(STATE.get("scalp_target_status") or "UNKNOWN").upper()
+                        # Latch the first valid entry-anchored target for this trade.
+                        # Later swing-pool changes must never move a profit target farther away.
+                        if _existing_scalp_status == "VALID" and _existing_scalp_target > 0:
+                            pass
+                        elif _pool.get("status") == "VALID":
                             _scalp_plan = build_scalp_target(side, entry, _pool.get("level"))
                             STATE["scalp_target_status"] = _scalp_plan.get("status", "UNKNOWN")
                             STATE["scalp_target_price"] = safe_float(_scalp_plan.get("target_price"), 0.0)
