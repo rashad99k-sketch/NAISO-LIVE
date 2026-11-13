@@ -10571,6 +10571,52 @@ def smart_opportunity_selection():
                 continue
             live_price = get_ticker_safe(exchange_sym)
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
+
+            # Final no-chase check uses the actual execution reference price, not only
+            # the earlier closed-candle analysis price. This closes the post-scan drift gap.
+            atr_for_location = float(atr_value)
+            actionable_distances = []
+            ob_for_location = item.get("order_block")
+            if isinstance(ob_for_location, dict) and ob_for_location.get("valid", True):
+                try:
+                    if float(ob_for_location.get("strength", 0) or 0) >= 5.0:
+                        ob_low = float(ob_for_location.get("low"))
+                        ob_high = float(ob_for_location.get("high"))
+                        if 0 < ob_low < ob_high:
+                            actionable_distances.append(max(ob_low - price, 0.0, price - ob_high) / atr_for_location)
+                except (TypeError, ValueError):
+                    pass
+            fvg_for_location = item.get("fvg")
+            if isinstance(fvg_for_location, dict):
+                try:
+                    expected_fvg = "BULLISH" if side == "BUY" else "BEARISH"
+                    if (str(fvg_for_location.get("direction", "")).upper() == expected_fvg
+                            and str(fvg_for_location.get("status", "")).upper() in ("UNFILLED", "PARTIALLY_FILLED")
+                            and float(fvg_for_location.get("size_atr", 0) or 0) >= 0.08):
+                        fvg_low = float(fvg_for_location.get("lower"))
+                        fvg_high = float(fvg_for_location.get("upper"))
+                        if 0 < fvg_low < fvg_high:
+                            actionable_distances.append(max(fvg_low - price, 0.0, price - fvg_high) / atr_for_location)
+                except (TypeError, ValueError):
+                    pass
+            golden_for_location = item.get("golden_zone") if isinstance(item.get("golden_zone"), dict) else {}
+            sr_for_location = golden_for_location.get("aligned_sr_zone")
+            if isinstance(sr_for_location, dict) and str(sr_for_location.get("status", "")).upper() == "CONFIRMED":
+                try:
+                    sr_low, sr_high = float(sr_for_location.get("low")), float(sr_for_location.get("high"))
+                    if 0 < sr_low < sr_high and float(sr_for_location.get("strength", 0) or 0) >= 5.0:
+                        actionable_distances.append(max(sr_low - price, 0.0, price - sr_high) / atr_for_location)
+                except (TypeError, ValueError):
+                    pass
+            if not actionable_distances or min(actionable_distances) > 1.5:
+                item["decision_state"] = "NO_CHASE"
+                item["rejection_reason"] = "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE"
+                log_execution(
+                    f"[LOCATION_FIRST] {exchange_sym} {side} blocked: no actionable zone within 1.5 ATR at execution price",
+                    "WARN",
+                )
+                continue
+
             setup = str(item.get("decision_setup_type") or item.get("setup_type", "")).upper()
             if not ("REVERSAL" in setup or "CONTINUATION" in setup):
                 item["decision_state"] = "REJECTED"
