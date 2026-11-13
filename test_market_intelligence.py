@@ -3,7 +3,7 @@ import pytest
 from ggp_market_intelligence import (
     TradingMode, EntryBehavior, ZoneEvent,
     classify_trading_mode, classify_entry_behavior, classify_zone_event,
-    build_intelligence_decision,
+    build_intelligence_decision, advance_failed_breakout_confirmation,
 )
 
 
@@ -116,8 +116,8 @@ def test_build_decision_never_grants_unproven_behavior():
 def test_zone_event_is_directional_for_sell_breakout():
     rows = [
         candle(1, 100, 101, 99, 99.5),
-        candle(2, 99.5, 100, 97, 97.5),
-        candle(3, 97.5, 99, 96, 97),
+        candle(2, 97.8, 97.9, 96.9, 97.2),
+        candle(3, 97.2, 97.7, 96.0, 97.0),
     ]
     result = classify_zone_event(rows, side="SELL", zone_low=98, zone_high=100, atr=1)
     assert result["event"] == ZoneEvent.BREAKOUT_CONFIRMED.value
@@ -263,6 +263,56 @@ def test_duplicate_failed_breakout_candle_does_not_increment_streak():
     previous_ts = 100.0
     duplicate_ts = 100.0
     next_ts = 115.0
-    assert duplicate_ts > previous_ts is False
+    assert (duplicate_ts > previous_ts) is False
     assert next_ts > previous_ts is True
     assert next_ts - previous_ts <= 15.0 * 1.5
+
+
+
+def test_failed_breakout_confirmation_latches_across_next_inside_candle():
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="BREAKOUT_PENDING", previous_timestamp=100,
+        previous_streak=0, current_event="FAILED_BREAKOUT",
+        current_timestamp=115, timeframe_seconds=15)
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 1
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event=event, previous_timestamp=115,
+        previous_streak=streak, current_event="INSIDE_ZONE",
+        current_timestamp=130, timeframe_seconds=15)
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 2
+
+
+def test_failed_breakout_confirmation_resets_on_duplicate_or_unrelated_event():
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="FAILED_BREAKOUT", previous_timestamp=115,
+        previous_streak=1, current_event="INSIDE_ZONE",
+        current_timestamp=115, timeframe_seconds=15)
+    assert event == ZoneEvent.INSIDE_ZONE.value
+    assert streak == 0
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="FAILED_BREAKOUT", previous_timestamp=115,
+        previous_streak=1, current_event="BREAKOUT_CONFIRMED",
+        current_timestamp=130, timeframe_seconds=15)
+    assert event == ZoneEvent.BREAKOUT_CONFIRMED.value
+    assert streak == 0
+
+
+def test_failed_breakout_confirmation_resets_after_time_gap():
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="FAILED_BREAKOUT", previous_timestamp=100,
+        previous_streak=1, current_event="INSIDE_ZONE",
+        current_timestamp=140, timeframe_seconds=15)
+    assert event == ZoneEvent.INSIDE_ZONE.value
+    assert streak == 0
+
+
+def test_breakout_retest_requires_touch_after_initial_acceptance():
+    rows = [
+        candle(1, 99, 101, 98.5, 99.5),
+        candle(2, 100.5, 103, 100, 102.5),
+        candle(3, 102.5, 103, 102.0, 102.7),
+    ]
+    result = classify_zone_event(rows, side="BUY", zone_low=99, zone_high=102, atr=1)
+    assert result["event"] == ZoneEvent.BREAKOUT_RETEST.value
