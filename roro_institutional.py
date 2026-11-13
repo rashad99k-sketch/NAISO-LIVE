@@ -461,7 +461,9 @@ class ContinuationEngine:
                 int(x.timestamp.iloc[bos_idx]), broken_level, None, 55.0,
             )
         # Prefer a nearby causal zone, but keep a shallow pullback path for strong trends.
-        if causal_level is not None:
+        if causal_level is not None and not context.get("location_first_required"):
+            # Preserve the legacy external-level fallback only for legacy callers.
+            # Strict location-first mode must retest an actual validated OB/FVG/SR zone.
             zones.insert(0, (float(causal_level), float(causal_level), "CAUSAL_LEVEL", int(x.timestamp.iloc[bos_idx])))
         retest_idx = None; pullback_type = None; retest_zone = None
         for r in range(bos_idx + 1, len(x) - 1):
