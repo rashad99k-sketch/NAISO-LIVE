@@ -80,6 +80,7 @@ from ggp_market_data import (
     FETCH_MIN_CANDLES,
     timeframe_seconds as _timeframe_seconds,
 )
+from ggp_market_intelligence import classify_zone_event
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -3456,7 +3457,9 @@ class LiveTradeManager:
             f"  Snapshot Version: {int(safe_float(STATE.get('indicator_snapshot_version'), 0))}\n"
             f"  Last Closed Candle: {safe_float(STATE.get('last_management_closed_candle_ts'), 0.0)}\n"
             f"  Calculation Timestamp: {safe_float(STATE.get('indicator_calc_ts'), now):.3f}\n"
-            f"  Freshness: {STATE.get('last_market_data_freshness', 'UNKNOWN')}\n"
+            f"  Freshness: {STATE.get('last_market_data_freshness', 'UNKNOWN')}\n"            f"  Trading Mode: {STATE.get('entry_trading_mode', 'UNCLASSIFIED')}\n"
+            f"  Entry Behavior: {STATE.get('entry_behavior', 'WAIT_FOR_STRUCTURE')}\n"
+            f"  Zone Event: {(STATE.get('market_intelligence') or {}).get('zone_event', 'INSUFFICIENT_DATA')}\n"
             f"  Update Status: UPDATED",
             "INFO", debounce_key=f"ind_refresh_{symbol}", debounce_sec=15)
 
@@ -3564,6 +3567,10 @@ class LiveTradeManager:
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
+            "market_intelligence": dict(STATE.get("market_intelligence") or {}),
+            "zone_event": str((STATE.get("market_intelligence") or {}).get("zone_event", "INSUFFICIENT_DATA")),
+            "entry_trading_mode": str(STATE.get("entry_trading_mode", "UNCLASSIFIED")),
+            "entry_behavior": str(STATE.get("entry_behavior", "WAIT_FOR_STRUCTURE")),
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
             "partial_done": STATE.get("partial_closed", False),
             "execution_unresolved": STATE.get("execution_unresolved", False),
@@ -4880,6 +4887,12 @@ STATE = {
     "peak_roe": 0.0,
     "peak_drawdown_roe": 0.0,
     "ema_profit_state": "INSUFFICIENT_DATA",
+            "market_intelligence": {},
+            "entry_trading_mode": str((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("mode", "UNCLASSIFIED")),
+            "entry_behavior": str((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("entry_behavior", "WAIT_FOR_STRUCTURE")),
+            "entry_behavior_confidence": safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("confidence", 0.0), 0.0),
+            "entry_behavior_reasons": list((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("reason_codes", [])),
+            "zone_reference_level": safe_float((_INSTITUTIONAL_ENTRY_CONTEXT or {}).get("market_intelligence", {}).get("reference_level", 0.0), 0.0),
     "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
     "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
     "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
