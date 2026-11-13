@@ -537,17 +537,24 @@ CACHE = {
 }
 _last_api_call = 0.0
 MIN_API_INTERVAL = _env_float_range("MIN_API_INTERVAL", 0.35, 0.20, 2.0)
+# BingX documents the USDT-M swap kline endpoint at 1 request/second per IP.
+# Keep the slower market-data endpoint pacing distinct from the generic
+# account/management request scheduler and serialize it across all workers.
+BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.0, 2.0)
+_API_METHOD_MIN_INTERVALS = {"fetch_ohlcv": BINGX_KLINE_MIN_INTERVAL}
 _API_RATE_LOCK = threading.Lock()
 _LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
-def rate_limit():
-    """Serialize request-start scheduling across scanner and management threads."""
+def rate_limit(func=None):
+    """Serialize API request starts, applying endpoint-specific minimum spacing."""
     global _last_api_call
+    method_name = getattr(func, "__name__", "") if func is not None else ""
+    min_interval = max(MIN_API_INTERVAL, _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL))
     with _API_RATE_LOCK:
         now = time.monotonic()
         elapsed = now - _last_api_call
-        if elapsed < MIN_API_INTERVAL:
-            time.sleep(MIN_API_INTERVAL - elapsed)
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
         _last_api_call = time.monotonic()
 
 CACHE_LOCK = threading.RLock()
@@ -580,7 +587,7 @@ def safe_api_call(func, *args, **kwargs):
     # create_order call: BingX may have accepted the first request already.
     is_order_write = getattr(func, "__name__", "") in {"create_order", "create_market_order", "create_limit_order"}
     if is_order_write:
-        rate_limit()
+        rate_limit(func)
         try:
             return func(*args, **kwargs)
         except Exception as exc:
@@ -598,7 +605,7 @@ def safe_api_call(func, *args, **kwargs):
             raise
     for attempt in range(3):
         try:
-            rate_limit()
+            rate_limit(func)
             return func(*args, **kwargs)
         except Exception as e:
             if "rate limit" in str(e).lower() or "100410" in str(e):

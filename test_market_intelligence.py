@@ -992,3 +992,64 @@ def test_price_patterns_are_exposed_by_institutional_bridge_as_observational_con
     assert "classify_price_pattern" in source
     assert '_intelligence["price_pattern"]' in source
     assert "closed.to_dict(\"records\")" in source
+
+
+def test_fvg_direction_gate_is_explicit_and_fails_closed_for_both_sides():
+    from ggp_institutional_bridge import _fvg_matches_side
+
+    bullish = {"direction": "BULLISH", "status": "UNFILLED"}
+    bearish = {"direction": "BEARISH", "status": "PARTIALLY_FILLED"}
+    invalidated = {"direction": "BULLISH", "status": "INVALIDATED"}
+
+    assert _fvg_matches_side(bullish, "BUY")
+    assert _fvg_matches_side(bearish, "SELL")
+    assert not _fvg_matches_side(bullish, "SELL")
+    assert not _fvg_matches_side(bearish, "BUY")
+    assert not _fvg_matches_side(invalidated, "BUY")
+    assert not _fvg_matches_side(None, "BUY")
+    assert not _fvg_matches_side(bullish, "UNKNOWN")
+
+
+def test_institutional_analyzer_uses_local_side_aware_fvg_gate():
+    from pathlib import Path
+
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    start = source.index("def analyze_symbol(")
+    end = source.index("\ndef analyze_symbol_both(", start)
+    analyzer_source = source[start:end]
+    assert "fvg_ok = _fvg_matches_side(fvg, side)" in analyzer_source
+    assert "fvg.get(\"direction\") == expected" not in analyzer_source
+
+
+def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
+    import ggpbot as bot
+
+    clock = [100.0]
+    waits = []
+
+    def fake_monotonic():
+        return clock[0]
+
+    def fake_sleep(seconds):
+        waits.append(float(seconds))
+        clock[0] += float(seconds)
+
+    def fetch_ohlcv():
+        return None
+
+    def fetch_ticker():
+        return None
+
+    monkeypatch.setattr(bot.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(bot.time, "sleep", fake_sleep)
+    monkeypatch.setattr(bot, "_last_api_call", 100.0)
+    monkeypatch.setattr(bot, "BINGX_KLINE_MIN_INTERVAL", 1.05)
+    monkeypatch.setitem(bot._API_METHOD_MIN_INTERVALS, "fetch_ohlcv", 1.05)
+
+    bot.rate_limit(fetch_ohlcv)
+    assert waits[-1] == pytest.approx(1.05)
+
+    waits.clear()
+    monkeypatch.setattr(bot, "_last_api_call", clock[0])
+    bot.rate_limit(fetch_ticker)
+    assert waits[-1] == pytest.approx(bot.MIN_API_INTERVAL)

@@ -431,6 +431,18 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     }
 
 
+def _fvg_matches_side(fvg: Any, side: str) -> bool:
+    """Fail-closed FVG direction gate used by the institutional analyzer."""
+    direction = str(side or "").upper()
+    expected_direction = "BULLISH" if direction == "BUY" else "BEARISH" if direction == "SELL" else ""
+    return bool(
+        expected_direction
+        and isinstance(fvg, dict)
+        and str(fvg.get("direction") or "").upper() == expected_direction
+        and str(fvg.get("status") or "").upper() in {"UNFILLED", "PARTIALLY_FILLED"}
+    )
+
+
 def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
                    now_ms: Optional[int] = None) -> Dict[str, Any]:
     x = _frame(df)
@@ -485,8 +497,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
                      and ob_state not in ("MITIGATED", "INVALIDATED"))
         except (TypeError, ValueError):
             ob_ok = False
-    fvg_ok = bool(isinstance(fvg, dict) and fvg.get("direction") == expected
-                 and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
+    fvg_ok = _fvg_matches_side(fvg, side)
     d, golden = _decision_result(decision), context["golden_zone"]
     # Explainable mode/entry-behavior classification. This is analytical metadata only;
     # UnifiedEntryAuthority and execute_entry remain the sole entry authorization path.
