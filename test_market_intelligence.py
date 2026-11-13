@@ -927,7 +927,7 @@ def _flat_level_fixture(direction="TOP", breakout=True):
     rows = []
     for idx in range(10):
         low = 105.0 + idx * 0.10 if direction == "TOP" else 105.0 - idx * 0.10
-        high = 110.0 if direction == "TOP" else 109.0 - idx * 0.10
+        high = 110.0 if direction == "TOP" else 104.0 - idx * 0.08
         open_price = low + 1.2
         close = low + 1.8
         # Oscillating closes avoid manufacturing a strong directional impulse.
