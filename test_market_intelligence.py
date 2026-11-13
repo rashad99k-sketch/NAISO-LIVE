@@ -5,7 +5,7 @@ from ggp_market_intelligence import (
     classify_trading_mode, classify_entry_behavior, classify_zone_event,
     build_intelligence_decision, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, select_opposing_liquidity_pool,
-    select_scalp_target_pct, build_scalp_target,
+    select_scalp_target_pct, build_scalp_target, classify_price_pattern,
 )
 
 
@@ -884,3 +884,111 @@ def test_scalp_target_distance_is_measured_from_entry_not_moving_mark():
     assert 'STATE.get("scalp_target_price")' in source
     assert 'STATE.get("scalp_target_tp1_price")' in source
     assert '"scalp_target_price": safe_float(STATE.get("scalp_target_price"), 0.0)' in source
+
+
+def _pattern_candle(open_price, high, low, close, volume=100):
+    return {"open": open_price, "high": high, "low": low, "close": close, "volume": volume}
+
+
+def _bull_flag_fixture(breakout=True):
+    rows = []
+    price = 100.0
+    for _ in range(8):
+        rows.append(_pattern_candle(price, price + 0.65, price - 0.10, price + 0.55, 100))
+        price += 0.55
+    flag_price = price
+    for idx in range(6):
+        open_price = flag_price - idx * 0.15
+        close = open_price - 0.15
+        rows.append(_pattern_candle(open_price, open_price + 0.10, close - 0.10, close, 50))
+    ceiling = max(row["high"] for row in rows[-6:])
+    rows.append(_pattern_candle(ceiling, ceiling + 0.45, ceiling - 0.05,
+                                ceiling + (0.30 if breakout else 0.02), 130))
+    return rows
+
+
+def _bear_flag_fixture(breakout=True):
+    rows = []
+    price = 120.0
+    for _ in range(8):
+        rows.append(_pattern_candle(price, price + 0.10, price - 0.65, price - 0.55, 100))
+        price -= 0.55
+    for idx in range(6):
+        open_price = price + idx * 0.15
+        close = open_price + 0.15
+        rows.append(_pattern_candle(open_price, close + 0.10, open_price - 0.10, close, 50))
+    floor = min(row["low"] for row in rows[-6:])
+    rows.append(_pattern_candle(floor, floor + 0.05, floor - 0.45,
+                                floor - (0.30 if breakout else 0.02), 130))
+    return rows
+
+
+def _flat_level_fixture(direction="TOP", breakout=True):
+    rows = []
+    for idx in range(10):
+        low = 105.0 + idx * 0.10 if direction == "TOP" else 105.0 - idx * 0.10
+        high = 110.0 if direction == "TOP" else 109.0 - idx * 0.10
+        open_price = low + 1.2
+        close = low + 1.8
+        # Oscillating closes avoid manufacturing a strong directional impulse.
+        if idx % 2:
+            open_price, close = close, open_price
+        if direction == "BOTTOM":
+            high = low + 4.0
+            low = 100.0
+            open_price, close = 102.0 + (idx % 2) * 0.1, 102.5 - (idx % 2) * 0.1
+        rows.append(_pattern_candle(open_price, high, low, close, 80))
+    if direction == "TOP":
+        rows.append(_pattern_candle(109.4, 110.6 if breakout else 110.1, 109.2,
+                                    110.3 if breakout else 109.8, 150))
+    else:
+        rows.append(_pattern_candle(100.6, 100.8, 99.4 if breakout else 99.9,
+                                    99.7 if breakout else 100.1, 150))
+    return rows
+
+
+def test_bull_flag_is_recognized_on_closed_candles_and_breakout_is_distinct():
+    forming = classify_price_pattern(_bull_flag_fixture(False), atr=1.0)
+    confirmed = classify_price_pattern(_bull_flag_fixture(True), atr=1.0)
+    assert forming["pattern"] == "BULL_FLAG"
+    assert forming["stage"] == "FORMING"
+    assert confirmed["pattern"] == "BULL_FLAG"
+    assert confirmed["stage"] == "BREAKOUT_CONFIRMED"
+    assert confirmed["direction"] == "BULLISH"
+
+
+def test_bear_flag_is_directional_mirror_of_bull_flag():
+    forming = classify_price_pattern(_bear_flag_fixture(False), atr=1.0)
+    confirmed = classify_price_pattern(_bear_flag_fixture(True), atr=1.0)
+    assert forming["pattern"] == "BEAR_FLAG"
+    assert forming["stage"] == "FORMING"
+    assert confirmed["pattern"] == "BEAR_FLAG"
+    assert confirmed["stage"] == "BREAKOUT_CONFIRMED"
+    assert confirmed["direction"] == "BEARISH"
+
+
+def test_flat_top_and_flat_bottom_patterns_require_repeated_level_tests():
+    top = classify_price_pattern(_flat_level_fixture("TOP", True), atr=1.0)
+    bottom = classify_price_pattern(_flat_level_fixture("BOTTOM", True), atr=1.0)
+    assert top["pattern"] == "FLAT_TOP"
+    assert top["stage"] == "BREAKOUT_CONFIRMED"
+    assert top["direction"] == "BULLISH"
+    assert bottom["pattern"] == "FLAT_BOTTOM"
+    assert bottom["stage"] == "BREAKOUT_CONFIRMED"
+    assert bottom["direction"] == "BEARISH"
+
+
+def test_price_pattern_classifier_fails_closed_on_bad_or_insufficient_data():
+    insufficient = classify_price_pattern([_pattern_candle(10, 11, 9, 10)] * 5, atr=1)
+    malformed = classify_price_pattern([_pattern_candle(10, 9, 8, 10)] * 20, atr=1)
+    assert insufficient["stage"] == "INSUFFICIENT_DATA"
+    assert malformed["stage"] == "INVALID_DATA"
+    assert malformed["confidence"] == 0.0
+
+
+def test_price_patterns_are_exposed_by_institutional_bridge_as_observational_context():
+    from pathlib import Path
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert "classify_price_pattern" in source
+    assert '_intelligence["price_pattern"]' in source
+    assert "closed.to_dict(\"records\")" in source
