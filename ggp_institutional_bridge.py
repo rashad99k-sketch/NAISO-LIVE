@@ -88,11 +88,20 @@ def _atr(df: pd.DataFrame, period: int = 14) -> float:
 
 def _adx(df: pd.DataFrame, period: int = 14) -> float:
     """Wilder ADX from completed OHLC candles; NaN means insufficient evidence."""
-    if not isinstance(df, pd.DataFrame) or len(df) < period * 2 + 1:
+    if (
+        not isinstance(df, pd.DataFrame)
+        or not isinstance(period, int) or period < 2
+        or len(df) < period * 2 + 1
+        or not {"high", "low", "close"}.issubset(df.columns)
+    ):
         return float("nan")
     high = pd.to_numeric(df["high"], errors="coerce")
     low = pd.to_numeric(df["low"], errors="coerce")
     close = pd.to_numeric(df["close"], errors="coerce")
+    if not (np.isfinite(high).all() and np.isfinite(low).all() and np.isfinite(close).all()):
+        return float("nan")
+    if ((high < low).any() or (close > high).any() or (close < low).any()):
+        return float("nan")
     up = high.diff()
     down = -low.diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
