@@ -1176,7 +1176,7 @@ def test_buy_pullback_and_micro_pullback_require_their_own_trigger():
     pullback_rows = [
         candle(1000, 9.0, 9.3, 8.8, 9.1),
         candle(2000, 9.1, 9.5, 8.9, 9.2),
-        candle(3000, 9.2, 10.1, 9.8, 10.0),
+        candle(3000, 9.2, 10.1, 9.1, 10.0),
         candle(4000, 9.8, 10.5, 9.7, 10.3),
     ]
     pullback = validate_entry_behavior_trigger(
