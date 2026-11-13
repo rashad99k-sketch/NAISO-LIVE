@@ -228,7 +228,7 @@ def detect_structure(df: pd.DataFrame) -> Dict[str, Any]:
     # CHoCH is the close through the protected opposite swing against the prior swing sequence.
     choch = "BULLISH_CHOCH" if bear and close > prior_high else "BEARISH_CHOCH" if bull and close < prior_low else None
     result.update({"direction": direction, "pattern": pattern, "bos": bos, "choch": choch,
-                   "mss": choch or bos, "swing_high": prior_high, "swing_low": prior_low,
+                   "mss": choch, "swing_high": prior_high, "swing_low": prior_low,
                    "confirmed": True})
     return result
 
