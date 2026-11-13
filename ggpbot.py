@@ -2468,7 +2468,32 @@ class TradeManagementBoard:
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
 
+        # Structural market intelligence augments the existing thesis score,
+        # but never becomes a parallel close authority. Only a confirmed failed
+        # breakout against the original trade-side zone is eligible as evidence.
+        # Require two consecutive fresh closes back inside before escalating.
+        mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
+        zone_event = str(mi.get("zone_event") or "").upper()
+        zone_confirmed = bool(mi.get("zone_event_confirmed", False))
+        zone_confidence = safe_float(mi.get("zone_event_confidence"), 0.0)
+        zone_side = str(mi.get("zone_side") or side).upper()
+        zone_fresh = bool(mi.get("zone_event_fresh", False))
+        zone_failure_streak = int(max(0, safe_float(mi.get("failed_breakout_streak"), 0)))
+        zone_evidence_valid = (
+            zone_event == "FAILED_BREAKOUT"
+            and zone_confirmed and zone_fresh
+            and zone_side == side and side in {"BUY", "SELL"}
+            and zone_confidence >= 0.75
+            and zone_failure_streak >= 2
+        )
         thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
+        thesis_reasons = list(ctx.get("thesis_failure_reasons") or [])
+        if zone_evidence_valid:
+            # Add a bounded evidence increment; thesis_failure_action and its
+            # existing profitability/structural gates remain the only decider.
+            thesis_score = min(100.0, thesis_score + 18.0)
+            thesis_reasons.append("confirmed_failed_breakout_reentry")
+
         thesis_action, thesis_reason = thesis_failure_action(
             side, roe, thesis_score, ctx.get("thesis_failure_reasons") or [],
             structural_invalidation=bool(ctx.get("structural_invalidation")))
@@ -3620,7 +3645,16 @@ class LiveTradeManager:
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
-            "market_intelligence": dict(STATE.get("market_intelligence") or {}),
+            "market_intelligence": {
+                **(STATE.get("market_intelligence") or {}),
+                "zone_side": str(STATE.get("side") or "").upper(),
+                "zone_event_fresh": (
+                    safe_float(STATE.get("zone_event_last_candle_ts"), 0.0) > 0
+                    and (time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0))
+                    <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                ),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+            },
             "zone_event_confirmed": bool((STATE.get("market_intelligence") or {}).get("zone_event_confirmed", False)),
             "zone_event_confidence": safe_float((STATE.get("market_intelligence") or {}).get("zone_event_confidence"), 0.0),
             "entry_trading_mode": str(STATE.get("entry_trading_mode", "UNCLASSIFIED")),
