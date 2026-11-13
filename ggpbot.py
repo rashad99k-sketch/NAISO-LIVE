@@ -3353,11 +3353,14 @@ class LiveTradeManager:
                             STATE["zone_event_last_candle_ts"] = _event_ts
                             _previous_zone_event = str(STATE.get("zone_event") or "").upper()
                             _previous_zone_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+                            _previous_failure_ts = safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0)
                             _same_failed_event = (
                                 _previous_zone_event == "FAILED_BREAKOUT"
                                 and _zr["event"] == "FAILED_BREAKOUT"
-                                and _previous_zone_ts > 0
-                                and (_event_ts - _previous_zone_ts) <= _timeframe_seconds(INTERVAL) * 1.5
+                                and _previous_failure_ts > 0
+                                and _event_ts > _previous_failure_ts
+                                and (_event_ts - _previous_failure_ts) <= _timeframe_seconds(INTERVAL) * 1.5
+                                and _previous_zone_ts == _previous_failure_ts
                             )
                             _failure_streak = int(safe_float(STATE.get("failed_breakout_streak"), 0))
                             if _zr["event"] == "FAILED_BREAKOUT":
@@ -3663,14 +3666,13 @@ class LiveTradeManager:
             "market_intelligence": {
                 **(STATE.get("market_intelligence") or {}),
                 "zone_side": str(STATE.get("side") or "").upper(),
-                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
-                "failed_breakout_last_candle_ts": safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0),
                 "zone_event_fresh": (
                     safe_float(STATE.get("zone_event_last_candle_ts"), 0.0) > 0
-                    and (time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0))
+                    and 0 <= (time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0))
                     <= max(2 * _timeframe_seconds(INTERVAL), 300)
                 ),
                 "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_last_candle_ts": safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0),
             },
             "zone_event_confirmed": bool((STATE.get("market_intelligence") or {}).get("zone_event_confirmed", False)),
             "zone_event_confidence": safe_float((STATE.get("market_intelligence") or {}).get("zone_event_confidence"), 0.0),
