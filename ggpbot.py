@@ -8834,6 +8834,24 @@ def hourly_cleanup():
             gc.collect()
         except Exception:
             pass
+    # PASSIVE checkpoint is bounded and does not force active readers/writers
+    # to stop. Keep it on the same five-minute maintenance cadence.
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is not None and callable(getattr(journal, "checkpoint_wal", None)):
+        try:
+            checkpoint = journal.checkpoint_wal("PASSIVE")
+            MEMORY["journal_maintenance"] = {
+                **checkpoint,
+                "checked_at": now,
+            }
+            if checkpoint.get("busy"):
+                log_execution(
+                    f"[JOURNAL] WAL checkpoint deferred by active connection: {checkpoint}",
+                    "WARN",
+                )
+        except Exception as exc:
+            log_execution(f"[JOURNAL] passive WAL checkpoint failed: {type(exc).__name__}: {exc}", "WARN")
+
     _last_cleanup = now
     log_execution(f"[RESOURCE] bounded cleanup removed={removed} cache={len(CACHE)}", "INFO")
 
