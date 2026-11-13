@@ -792,3 +792,18 @@ def test_paper_entry_has_one_canonical_intelligence_field_set():
     block = source[start:end]
     for field in ('"entry_zone_low":', '"entry_zone_high":', '"trading_mode":', '"market_intelligence":'):
         assert block.count(field) == 1
+
+
+def test_paper_and_live_entry_reset_liquidity_state_once_each():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    paper_start = source.index('        STATE.update({\n            "open": True, "side": side, "entry": price')
+    paper_end = source.index("        TRADE_STATE.update({", paper_start)
+    paper = source[paper_start:paper_end]
+    assert paper.count('"opposing_liquidity_status":') == 1
+    live_start = source.index('        STATE.update({\n            "open": True, "side": side, "entry": price', source.index("pending_management_state"))
+    live_end = source.index("        TRADE_STATE.update({", live_start)
+    live = source[live_start:live_end]
+    assert live.count('"entry_zone_low":') == 1
+    assert live.count('"trading_mode":') == 1
+
