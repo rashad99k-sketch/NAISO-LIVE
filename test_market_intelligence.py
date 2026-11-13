@@ -5,7 +5,7 @@ from ggp_market_intelligence import (
     classify_trading_mode, classify_entry_behavior, classify_zone_event,
     build_intelligence_decision, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, select_opposing_liquidity_pool,
-    select_scalp_target_pct, build_scalp_target, classify_price_pattern,
+    select_scalp_target_pct, build_scalp_target, classify_price_pattern,\n    build_support_resistance_zones, validate_order_block_zone,
 )
 
 
@@ -1053,3 +1053,77 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
     monkeypatch.setattr(bot, "_last_api_call", clock[0])
     bot.rate_limit(fetch_ticker)
     assert waits[-1] == pytest.approx(bot.MIN_API_INTERVAL)
+
+
+def _sr_fixture():
+    rows = []
+    for idx in range(24):
+        o, c, h, lo = 12.0, 12.1, 13.0, 11.0
+        if idx in (4, 14):
+            lo, h, o, c = 10.0, 12.4, 11.8, 12.1
+        if idx in (9, 19):
+            h, lo, o, c = 14.0, 11.6, 12.2, 11.9
+        rows.append(candle((idx + 1) * 900000, o, h, lo, c))
+    return rows
+
+
+def test_support_resistance_clusters_confirmed_pivots_and_reports_zone_geometry():
+    zones = build_support_resistance_zones(
+        _sr_fixture(), price=12.0, atr=1.0, lookback=120,
+        pivot_span=2, cluster_atr=0.22, min_touches=2,
+    )
+    assert zones["status"] == "VALID"
+    support = next(z for z in zones["supports"] if z["status"] == "CONFIRMED")
+    resistance = next(z for z in zones["resistances"] if z["status"] == "CONFIRMED")
+    assert support["type"] == "SUPPORT"
+    assert support["touches"] >= 2
+    assert support["low"] < support["level"] < support["high"]
+    assert resistance["type"] == "RESISTANCE"
+    assert resistance["touches"] >= 2
+    assert resistance["low"] < resistance["level"] < resistance["high"]
+
+
+def test_support_resistance_fails_closed_on_invalid_or_non_monotonic_candles():
+    invalid = build_support_resistance_zones(_sr_fixture(), price=0, atr=1)
+    assert invalid["status"] == "UNKNOWN"
+    rows = _sr_fixture()
+    rows[-1] = {**rows[-1], "timestamp": rows[-2]["timestamp"]}
+    result = build_support_resistance_zones(rows, price=12, atr=1)
+    assert result["status"] == "UNKNOWN"
+    assert result["reason"] == "non_monotonic_timestamps"
+
+
+def test_bullish_order_block_validation_tracks_partial_mitigation_and_invalidation():
+    zone = {"low": 9.0, "high": 9.8, "strength": 7.0,
+            "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
+    candles = [
+        candle(1000, 9.5, 9.9, 9.0, 9.2),
+        candle(2000, 9.2, 10.2, 9.1, 10.1),
+        candle(3000, 10.1, 10.5, 9.5, 10.2),
+    ]
+    valid = validate_order_block_zone(
+        side="BUY", zone=zone, candles=candles, atr=1.0,
+    )
+    assert valid["valid"] is True
+    assert valid["status"] == "PARTIALLY_MITIGATED"
+    broken = candles + [candle(4000, 9.5, 9.7, 8.8, 8.9)]
+    invalid = validate_order_block_zone(
+        side="BUY", zone=zone, candles=broken, atr=1.0,
+    )
+    assert invalid["valid"] is False
+    assert invalid["status"] == "INVALIDATED"
+
+
+def test_bearish_order_block_validation_is_directionally_symmetric():
+    zone = {"low": 10.2, "high": 11.0, "strength": 7.0,
+            "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
+    candles = [
+        candle(1000, 10.5, 11.0, 10.1, 10.8),
+        candle(2000, 10.8, 10.9, 9.8, 9.9),
+        candle(3000, 9.9, 10.5, 9.5, 9.8),
+    ]
+    valid = validate_order_block_zone(side="SELL", zone=zone, candles=candles, atr=1.0)
+    assert valid["valid"] is True
+    broken = candles + [candle(4000, 10.7, 11.2, 10.6, 11.1)]
+    invalid = validate_order_block_zone(side="SELL", zone=zone, candles=broken, atr=1.0)
+    assert invalid["status"] == "INVALIDATED"
