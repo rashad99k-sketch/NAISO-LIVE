@@ -43,6 +43,15 @@ def test_entry_behavior_retest_for_bos_continuation():
     assert behavior == EntryBehavior.RETEST.value
 
 
+def test_bos_level_alone_does_not_force_retest_classification():
+    behavior, _, _ = classify_entry_behavior(
+        setup_type="TREND_CONTINUATION",
+        mss_confirmed=True,
+        bos_level=100,
+    )
+    assert behavior == EntryBehavior.WAIT_FOR_STRUCTURE.value
+
+
 def test_entry_behavior_pullback_for_causal_reversal_zone():
     behavior, _, _ = classify_entry_behavior(setup_type="LIQUIDITY_SWEEP_REVERSAL",
                                                sweep_confirmed=True, mss_confirmed=True,
@@ -70,7 +79,7 @@ def test_single_close_is_pending_and_multiple_closes_confirm():
             candle(3, 103, 105, 102, 104)]
     pending = classify_zone_event(rows[:1] + [candle(2,102,104,101,101.5), rows[2]],
                                   side="BUY", zone_low=99, zone_high=102, atr=1)
-    assert pending["event"] in {ZoneEvent.BREAKOUT_PENDING.value, ZoneEvent.BREAKOUT_CONFIRMED.value}
+    assert pending["event"] == ZoneEvent.BREAKOUT_PENDING.value
     confirmed = classify_zone_event(rows, side="BUY", zone_low=99, zone_high=102, atr=1)
     assert confirmed["event"] == ZoneEvent.BREAKOUT_CONFIRMED.value
 
@@ -79,6 +88,14 @@ def test_failed_breakout_requires_reentry_after_prior_close_outside():
     rows = [candle(1, 101, 104, 100, 103), candle(2, 103, 104, 100, 103),
             candle(3, 103, 104, 99, 101)]
     result = classify_zone_event(rows, side="BUY", zone_low=100, zone_high=102, atr=1)
+    assert result["event"] == ZoneEvent.FAILED_BREAKOUT.value
+    assert result["confirmed"] is True
+
+
+def test_sell_failed_breakout_requires_reentry_above_lower_boundary():
+    rows = [candle(1, 99, 100, 96, 97), candle(2, 97, 99, 96, 97),
+            candle(3, 97, 101, 96, 99)]
+    result = classify_zone_event(rows, side="SELL", zone_low=98, zone_high=100, atr=1)
     assert result["event"] == ZoneEvent.FAILED_BREAKOUT.value
     assert result["confirmed"] is True
 
