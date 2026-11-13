@@ -10215,6 +10215,11 @@ def smart_opportunity_selection():
                 "closed_candle_frame": closed_df.copy(),
                 "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
                 "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
+                "market_intelligence": dict(item.get("market_intelligence") or {}),
+                "trading_mode": str((item.get("market_intelligence") or {}).get("mode", "UNCLASSIFIED")),
+                "entry_behavior": str((item.get("market_intelligence") or {}).get("entry_behavior", "WAIT_FOR_STRUCTURE")),
+                "entry_behavior_confidence": safe_float((item.get("market_intelligence") or {}).get("confidence", 0.0), 0.0),
+                "entry_behavior_reasons": list((item.get("market_intelligence") or {}).get("reason_codes", [])),
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
             try:
