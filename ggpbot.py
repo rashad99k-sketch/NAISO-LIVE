@@ -8816,10 +8816,6 @@ def hourly_cleanup():
             for _, key in dated[:max(0, len(CACHE) - CACHE_MAX_ITEMS)]:
                 CACHE.pop(key, None)
                 removed += 1
-    try:
-        gc.collect()
-    except Exception:
-        pass
     manager = globals().get("INSTITUTIONAL_RESOURCE_MANAGER")
     if manager:
         try:
@@ -8828,6 +8824,16 @@ def hourly_cleanup():
                                           "cleanup_result": result.get("result")}
         except Exception as exc:
             log_execution(f"[RESOURCE] cleanup/metrics unavailable: {exc}", "WARN")
+            # Fall back to one collection only when the resource manager failed.
+            try:
+                gc.collect()
+            except Exception:
+                pass
+    else:
+        try:
+            gc.collect()
+        except Exception:
+            pass
     _last_cleanup = now
     log_execution(f"[RESOURCE] bounded cleanup removed={removed} cache={len(CACHE)}", "INFO")
 
@@ -9683,7 +9689,9 @@ def main_loop_sniper():
             sync_all_states()
             cooldown_active_now = daily_loss_cooldown_active()
             if cooldown_active_now and not (STATE.get("open") or TRADE_STATE.get("in_position")):
-                _loss_cooldown_maintenance()
+                # Keep the normal bounded TTL/resource cleanup alive while entry scanning is paused.
+                # Do not force full GC on every one-second cooldown poll.
+                hourly_cleanup()
                 time.sleep(1)
                 continue
 
@@ -9737,8 +9745,8 @@ def main_loop_sniper():
                         current_pnl = STATE.get("roe_pct", 0.0)
                         update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
             # Drawdown cooldown never force-closes exposure; LiveTradeManager owns exits.
-            if daily_loss_cooldown_active():
-                _loss_cooldown_maintenance()
+            # Cooldown does not own cleanup; the existing bounded lifecycle cleanup does.
+            daily_loss_cooldown_active()
             print_snapshot()
             hourly_cleanup()
             time.sleep(BASE_SLEEP)
@@ -9902,15 +9910,6 @@ def daily_loss_cooldown_active():
                 f"new entries paused for {LOSS_COOLDOWN_SECONDS // 60} minutes; open trade management remains active", "ERROR")
             return True
         return False
-
-
-def _loss_cooldown_maintenance():
-    """Bounded, non-destructive maintenance; never clear trade-management caches or orders."""
-    try:
-        STATE["loss_cooldown_last_gc_collected"] = int(gc.collect())
-        STATE["loss_cooldown_last_gc_ts"] = time.time()
-    except Exception as exc:
-        log_execution(f"[LOSS_COOLDOWN] safe GC maintenance failed: {exc}", "WARN")
 
 
 def _integration_fetch_frame(symbol):
