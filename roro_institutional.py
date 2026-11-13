@@ -175,8 +175,24 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
         for low, high, name, available_ts in levels:
             if name not in ("ORDER_BLOCK", "FVG", "SUPPORT", "RESISTANCE"):
                 continue
-            if available_ts is None or int(available_ts) <= 0:
+            if available_ts is None or int(available_ts) <= 0 or not (0 < low < high):
                 continue
+            if name == "ORDER_BLOCK":
+                ob_data = context.get("order_block") or {}
+                try:
+                    if float(ob_data.get("strength", 0) or 0) < 5.0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if name == "FVG":
+                fvg_data = context.get("fvg") or {}
+                try:
+                    if str(fvg_data.get("status", "")).upper() not in ("UNFILLED", "PARTIALLY_FILLED"):
+                        continue
+                    if float(fvg_data.get("size_atr", 0) or 0) < 0.08:
+                        continue
+                except (TypeError, ValueError):
+                    continue
             timeframe_ms = max(1, int(context.get("timeframe_ms", 900_000)))
             latest_ts = int(context.get("latest_timestamp", available_ts))
             if max(0, latest_ts - int(available_ts)) / timeframe_ms > 48:
