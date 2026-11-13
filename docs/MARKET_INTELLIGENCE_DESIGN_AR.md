@@ -20,5 +20,13 @@ This layer classifies a setup's trading mode (SCALP/TREND/SNIPER), primary entry
 
 A wick alone is not a confirmed breakout. These event labels are evidence for the management board and do not force an exit.
 
+## Runtime wiring
+- The institutional bridge computes Wilder ADX from the validated, completed-candle frame; missing/insufficient ADX remains unknown.
+- A qualified causal Order Block is the primary reference zone. A directionally valid, unfilled FVG is the fallback. Invalid or missing bounds are not fabricated.
+- Mode, entry behavior, confidence, reasons, and reference bounds are copied into the entry context for both the unified institutional path and SNIPER V2 path, then persisted in the active trade state.
+- The live manager uses the canonical `last_closed_ts` and `_closed_candle_frame`; the observer only evaluates completed candles and deduplicates by candle timestamp.
+- A failed breakout is latched only when a close re-enters the zone after an outside close, then confirmed when the next adjacent completed candle remains inside. A duplicate, unrelated event, or time gap resets the streak.
+- The management board may consume this evidence once per trade, only when it is fresh, same-side, confirmed, confidence >= 0.75, and streak >= 2. It is supporting thesis evidence, not a direct close command.
+
 ## Integration status
-The current incremental branch adds an analytical module and tests and passes classification metadata through the institutional bridge and live manager context. It is not a LIVE release. Full pytest/CI, end-to-end paper lifecycle validation, and review of how the live manager consumes zone-event evidence are required before enabling any behavior that changes trade actions.
+The mode label and entry behavior are analytical metadata; they do not replace or bypass the existing RORO entry authority. TradeManagementBoard remains the single routine management decision authority and the existing execution/verification pipeline remains the only order path. This branch is still a review candidate, not a LIVE release. Passing CI does not replace end-to-end PAPER validation of a full entry-to-close lifecycle.
