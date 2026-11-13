@@ -82,7 +82,7 @@ from ggp_market_data import (
 )
 from ggp_market_intelligence import (
     classify_zone_event, advance_failed_breakout_confirmation,
-    is_confirmed_failed_breakout_evidence, build_scalp_target,
+    is_confirmed_failed_breakout_evidence, build_scalp_target, validate_entry_behavior_trigger,
 )
 from ggp_institutional_bridge import build_liquidity_pools
 
@@ -5340,6 +5340,37 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         if price <= 0:
             raise ValueError("Invalid live ticker price")
 
+        # Last-mile guard: re-check the already-confirmed behavior against the
+        # actual exchange ticker immediately before submitting the market order.
+        institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+        if institutional_ctx.get("entry_behavior_gate_passed") is True:
+            intelligence = institutional_ctx.get("market_intelligence")
+            intelligence = intelligence if isinstance(intelligence, dict) else {}
+            atr_for_gate = safe_float(institutional_ctx.get("entry_behavior_atr"), 0.0)
+            low_for_gate = safe_float(institutional_ctx.get("entry_zone_low"), 0.0)
+            high_for_gate = safe_float(institutional_ctx.get("entry_zone_high"), 0.0)
+            level_for_gate = safe_float(institutional_ctx.get("entry_reference_level",
+                                                              intelligence.get("reference_level")), 0.0)
+            final_gate = validate_entry_behavior_trigger(
+                side=side,
+                behavior=str(institutional_ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                candles=(institutional_ctx.get("closed_candle_frame").to_dict("records")
+                         if isinstance(institutional_ctx.get("closed_candle_frame"), pd.DataFrame) else []),
+                entry_price=price, atr=atr_for_gate,
+                zone_low=low_for_gate if low_for_gate > 0 else None,
+                zone_high=high_for_gate if high_for_gate > low_for_gate > 0 else None,
+                reference_level=level_for_gate if level_for_gate > 0 else None,
+                origin_timestamp=institutional_ctx.get("entry_origin_timestamp"),
+            )
+            if not final_gate.get("valid"):
+                log_execution(
+                    f"[ENTRY_BEHAVIOR_FINAL_BLOCK] {sym} {side} actual_price={price:.12g} "
+                    f"reason={final_gate.get('reason')} status={final_gate.get('status')}; "
+                    f"exchange order not submitted",
+                    "WARN",
+                )
+                return None
+
         required_margin = (amount * contract_size * price) / LEVERAGE
         if usdt < required_margin * 1.01:
             log_execution(f"Insufficient margin: need {required_margin:.2f}, have {usdt:.2f}", "ERROR")
@@ -5941,19 +5972,76 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
     institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
-    if not PAPER_MODE and MODE_LIVE and institutional_ctx:
+    if institutional_ctx:
+        # Institutional entry behavior must be proven from the same validated,
+        # closed-candle stream in PAPER and LIVE. No mode may bypass this gate.
         df, candle_diagnostic = resolve_entry_closed_candles(symbol, institutional_ctx)
         if df is None:
-            record_entry_data_rejection(symbol, side, candle_diagnostic)
+            record_entry_data_rejection(symbol, side, candle_diagnostic,
+                                        stage="ENTRY_BEHAVIOR_EXECUTION_GATE")
             log_execution(
-                f"[ENTRY] {candle_diagnostic.get('reason', 'OHLCV_EMPTY')} for authorized "
-                f"institutional setup; LIVE blocked",
+                f"[ENTRY_BEHAVIOR_BLOCK] {symbol} {side}: "
+                f"{candle_diagnostic.get('reason', 'OHLCV_EMPTY')} | closed-candle proof unavailable",
                 "ERROR",
             )
             return False
     else:
-        # Preserve the existing PAPER and legacy/manual data path.
+        # Preserve the existing legacy/manual data path.
         df = get_ohlcv_safe(symbol, 100)
+
+    if institutional_ctx:
+        market_intelligence = institutional_ctx.get("market_intelligence")
+        market_intelligence = market_intelligence if isinstance(market_intelligence, dict) else {}
+        behavior = str(institutional_ctx.get("entry_behavior") or
+                       market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE").upper()
+        gate_atr_series = compute_atr(df) if df is not None else None
+        gate_atr = safe_float(gate_atr_series.iloc[-1], 0.0) if gate_atr_series is not None and len(gate_atr_series) else 0.0
+        zone_low = safe_float(institutional_ctx.get("entry_zone_low"), 0.0)
+        zone_high = safe_float(institutional_ctx.get("entry_zone_high"), 0.0)
+        reference_level = safe_float(
+            institutional_ctx.get("entry_reference_level", market_intelligence.get("reference_level")), 0.0
+        )
+        gate = validate_entry_behavior_trigger(
+            side=side, behavior=behavior, candles=df.to_dict("records") if df is not None else [],
+            entry_price=reference_price, atr=gate_atr,
+            zone_low=zone_low if zone_low > 0 else None,
+            zone_high=zone_high if zone_high > zone_low > 0 else None,
+            reference_level=reference_level if reference_level > 0 else None,
+            origin_timestamp=institutional_ctx.get("entry_origin_timestamp"),
+        )
+        if not gate.get("valid"):
+            reason_code = str(gate.get("reason") or "entry_behavior_not_confirmed")
+            MEMORY.setdefault("entry_rejection_metrics", {})[reason_code] = (
+                int(MEMORY.setdefault("entry_rejection_metrics", {}).get(reason_code, 0) or 0) + 1
+            )
+            MEMORY.setdefault("no_entry_feed", []).append({
+                "time": time.time(), "symbol": str(symbol), "side": side,
+                "reason": reason_code, "category": str(gate.get("status") or "ENTRY_BEHAVIOR_BLOCK"),
+                "stage": "ENTRY_BEHAVIOR_EXECUTION_GATE",
+            })
+            MEMORY["no_entry_feed"] = MEMORY["no_entry_feed"][-100:]
+            log_execution(
+                f"[ENTRY_BEHAVIOR_BLOCK] {symbol} {side} behavior={behavior} "
+                f"status={gate.get('status')} reason={reason_code} "
+                f"distance_atr={gate.get('distance_atr')} | no order submitted",
+                "WARN",
+            )
+            return False
+        institutional_ctx.update({
+            "entry_behavior_gate_passed": True,
+            "entry_behavior_gate": dict(gate),
+            "entry_behavior_atr": float(gate_atr),
+            "entry_reference_level": reference_level if reference_level > 0 else None,
+            "entry_zone_low": zone_low if zone_low > 0 else None,
+            "entry_zone_high": zone_high if zone_high > zone_low > 0 else None,
+            "closed_candle_frame": df.copy(),
+        })
+        log_execution(
+            f"[ENTRY_BEHAVIOR_CONFIRMED] {symbol} {side} behavior={behavior} "
+            f"reason={gate.get('reason')} confirmation_ts={gate.get('confirmation_timestamp')} "
+            f"distance_atr={gate.get('distance_atr')}",
+            "SUCCESS",
+        )
 
     adx_series = compute_adx(df) if df is not None else None
     adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else 20.0
@@ -10560,6 +10648,8 @@ def smart_opportunity_selection():
                 "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
                 "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
+                "entry_reference_level": safe_float(market_intelligence.get("reference_level"), 0.0),
+                "entry_origin_timestamp": item.get("origin_timestamp"),
                 "entry_behavior_confidence": safe_float(item.get("entry_behavior_confidence", market_intelligence.get("confidence")), 0.0),
                 "entry_behavior_reasons": list(item.get("entry_behavior_reasons") or market_intelligence.get("reason_codes") or []),
                 "market_intelligence": dict(market_intelligence),
