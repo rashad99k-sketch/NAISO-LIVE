@@ -352,7 +352,7 @@ class ReversalEngine:
                 _event_id(symbol, side, setup_name, int(x.timestamp.iloc[sweep_idx])),
                 int(x.timestamp.iloc[sweep_idx]), level, None, 60.0,
             )
-        retest_idx = None; retest_zone = ""
+        retest_idx = None; retest_zone = ""; retest_zone_ts = None
         for r in range(bos_idx + 1, len(x) - 1):
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
@@ -363,6 +363,7 @@ class ReversalEngine:
                 held = float(candle.close) > zlow if side == "BUY" else float(candle.close) < zhigh
                 if touched and held:
                     retest_idx, retest_zone = r, zname
+                    retest_zone_ts = available_ts
                     break
             if retest_idx is not None:
                 break
@@ -397,9 +398,14 @@ class ReversalEngine:
             evidence = ("prior_liquidity_pool", "sweep", "reclaim", "closed_mss", f"post_mss_retest:{retest_zone}", "directional_trigger")
         ts = int(x.timestamp.iloc[sweep_idx])
         score = 75.0 + (10.0 if context.get("volume_confirmed") else 0.0) + (5.0 if context.get("order_block") else 0.0)
+        location_event_id = (
+            _event_id(symbol, side, f"LOCATION:{retest_zone}", int(retest_zone_ts))
+            if context.get("location_first_required") and retest_zone_ts is not None
+            else _event_id(symbol, side, setup_name, ts)
+        )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, setup_name, side,
                                      "reversal_sequence_confirmed", evidence, (),
-                                     _event_id(symbol, side, setup_name, ts), ts, level, stop, min(100.0, score))
+                                     location_event_id, ts, level, stop, min(100.0, score))
 
 
 class ContinuationEngine:
@@ -465,7 +471,7 @@ class ContinuationEngine:
             # Preserve the legacy external-level fallback only for legacy callers.
             # Strict location-first mode must retest an actual validated OB/FVG/SR zone.
             zones.insert(0, (float(causal_level), float(causal_level), "CAUSAL_LEVEL", int(x.timestamp.iloc[bos_idx])))
-        retest_idx = None; pullback_type = None; retest_zone = None
+        retest_idx = None; pullback_type = None; retest_zone = None; retest_zone_ts = None
         for r in range(bos_idx + 1, len(x) - 1):
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
@@ -476,6 +482,7 @@ class ContinuationEngine:
                 holds = float(candle.close) > zlow if bullish else float(candle.close) < zhigh
                 if touches and holds:
                     retest_idx, pullback_type, retest_zone = r, "RETEST" if zname == "BOS_LEVEL" else "PULLBACK", zname
+                    retest_zone_ts = available_ts
                     break
             if retest_idx is not None:
                 break
@@ -531,10 +538,14 @@ class ContinuationEngine:
         evidence = (bos_name, "displacement", f"{pullback_type}:{retest_zone}", "post_retest_trigger", "trend_ema20_ema50_alignment", f"bos_volume_ratio:{volume_ratio:.2f}")
         ts = int(x.timestamp.iloc[bos_idx])
         score = 70.0 + (10.0 if context.get("volume_confirmed") else 0.0) + (5.0 if context.get("order_block") else 0.0)
+        location_event_id = (
+            _event_id(symbol, side, f"LOCATION:{retest_zone}", int(retest_zone_ts))
+            if context.get("location_first_required") and retest_zone_ts is not None
+            else _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts)
+        )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, "TREND_CONTINUATION_RETEST", side,
                                      "continuation_sequence_confirmed", evidence, (),
-                                     _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts), ts,
-                                     broken_level, stop, min(100.0, score))
+                                     location_event_id, ts, broken_level, stop, min(100.0, score))
 
 
 class UnifiedEntryAuthority:
