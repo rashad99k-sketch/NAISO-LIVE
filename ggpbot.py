@@ -83,6 +83,7 @@ from ggp_market_data import (
 from ggp_market_intelligence import (
     classify_zone_event, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, build_scalp_target,
+    build_support_resistance_zones,
 )
 from ggp_institutional_bridge import build_liquidity_pools
 
