@@ -3301,31 +3301,54 @@ class LiveTradeManager:
             try:
                 _zl = safe_float(STATE.get("entry_zone_low"), 0.0)
                 _zh = safe_float(STATE.get("entry_zone_high"), 0.0)
-                _zts = int(safe_float(STATE.get("zone_event_last_candle_ts"), 0))
-                if _zl > 0 and _zh > _zl and len(df_live) >= 3 and int(closed_candle_ts) > _zts:
-                    _zr = classify_zone_event(df_live.tail(12).to_dict("records"), side=side,
-                                               zone_low=_zl, zone_high=_zh, atr=atr)
+                _zts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+                # Normalize the closed-candle frame explicitly: timestamp may be
+                # an index in some exchange/cache paths, so never pass raw pandas
+                # records to the pure classifier without a canonical timestamp.
+                if _zl > 0 and _zh > _zl and len(df_live) >= 3 and closed_candle_ts > _zts:
+                    _zone_frame = df_live.tail(12).copy()
+                    if "timestamp" not in _zone_frame.columns:
+                        _zone_frame["timestamp"] = _zone_frame.index
+                    _zone_rows = []
+                    for _row in _zone_frame[["timestamp", "open", "high", "low", "close"]].to_dict("records"):
+                        _ts_value = safe_float(_row.get("timestamp"), 0.0)
+                        if _ts_value > 1e12:
+                            _ts_value /= 1000.0
+                        _row["timestamp"] = _ts_value
+                        _zone_rows.append(_row)
+                    _zr = classify_zone_event(
+                        _zone_rows, side=side, zone_low=_zl, zone_high=_zh, atr=atr
+                    )
                     if _zr.get("event") != "INSUFFICIENT_DATA":
-                        STATE["zone_event"] = _zr["event"]
-                        STATE["zone_event_last_candle_ts"] = int(_zr.get("timestamp") or closed_candle_ts)
-                        STATE["market_intelligence"] = {
-                            **(STATE.get("market_intelligence") or {}),
-                            "zone_event": _zr["event"],
-                            "zone_event_confirmed": bool(_zr.get("confirmed")),
-                            "zone_event_confidence": safe_float(_zr.get("confidence"), 0.0),
-                            "zone_reference_level": safe_float(_zr.get("level"), 0.0),
-                            "zone_event_reasons": list(_zr.get("reason_codes") or []),
-                            "zone_event_timestamp": STATE["zone_event_last_candle_ts"],
-                        }
-                        record_trade_management_event(
-                            "MARKET_STRUCTURE_EVENT", "CONFIRMED" if _zr.get("confirmed") else "OBSERVED",
-                            dedupe_key=f"zone:{symbol}:{_zr['event']}:{STATE['zone_event_last_candle_ts']}",
-                            dedupe_seconds=0, symbol=symbol, side=side,
-                            reason=_zr["event"], price=mark_price,
-                            reference_level=_zr.get("level"), confidence=_zr.get("confidence"))
+                        _event_ts = safe_float(_zr.get("timestamp"), closed_candle_ts)
+                        # Do not mark a candle processed unless classification
+                        # produced a valid event timestamp.
+                        if _event_ts > _zts:
+                            STATE["zone_event"] = _zr["event"]
+                            STATE["zone_event_last_candle_ts"] = _event_ts
+                            STATE["market_intelligence"] = {
+                                **(STATE.get("market_intelligence") or {}),
+                                "zone_event": _zr["event"],
+                                "zone_event_confirmed": bool(_zr.get("confirmed")),
+                                "zone_event_confidence": safe_float(_zr.get("confidence"), 0.0),
+                                "zone_reference_level": safe_float(_zr.get("level"), 0.0),
+                                "zone_event_reasons": list(_zr.get("reason_codes") or []),
+                                "zone_event_timestamp": _event_ts,
+                            }
+                            record_trade_management_event(
+                                "MARKET_STRUCTURE_EVENT",
+                                "CONFIRMED" if _zr.get("confirmed") else "OBSERVED",
+                                dedupe_key=f"zone:{symbol}:{_zr['event']}:{_event_ts}",
+                                dedupe_seconds=0, symbol=symbol, side=side,
+                                reason=_zr["event"], price=mark_price,
+                                reference_level=_zr.get("level"),
+                                confidence=_zr.get("confidence"),
+                            )
             except Exception as _zone_exc:
-                log_execution(f"[MARKET_INTELLIGENCE] {symbol}: {type(_zone_exc).__name__}",
-                              "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60)
+                log_execution(
+                    f"[MARKET_INTELLIGENCE] {symbol}: {type(_zone_exc).__name__}: {_zone_exc}",
+                    "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60
+                )
 
             STATE["di_plus_live"] = plus_di
             STATE["di_minus_live"] = minus_di
