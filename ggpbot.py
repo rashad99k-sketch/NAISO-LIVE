@@ -3645,6 +3645,76 @@ class LiveTradeManager:
             "emergency_reason": STATE.get("emergency_reason", ""),
         }
 
+        # Closed-candle zone lifecycle; context only, no order side effects.
+        try:
+            _zone_low = safe_float(STATE.get("entry_zone_low"), 0.0)
+            _zone_high = safe_float(STATE.get("entry_zone_high"), 0.0)
+            _last_zone_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+            if _zone_low > 0 and _zone_high > _zone_low and len(df_live) >= 3 and closed_candle_ts > _last_zone_ts:
+                _zone_frame = df_live.tail(12).copy()
+                if "timestamp" not in _zone_frame.columns:
+                    _zone_frame["timestamp"] = _zone_frame.index
+                _zone_rows = []
+                for _candle in _zone_frame[["timestamp", "open", "high", "low", "close"]].to_dict("records"):
+                    _stamp = safe_float(_candle.get("timestamp"), 0.0)
+                    if _stamp > 1e12:
+                        _stamp /= 1000.0
+                    _candle["timestamp"] = _stamp
+                    _zone_rows.append(_candle)
+                _zone_result = classify_zone_event(
+                    _zone_rows, side=side, zone_low=_zone_low, zone_high=_zone_high, atr=atr
+                )
+                if _zone_result.get("event") != "INSUFFICIENT_DATA":
+                    _event_ts = safe_float(_zone_result.get("timestamp"), closed_candle_ts)
+                    if _event_ts > _last_zone_ts:
+                        _prior_event = str(STATE.get("zone_event") or "").upper()
+                        _prior_streak = int(safe_float(STATE.get("failed_breakout_streak"), 0))
+                        _management_event, _failure_streak = advance_failed_breakout_confirmation(
+                            previous_event=_prior_event,
+                            previous_timestamp=_last_zone_ts,
+                            previous_streak=_prior_streak,
+                            current_event=_zone_result["event"],
+                            current_timestamp=_event_ts,
+                            timeframe_seconds=_timeframe_seconds(INTERVAL),
+                        )
+                        _failure_active = (
+                            _management_event == "FAILED_BREAKOUT" and _failure_streak >= 1
+                        )
+                        _previous_mi = STATE.get("market_intelligence") or {}
+                        _mi_confidence = (
+                            max(safe_float(_previous_mi.get("zone_event_confidence"), 0.0),
+                                safe_float(_zone_result.get("confidence"), 0.0))
+                            if _failure_active else safe_float(_zone_result.get("confidence"), 0.0)
+                        )
+                        STATE["zone_event"] = _management_event
+                        STATE["zone_event_last_candle_ts"] = _event_ts
+                        STATE["failed_breakout_streak"] = _failure_streak
+                        STATE["failed_breakout_last_candle_ts"] = _event_ts if _failure_active else 0.0
+                        STATE["market_intelligence"] = {
+                            **_previous_mi,
+                            "zone_event": _management_event,
+                            "raw_zone_event": _zone_result["event"],
+                            "zone_event_confirmed": bool(_zone_result.get("confirmed")) or _failure_active,
+                            "zone_event_confidence": _mi_confidence,
+                            "zone_reference_level": safe_float(_zone_result.get("level"), 0.0),
+                            "zone_event_reasons": list(_zone_result.get("reason_codes") or []),
+                            "zone_event_timestamp": _event_ts,
+                        }
+                        record_trade_management_event(
+                            "MARKET_STRUCTURE_EVENT",
+                            "CONFIRMED" if (_zone_result.get("confirmed") or _failure_active) else "OBSERVED",
+                            dedupe_key=f"zone:{symbol}:{_management_event}:{_event_ts}",
+                            dedupe_seconds=0, symbol=symbol, side=side,
+                            reason=f"{_management_event}; raw={_zone_result['event']}; streak={_failure_streak}",
+                            price=mark_price, reference_level=_zone_result.get("level"),
+                            confidence=_mi_confidence,
+                        )
+        except Exception as _zone_error:
+            log_execution(
+                f"[MARKET_INTELLIGENCE] {symbol}: {type(_zone_error).__name__}: {_zone_error}",
+                "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60
+            )
+
         # ========== GET DECISION FROM BOARD ==========
         decision = self.board.evaluate(context)
         self._last_decision = decision
@@ -4963,6 +5033,14 @@ STATE = {
     "structural_invalidation": False, "thesis_failure_reasons": [],
     "emergency_exit": False, "emergency_reason": None,
     "emergency_source": None, "emergency_ts": 0.0,
+    "zone_event_last_candle_ts": 0.0,
+    "failed_breakout_streak": 0,
+    "failed_breakout_last_candle_ts": 0.0,
+    "failed_breakout_thesis_credit_applied": False,
+    "entry_zone_low": 0.0,
+    "entry_zone_high": 0.0,
+    "entry_behavior_confidence": 0.0,
+    "entry_behavior_reasons": [],
 }
 paper = {"balance": 10000.0, "position": None}
 _ACTIVE_TRADE = False
