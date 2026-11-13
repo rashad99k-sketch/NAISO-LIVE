@@ -518,7 +518,7 @@ def classify_price_pattern(candles: Sequence[Dict[str, Any]], *, atr: Any,
     flat_top = (
         len(top_touches) >= 3 and base_range >= 0.8 * atr_v
         and base_range <= 5.0 * atr_v
-        and newer_lows >= older_lows - 0.10 * atr_v
+        and newer_lows >= older_lows + 0.05 * atr_v
     )
     if flat_top:
         breakout = trigger["close"] > ceiling + 0.05 * atr_v
@@ -526,13 +526,13 @@ def classify_price_pattern(candles: Sequence[Dict[str, Any]], *, atr: Any,
                 "stage": "BREAKOUT_CONFIRMED" if breakout else "FORMING",
                 "direction": "BULLISH", "confidence": 0.82 if breakout else 0.68,
                 "reference_level": round(float(ceiling), 12),
-                "reason_codes": ["three_or_more_resistance_tests", "base_lows_not_collapsing"]
+                "reason_codes": ["three_or_more_resistance_tests", "higher_lows_converging"]
                                 + (["closed_candle_resistance_break"] if breakout else ["waiting_for_resistance_break"])}
 
     flat_bottom = (
         len(bottom_touches) >= 3 and base_range >= 0.8 * atr_v
         and base_range <= 5.0 * atr_v
-        and newer_highs <= older_highs + 0.10 * atr_v
+        and newer_highs <= older_highs - 0.05 * atr_v
     )
     if flat_bottom:
         breakout = trigger["close"] < floor - 0.05 * atr_v
@@ -540,7 +540,7 @@ def classify_price_pattern(candles: Sequence[Dict[str, Any]], *, atr: Any,
                 "stage": "BREAKOUT_CONFIRMED" if breakout else "FORMING",
                 "direction": "BEARISH", "confidence": 0.82 if breakout else 0.68,
                 "reference_level": round(float(floor), 12),
-                "reason_codes": ["three_or_more_support_tests", "base_highs_not_rising"]
+                "reason_codes": ["three_or_more_support_tests", "lower_highs_converging"]
                                 + (["closed_candle_support_break"] if breakout else ["waiting_for_support_break"])}
 
     return {"pattern": "NONE", "stage": "NO_PATTERN",
