@@ -4664,33 +4664,34 @@ def detect_structure_shift(df):
     return None
 
 def get_clustered_zones(df, lookback=120, cluster_pct=0.002):
-    highs = df['high'].values[-lookback:]
-    lows = df['low'].values[-lookback:]
-    swing_highs = []
-    for i in range(2, len(highs)-2):
-        if highs[i] == max(highs[i-2:i+3]):
-            swing_highs.append(highs[i])
-    swing_lows = []
-    for i in range(2, len(lows)-2):
-        if lows[i] == min(lows[i-2:i+3]):
-            swing_lows.append(lows[i])
-    def cluster(points, pct):
-        if not points:
-            return []
-        points = sorted(points)
-        clusters = []
-        current = [points[0]]
-        for p in points[1:]:
-            if abs(p - current[-1]) / p < pct:
-                current.append(p)
-            else:
-                clusters.append(sum(current)/len(current))
-                current = [p]
-        clusters.append(sum(current)/len(current))
-        return clusters
-    res_levels = cluster(swing_highs, cluster_pct)
-    sup_levels = cluster(swing_lows, cluster_pct)
-    return sup_levels, res_levels
+    """Compatibility wrapper over the canonical confirmed S/R zone engine."""
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 20:
+        return [], []
+    try:
+        atr_series = compute_atr(df)
+        atr_value = safe_float(atr_series.iloc[-1], 0.0) if atr_series is not None and len(atr_series) else 0.0
+        price = safe_float(df["close"].iloc[-1], 0.0)
+        if atr_value <= 0 or price <= 0:
+            return [], []
+        zones = build_support_resistance_zones(
+            df.tail(max(20, int(lookback))).to_dict("records"),
+            price=price, atr=atr_value, lookback=lookback,
+            pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=8,
+        )
+        if zones.get("status") != "VALID":
+            return [], []
+        supports = [
+            float(z["level"]) for z in zones.get("supports", [])
+            if z.get("status") == "CONFIRMED" and float(z.get("strength", 0) or 0) >= 5.0
+        ]
+        resistances = [
+            float(z["level"]) for z in zones.get("resistances", [])
+            if z.get("status") == "CONFIRMED" and float(z.get("strength", 0) or 0) >= 5.0
+        ]
+        return supports, resistances
+    except Exception as exc:
+        log_execution(f"[STRUCTURE_ZONES] S/R calculation unavailable: {type(exc).__name__}: {exc}", "WARN")
+        return [], []
 
 def detect_liquidity_cluster(df, lb=20, tol=0.001):
     highs = df['high'].iloc[-lb:]
