@@ -449,3 +449,59 @@ def test_management_board_receives_post_observer_fresh_market_intelligence_snaps
         "decision = self.board.evaluate(context)") if "decision = self.board.evaluate(context)" in segment else True
     assert '"failed_breakout_thesis_credit_applied": bool(' in segment
     assert '"zone_event_fresh": (' in segment
+
+
+def test_actual_pipeline_regime_labels_classify_trend_and_scalp():
+    trend, _, trend_reasons = classify_trading_mode(
+        regime="TREND_CONTINUATION",
+        adx=27.0,
+        continuation_probability=0.74,
+        data_quality="VALID_CLOSED_CANDLES",
+    )
+    assert trend == TradingMode.TREND.value
+    assert "directional_regime" in trend_reasons
+
+    pullback, _, _ = classify_trading_mode(
+        regime="EMA20_PULLBACK",
+        adx=24.0,
+        continuation_probability=0.68,
+        data_quality="VALID_CLOSED_CANDLES",
+    )
+    assert pullback == TradingMode.TREND.value
+
+    scalp, _, scalp_reasons = classify_trading_mode(
+        regime="RANGE_OR_UNCLEAR",
+        adx=16.0,
+        continuation_probability=0.42,
+        liquidity_quality="ADEQUATE",
+        data_quality="VALID_CLOSED_CANDLES",
+    )
+    assert scalp == TradingMode.SCALP.value
+    assert "range_regime" in scalp_reasons
+
+
+def test_bos_without_explicit_mss_does_not_qualify_as_sniper():
+    mode, _, _ = classify_trading_mode(
+        regime="TREND_CONTINUATION",
+        adx=28.0,
+        continuation_probability=0.80,
+        sweep_confirmed=True,
+        mss_confirmed=False,
+        causal_zone_valid=True,
+        data_quality="VALID_CLOSED_CANDLES",
+    )
+    assert mode == TradingMode.TREND.value
+    assert mode != TradingMode.SNIPER.value
+
+
+def test_sniper_requires_all_three_structural_conditions():
+    mode, _, _ = classify_trading_mode(
+        regime="RANGE_OR_UNCLEAR",
+        adx=17.0,
+        continuation_probability=0.40,
+        sweep_confirmed=True,
+        mss_confirmed=True,
+        causal_zone_valid=True,
+        data_quality="VALID_CLOSED_CANDLES",
+    )
+    assert mode == TradingMode.SNIPER.value
