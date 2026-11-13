@@ -86,6 +86,33 @@ def _atr(df: pd.DataFrame, period: int = 14) -> float:
     return float(value) if pd.notna(value) and np.isfinite(value) and value > 0 else float("nan")
 
 
+def _adx(df: pd.DataFrame, period: int = 14) -> float:
+    """Wilder ADX from completed OHLC candles; NaN means insufficient evidence."""
+    if not isinstance(df, pd.DataFrame) or len(df) < period * 2 + 1:
+        return float("nan")
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    previous_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - previous_close).abs(),
+        (low - previous_close).abs(),
+    ], axis=1).max(axis=1)
+    alpha = 1.0 / float(period)
+    atr_wilder = tr.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr_wilder.replace(0, np.nan)
+    minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr_wilder.replace(0, np.nan)
+    denominator = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / denominator
+    value = dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean().iloc[-1]
+    return float(value) if pd.notna(value) and np.isfinite(value) else float("nan")
+
+
 def build_liquidity_pools(df: pd.DataFrame) -> Dict[str, List[float]]:
     """Build prior-known swing and clustered equal-high/low liquidity pools."""
     if not isinstance(df, pd.DataFrame) or len(df) < 12:
@@ -410,12 +437,25 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _disp_atr = None
     try:
         _last = closed.iloc[-1]
-        _prev = closed.iloc[-2]
         _disp_atr = abs(float(_last.close) - float(_last.open)) / max(_atr(closed), 1e-12)
     except Exception:
         pass
+    _adx_value = _adx(closed)
+    # Prefer the causal order block as the primary zone; use a directionally
+    # valid, unfilled FVG only when no qualified OB exists.
+    _zone_low = _zone_high = None
+    if ob_ok and isinstance(ob, dict):
+        _zone_low = float(ob.get("low", 0) or 0)
+        _zone_high = float(ob.get("high", 0) or 0)
+    elif fvg_ok and isinstance(fvg, dict):
+        _zone_low = float(fvg.get("lower", 0) or 0)
+        _zone_high = float(fvg.get("upper", 0) or 0)
+    if not (_zone_low is not None and _zone_high is not None
+            and np.isfinite(_zone_low) and np.isfinite(_zone_high)
+            and 0 < _zone_low < _zone_high):
+        _zone_low = _zone_high = None
     _intelligence = build_intelligence_decision(
-        regime=reg.state, adx=None,
+        regime=reg.state, adx=_adx_value,
         continuation_probability=(float(cont.score) / 100.0 if getattr(cont, "score", None) is not None else None),
         liquidity_quality="GOOD" if float(_liq_conf or 0) >= 65.0 else "UNKNOWN",
         displacement_atr=_disp_atr,
@@ -424,6 +464,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         mss_confirmed=bool(context["structure"].get("mss") or context["structure"].get("bos")),
         causal_zone_valid=bool(ob_ok or fvg_ok),
         bos_level=(context["structure"].get("swing_high") if side == "BUY" else context["structure"].get("swing_low")),
+        reference_low=_zone_low, reference_high=_zone_high,
         volatility_atr=(_atr(closed) / float(context["price"]) * 100.0 if float(context["price"] or 0) > 0 else None),
         data_quality="VALID_CLOSED_CANDLES",
     ).to_dict()
@@ -443,6 +484,13 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "order_block": ob, "order_block_state": ob_state, "fvg": fvg, "golden_zone": golden,
         "volume_ratio": context["volume_ratio"], "volume_confirmed": context["volume_confirmed"],
         "market_intelligence": _intelligence,
+        "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
+        "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
+        "entry_behavior_confidence": float(_intelligence.get("confidence", 0.0) or 0.0),
+        "entry_behavior_reasons": list(_intelligence.get("reason_codes") or []),
+        "entry_zone_low": _intelligence.get("reference_low"),
+        "entry_zone_high": _intelligence.get("reference_high"),
+        "adx": float(_adx_value) if np.isfinite(_adx_value) else None,
         "reversal": _decision_result(rev), "continuation": _decision_result(cont), "entry_status": decision.state,
         "icons": {
             "regime": "📈" if reg.direction == "BULLISH" else "📉" if reg.direction == "BEARISH" else "⚪",
