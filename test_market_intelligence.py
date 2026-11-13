@@ -859,5 +859,7 @@ def test_scalp_target_distance_is_measured_from_entry_not_moving_mark():
     from pathlib import Path
     source = Path("ggpbot.py").read_text(encoding="utf-8")
     assert 'build_scalp_target(side, entry, _pool.get("level"))' in source
+    assert 'if _existing_scalp_status == "VALID" and _existing_scalp_target > 0:' in source
+    assert 'Keep a previously latched target through transient pool-data errors.' in source
     assert 'STATE.get("scalp_target_price")' in source
     assert '"scalp_target_price": safe_float(STATE.get("scalp_target_price"), 0.0)' in source
