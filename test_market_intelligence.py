@@ -646,3 +646,39 @@ def test_failed_breakout_closed_candle_lifecycle_produces_board_eligible_evidenc
     assert not is_confirmed_failed_breakout_evidence(
         {**evidence, "failed_breakout_thesis_credit_applied": True}, "BUY"
     )
+
+
+def test_select_opposing_liquidity_pool_is_directional():
+    assert select_opposing_liquidity_pool([101, 103, 98], "BUY", 100) == {
+        "status": "VALID", "level": 101.0, "distance_pct": 1.0
+    }
+    assert select_opposing_liquidity_pool([101, 97, 95], "SELL", 100) == {
+        "status": "VALID", "level": 97.0, "distance_pct": 3.0
+    }
+
+
+def test_select_opposing_liquidity_pool_fails_closed_on_missing_or_wrong_side_levels():
+    assert select_opposing_liquidity_pool([], "BUY", 100)["status"] == "NO_OPPOSING_POOL"
+    assert select_opposing_liquidity_pool([101, 103], "SELL", 100)["status"] == "NO_OPPOSING_POOL"
+    assert select_opposing_liquidity_pool([float("nan"), "bad"], "BUY", 100)["status"] == "NO_OPPOSING_POOL"
+    assert select_opposing_liquidity_pool([101], "LONG", 100)["status"] == "UNKNOWN"
+
+
+def test_scalp_target_stays_before_opposing_liquidity():
+    assert select_scalp_target_pct(0.80) == (0.5, "largest_target_before_opposing_pool_0.5pct")
+    assert select_scalp_target_pct(2.20) == (2.0, "largest_target_before_opposing_pool_2pct")
+    assert select_scalp_target_pct(0.20)[0] == 0.0
+    assert select_scalp_target_pct(None)[0] == 0.0
+
+
+def test_live_entry_persists_entry_intelligence_and_zone_context():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    start = source.index('        STATE.update({\n            "open": True, "side": side, "entry": price')
+    end = source.index("        TRADE_STATE.update({", start)
+    live_state = source[start:end]
+    assert '"entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low")' in live_state
+    assert '"entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high")' in live_state
+    assert '"trading_mode": str(institutional_entry_ctx.get("trading_mode")' in live_state
+    assert '"entry_behavior": str(institutional_entry_ctx.get("entry_behavior")' in live_state
+    assert '"market_intelligence": {' in live_state
