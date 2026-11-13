@@ -2468,6 +2468,7 @@ class TradeManagementBoard:
                 "opposing_liquidity_level": safe_float(ctx.get("opposing_liquidity_level"), 0.0),
                 "scalp_target_status": str(ctx.get("scalp_target_status") or "UNKNOWN"),
                 "scalp_target_price": safe_float(ctx.get("scalp_target_price"), 0.0),
+                "scalp_target_tp1_price": safe_float(ctx.get("scalp_target_tp1_price"), 0.0),
                 "scalp_target_selected_pct": safe_float(ctx.get("scalp_target_selected_pct"), 0.0),
             }
             self._decision_history.append(meta)
@@ -2534,12 +2535,30 @@ class TradeManagementBoard:
             target_source = ("opposing_liquidity_scalp_target"
                              if scalp_target_status == "VALID" and scalp_target > 0
                              else "adaptive_range_fallback")
-            if range_target > 0 and target_reached(side, current, range_target):
-                return decision(TradeDecisionType.FULL_CLOSE,
-                                f"range_scalp_{target_source}_hit_{safe_float(ctx.get('scalp_target_selected_pct'), safe_float(ctx.get('range_target_move_pct'), 0.5)):.2f}pct",
-                                close_reason="RANGE_SCALP_TARGET", target_price=range_target,
-                                opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0))
-            return decision(TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target",
+            tp1_hit = bool(ctx.get("tp1_hit"))
+            tp2_hit = bool(ctx.get("tp2_hit"))
+            if range_target > 0 and entry > 0:
+                tp1_target = safe_float(ctx.get("scalp_target_tp1_price"), 0.0)
+                if tp1_target <= 0:
+                    tp1_target = entry + (range_target - entry) * 0.5
+                if not tp1_hit and remaining > 0 and initial > 0 and target_reached(side, current, tp1_target):
+                    target_remaining = initial * 0.5
+                    tolerance = max(initial * 0.002, 1e-10)
+                    qty_to_close = max(0.0, remaining - target_remaining)
+                    if qty_to_close <= tolerance:
+                        return decision(TradeDecisionType.HOLD, "range_scalp_tp1_quantity_wait_for_reconciliation")
+                    ratio = min(1.0, qty_to_close / remaining)
+                    return decision(TradeDecisionType.PARTIAL_CLOSE,
+                                    f"range_scalp_{target_source}_tp1_50pct",
+                                    ratio=ratio, target_remaining_qty=target_remaining,
+                                    close_reason="TP1", target_price=tp1_target,
+                                    tp2_target_price=range_target)
+                if tp1_hit and not tp2_hit and target_reached(side, current, range_target):
+                    return decision(TradeDecisionType.FULL_CLOSE,
+                                    f"range_scalp_{target_source}_tp2_runner_exit",
+                                    close_reason="TP2", target_price=range_target,
+                                    opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0))
+            return decision(TradeDecisionType.HOLD, "range_scalp_waiting_for_two_stage_targets",
                             target_price=range_target, target_source=target_source)
 
         # Canonical TP1: reduce the original filled quantity to exactly 50%.
@@ -3449,11 +3468,13 @@ class LiveTradeManager:
                             _scalp_plan = build_scalp_target(side, entry, _pool.get("level"))
                             STATE["scalp_target_status"] = _scalp_plan.get("status", "UNKNOWN")
                             STATE["scalp_target_price"] = safe_float(_scalp_plan.get("target_price"), 0.0)
+                            STATE["scalp_target_tp1_price"] = safe_float(_scalp_plan.get("tp1_target_price"), 0.0)
                             STATE["scalp_target_selected_pct"] = safe_float(_scalp_plan.get("target_pct"), 0.0)
                             STATE["scalp_target_selection_reason"] = str(_scalp_plan.get("reason") or "target_not_available")
                         else:
                             STATE["scalp_target_status"] = "NO_TARGET"
                             STATE["scalp_target_price"] = 0.0
+                            STATE["scalp_target_tp1_price"] = 0.0
                             STATE["scalp_target_selected_pct"] = 0.0
                             STATE["scalp_target_selection_reason"] = "no_verified_opposing_pool"
                         record_trade_management_event(
@@ -3476,6 +3497,7 @@ class LiveTradeManager:
                                 and safe_float(STATE.get("scalp_target_price"), 0.0) > 0):
                             STATE["scalp_target_status"] = "UNKNOWN"
                             STATE["scalp_target_price"] = 0.0
+                            STATE["scalp_target_tp1_price"] = 0.0
                             STATE["scalp_target_selected_pct"] = 0.0
                             STATE["scalp_target_selection_reason"] = "pool_analysis_error"
                         log_execution(
@@ -3689,6 +3711,7 @@ class LiveTradeManager:
             "opposing_liquidity_level": safe_float(STATE.get("opposing_liquidity_level"), 0.0),
             "scalp_target_status": STATE.get("scalp_target_status", "UNKNOWN"),
             "scalp_target_price": safe_float(STATE.get("scalp_target_price"), 0.0),
+            "scalp_target_tp1_price": safe_float(STATE.get("scalp_target_tp1_price"), 0.0),
             "scalp_target_selected_pct": safe_float(STATE.get("scalp_target_selected_pct"), 0.0),
             "scalp_target_selection_reason": str(STATE.get("scalp_target_selection_reason") or ""),
             "opposing_liquidity": {
@@ -5143,6 +5166,7 @@ STATE = {
     "opposing_liquidity_timestamp": 0.0,
     "scalp_target_selected_pct": 0.0,
     "scalp_target_price": 0.0,
+    "scalp_target_tp1_price": 0.0,
     "scalp_target_status": "UNKNOWN",
     "scalp_target_selection_reason": "",
 
@@ -6094,7 +6118,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
             "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
-            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_status": "UNKNOWN", "scalp_target_selection_reason": "",
+            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_tp1_price": 0.0, "scalp_target_status": "UNKNOWN", "scalp_target_selection_reason": "",
 
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
             "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
@@ -6223,7 +6247,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
             "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
-            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0,
+            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_tp1_price": 0.0,
             "scalp_target_status": "UNKNOWN", "scalp_target_selection_reason": "",
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
             "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
