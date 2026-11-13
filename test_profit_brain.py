@@ -3,6 +3,7 @@ from ggp_profit_brain import (
     classify_profit_mode, range_target_price, target_reached,
     select_range_target_pct, tp2_reassessment,
 )
+from ggp_market_intelligence import build_scalp_target
 
 
 def test_unknown_or_missing_data_does_not_trigger_full_close_range_mode():
@@ -116,3 +117,13 @@ def test_ema_context_classifies_aligned_uptrend():
     result = ema_trend_context(frame, "BUY")
     assert result["state"] == "TREND_RIDE"
     assert result["trend_aligned"] is True
+
+
+def test_buy_sell_opposing_liquidity_targets_trigger_in_correct_direction():
+    buy = build_scalp_target("BUY", 100.0, 100.90)
+    sell = build_scalp_target("SELL", 100.0, 99.10)
+    assert buy["status"] == sell["status"] == "VALID"
+    assert target_reached("BUY", 100.5, buy["target_price"])
+    assert not target_reached("BUY", 100.4, buy["target_price"])
+    assert target_reached("SELL", 99.5, sell["target_price"])
+    assert not target_reached("SELL", 99.6, sell["target_price"])
