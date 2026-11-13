@@ -3663,8 +3663,6 @@ class LiveTradeManager:
                 "source": "CLOSED_CANDLE_SWING_POOLS",
                 "timestamp": safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0),
             },
-            "scalp_target_selected_pct": safe_float(STATE.get("scalp_target_selected_pct"), 0.0),
-            "scalp_target_selection_reason": str(STATE.get("scalp_target_selection_reason") or ""),
 
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
@@ -5103,12 +5101,6 @@ STATE = {
     "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
     "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
     "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
-    "opposing_liquidity_status": "UNKNOWN",
-    "opposing_liquidity_level": 0.0,
-    "opposing_liquidity_distance_pct": 0.0,
-    "opposing_liquidity_timestamp": 0.0,
-    "scalp_target_selected_pct": 0.0,
-    "scalp_target_selection_reason": "",
 
     "opposing_liquidity_status": "UNKNOWN",
     "opposing_liquidity_level": 0.0,
