@@ -3414,6 +3414,42 @@ class LiveTradeManager:
                         STATE["profit_mode_candidate_count"] = 0
                 STATE["profit_mode_reason"] = candidate_reason
                 STATE["profit_mode_evidence"] = list(candidate_evidence)
+                # Build one opposing-liquidity snapshot from completed candles per candle.
+                if closed_candle_ts > safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0):
+                    try:
+                        _pool_data = build_liquidity_pools(df_live.tail(120).reset_index(drop=True))
+                        _pool_levels = _pool_data.get("high_pools", []) if side == "BUY" else _pool_data.get("low_pools", [])
+                        _pool = select_opposing_liquidity_pool(_pool_levels, side, mark_price)
+                        STATE["opposing_liquidity_status"] = _pool.get("status", "UNKNOWN")
+                        STATE["opposing_liquidity_level"] = safe_float(_pool.get("level"), 0.0)
+                        STATE["opposing_liquidity_distance_pct"] = safe_float(_pool.get("distance_pct"), 0.0)
+                        STATE["opposing_liquidity_timestamp"] = closed_candle_ts
+                        if _pool.get("status") == "VALID":
+                            _scalp_pct, _scalp_reason = select_scalp_target_pct(_pool.get("distance_pct"))
+                            STATE["scalp_target_selected_pct"] = _scalp_pct
+                            STATE["scalp_target_selection_reason"] = _scalp_reason
+                        else:
+                            STATE["scalp_target_selected_pct"] = 0.0
+                            STATE["scalp_target_selection_reason"] = "no_verified_opposing_pool"
+                        record_trade_management_event(
+                            "OPPOSING_LIQUIDITY_REFRESH", "OBSERVED",
+                            dedupe_key=f"opposing_pool:{symbol}:{side}:{closed_candle_ts}",
+                            dedupe_seconds=0, symbol=symbol, side=side, price=mark_price,
+                            reference_level=STATE["opposing_liquidity_level"],
+                            distance_pct=STATE["opposing_liquidity_distance_pct"],
+                            scalp_target_pct=STATE["scalp_target_selected_pct"],
+                            reason=STATE["scalp_target_selection_reason"],
+                        )
+                    except Exception as _pool_error:
+                        STATE["opposing_liquidity_status"] = "UNKNOWN"
+                        STATE["opposing_liquidity_level"] = 0.0
+                        STATE["opposing_liquidity_distance_pct"] = 0.0
+                        STATE["scalp_target_selected_pct"] = 0.0
+                        STATE["scalp_target_selection_reason"] = "pool_analysis_error"
+                        log_execution(
+                            f"[OPPOSING_LIQUIDITY] {symbol}: {type(_pool_error).__name__}: {_pool_error}",
+                            "WARN", debounce_key=f"opposing_pool_{symbol}", debounce_sec=60
+                        )
                 if current_mode == RANGE_MODE and not safe_float(STATE.get("range_target_price"), 0.0):
                     # Range exits are anchored to the nearest opposing swing-liquidity
                     # pool, not a hard-coded 0.5/1/2% price move. Use completed bars only.
@@ -3431,6 +3467,21 @@ class LiveTradeManager:
                         swing_levels = []
                     adaptive_target, target_reason = adaptive_range_target_price(
                         side, entry, atr, swing_levels)
+                    _pool_level = safe_float(STATE.get("opposing_liquidity_level"), 0.0)
+                    if _pool_level > 0:
+                        _scalp_pct, _scalp_reason = select_scalp_target_pct(
+                            STATE.get("opposing_liquidity_distance_pct"))
+                        if _scalp_pct > 0:
+                            _pct_target = entry * (1.0 + _scalp_pct / 100.0) if side == "BUY" else entry * (1.0 - _scalp_pct / 100.0)
+                            _pool_target = _pool_level - atr * 0.10 if side == "BUY" else _pool_level + atr * 0.10
+                            _before_pool = _pct_target < _pool_target if side == "BUY" else _pct_target > _pool_target
+                            if _before_pool and ((side == "BUY" and _pct_target > entry) or (side == "SELL" and _pct_target < entry)):
+                                adaptive_target = round(_pct_target, 12)
+                                target_reason = _scalp_reason + "_before_opposing_pool"
+                            else:
+                                target_reason = "opposing_pool_geometry_rejected_atr_fallback"
+                        else:
+                            target_reason = _scalp_reason + "_atr_fallback"
                     STATE["range_target_price"] = adaptive_target
                     STATE["range_target_move_pct"] = (abs(adaptive_target-entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
                     STATE["range_target_reason"] = target_reason
@@ -3605,6 +3656,16 @@ class LiveTradeManager:
             "synthetic_tp1": STATE.get("synthetic_tp1", 0), "tp2_price": STATE.get("tp2_price", 0),
             "range_target_price": STATE.get("range_target_price", 0),
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
+            "opposing_liquidity": {
+                "status": STATE.get("opposing_liquidity_status", "UNKNOWN"),
+                "level": safe_float(STATE.get("opposing_liquidity_level"), 0.0),
+                "distance_pct": safe_float(STATE.get("opposing_liquidity_distance_pct"), 0.0),
+                "source": "CLOSED_CANDLE_SWING_POOLS",
+                "timestamp": safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0),
+            },
+            "scalp_target_selected_pct": safe_float(STATE.get("scalp_target_selected_pct"), 0.0),
+            "scalp_target_selection_reason": str(STATE.get("scalp_target_selection_reason") or ""),
+
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
             "entry_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
@@ -3666,7 +3727,7 @@ class LiveTradeManager:
                             timeframe_seconds=_timeframe_seconds(INTERVAL),
                         )
                         _failure_active = (
-                            _management_event == "FAILED_BREAKOUT" and _failure_streak >= 1
+                            _management_event == "FAILED_BREAKOUT" and _failure_streak >= 2
                         )
                         _previous_mi = STATE.get("market_intelligence") or {}
                         _mi_confidence = (
@@ -3682,7 +3743,7 @@ class LiveTradeManager:
                             **_previous_mi,
                             "zone_event": _management_event,
                             "raw_zone_event": _zone_result["event"],
-                            "zone_event_confirmed": bool(_zone_result.get("confirmed")) or _failure_active,
+                            "zone_event_confirmed": (bool(_zone_result.get("confirmed")) if _management_event != "FAILED_BREAKOUT" else _failure_active),
                             "zone_event_confidence": _mi_confidence,
                             "zone_reference_level": safe_float(_zone_result.get("level"), 0.0),
                             "zone_event_reasons": list(_zone_result.get("reason_codes") or []),
@@ -3698,7 +3759,7 @@ class LiveTradeManager:
                         }
                         record_trade_management_event(
                             "MARKET_STRUCTURE_EVENT",
-                            "CONFIRMED" if (_zone_result.get("confirmed") or _failure_active) else "OBSERVED",
+                            "CONFIRMED" if (bool(_zone_result.get("confirmed")) and _management_event != "FAILED_BREAKOUT") or _failure_active else "OBSERVED",
                             dedupe_key=f"zone:{symbol}:{_management_event}:{_event_ts}",
                             dedupe_seconds=0, symbol=symbol, side=side,
                             reason=f"{_management_event}; raw={_zone_result['event']}; streak={_failure_streak}",
@@ -5042,6 +5103,13 @@ STATE = {
     "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
     "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
     "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
+    "opposing_liquidity_status": "UNKNOWN",
+    "opposing_liquidity_level": 0.0,
+    "opposing_liquidity_distance_pct": 0.0,
+    "opposing_liquidity_timestamp": 0.0,
+    "scalp_target_selected_pct": 0.0,
+    "scalp_target_selection_reason": "",
+
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
     "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
     "execution_unresolved": False, "close_reconciliation_required": False,
