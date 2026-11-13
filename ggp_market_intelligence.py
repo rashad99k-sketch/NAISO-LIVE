@@ -405,6 +405,8 @@ def build_support_resistance_zones(candles: Sequence[Dict[str, Any]], *,
             low = max(1e-12, max(raw_low - pad, center - half_cap))
             high = min(raw_high + pad, center + half_cap)
             last_idx, _, last_ts = group[-1]
+            # A pivot is only knowable after the configured right-side candles close.
+            confirmed_at_ts = normalized[last_idx + span]["timestamp"]
             later = normalized[last_idx + 1:]
             if kind == "SUPPORT":
                 broken = any(x["close"] < low for x in later)
@@ -435,6 +437,7 @@ def build_support_resistance_zones(candles: Sequence[Dict[str, Any]], *,
                 "reaction_atr": round(float(reaction), 3), "distance_atr": round(float(max(0.0, distance)), 3),
                 "age_bars": age, "strength": round(float(max(0.0, strength)), 2),
                 "status": status, "last_pivot_timestamp": int(last_ts),
+                "confirmed_at_timestamp": int(confirmed_at_ts),
             })
         zones.sort(key=lambda z: (z["status"] == "CONFIRMED", z["strength"], -z["distance_atr"]), reverse=True)
         return zones[:max(1, int(max_zones))]
