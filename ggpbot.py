@@ -6213,6 +6213,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "failed_breakout_thesis_credit_applied": False,
             "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
             "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "support_resistance": dict(institutional_entry_ctx.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
             "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
             "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
             "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
