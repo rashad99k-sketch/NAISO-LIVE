@@ -186,23 +186,30 @@ def test_trade_state_default_keeps_existing_protection_and_reconciliation_keys()
     assert {"entry_zone_low", "entry_zone_high", "zone_event_last_candle_ts"} <= keys
 
 
+
 def test_failed_breakout_evidence_requires_two_fresh_confirmed_candles():
-    # This unit test covers the conservative evidence contract independent of
-    # live exchange execution. One failed close must not count as thesis failure.
-    def valid_evidence(streak):
+    def evidence(streak, fresh=True):
         return {
             "zone_event": "FAILED_BREAKOUT",
             "zone_event_confirmed": True,
             "zone_event_confidence": 0.80,
             "zone_side": "BUY",
-            "zone_event_fresh": True,
+            "zone_event_fresh": fresh,
             "failed_breakout_streak": streak,
         }
-    one = valid_evidence(1)
-    two = valid_evidence(2)
-    assert one["failed_breakout_streak"] < 2
-    assert two["failed_breakout_streak"] >= 2
-
+    def valid(ctx, side="BUY"):
+        return (
+            str(ctx.get("zone_event") or "").upper() == "FAILED_BREAKOUT"
+            and bool(ctx.get("zone_event_confirmed"))
+            and bool(ctx.get("zone_event_fresh"))
+            and str(ctx.get("zone_side") or "").upper() == side
+            and float(ctx.get("zone_event_confidence") or 0) >= 0.75
+            and int(ctx.get("failed_breakout_streak") or 0) >= 2
+        )
+    assert not valid(evidence(1))
+    assert valid(evidence(2))
+    assert not valid(evidence(2, fresh=False))
+    assert not valid(evidence(2), side="SELL")
 
 def test_failed_breakout_streak_counts_distinct_consecutive_candles():
     # The runtime streak contract is candle-based: same candle is ignored,
