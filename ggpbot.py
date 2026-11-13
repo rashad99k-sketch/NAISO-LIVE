@@ -146,6 +146,71 @@ def _env_float_range(name, default, minimum, maximum):
         print(f"[CONFIG] Invalid {name}; safe default {default} applied")
         return float(default)
 
+# Observational only: all routine trade-management decisions still come from
+# TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
+TRADE_MANAGEMENT_LOG = TradeManagementEventLog(max_items=200)
+_TRADE_EVENT_DEDUPE = {}
+_TRADE_EVENT_DEDUPE_LOCK = threading.RLock()
+
+def record_trade_management_event(event_type, status="INFO", *, log_level=None,
+                                  dedupe_key=None, dedupe_seconds=0, **fields):
+    now = time.time()
+    if dedupe_key:
+        with _TRADE_EVENT_DEDUPE_LOCK:
+            previous = _TRADE_EVENT_DEDUPE.get(str(dedupe_key), 0.0)
+            if now - previous < max(0.0, float(dedupe_seconds)):
+                return None
+            _TRADE_EVENT_DEDUPE[str(dedupe_key)] = now
+            if len(_TRADE_EVENT_DEDUPE) > 500:
+                cutoff = now - 900
+                for key, ts in list(_TRADE_EVENT_DEDUPE.items()):
+                    if ts < cutoff:
+                        _TRADE_EVENT_DEDUPE.pop(key, None)
+    event = TRADE_MANAGEMENT_LOG.record(event_type, status, **fields)
+    logger = globals().get("log_execution")
+    if logger and (log_level or event_type not in {"BOARD_DECISION"}):
+        details = []
+        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "reason", "order_id"):
+            value = event.get(key)
+            if value not in (None, ""):
+                details.append(f"{key}={value}")
+        logger(f"[🧠 PROFIT BRAIN] {event.get('icon','🧠')} {event.get('label',event_type)} | status={status} | " + " | ".join(details),
+               log_level or ("WARN" if str(status).upper() in {"UNRESOLVED", "FAILED", "UNKNOWN"} else "INFO"),
+               debounce_key=f"trade_event_{dedupe_key}" if dedupe_key else None,
+               debounce_sec=max(1, int(dedupe_seconds or 1)))
+    return event
+
+def _env_bool(name, default=False):
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return bool(default)
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if value in {"0", "false", "no", "off", "disabled"}:
+        return False
+    print(f"[MODE] Invalid {name}={raw!r}; safe default {bool(default)} applied")
+    return bool(default)
+
+def _env_int_range(name, default, minimum, maximum):
+    try:
+        value = int(os.getenv(name, str(default)))
+        return max(minimum, min(maximum, value))
+    except (TypeError, ValueError):
+        print(f"[CONFIG] Invalid {name}; safe default {default} applied")
+        return int(default)
+
+def _env_float_range(name, default, minimum, maximum):
+    try:
+        value = float(os.getenv(name, str(default)))
+        if not math.isfinite(value):
+            raise ValueError("non-finite")
+        return max(minimum, min(maximum, value))
+    except (TypeError, ValueError):
+        print(f"[CONFIG] Invalid {name}; safe default {default} applied")
+        return float(default)
+
+
 # ========== INSTITUTIONAL ENGINES (EMBEDDED) ==========
 class SmartMoneyEngine:
     @staticmethod
@@ -10196,19 +10261,13 @@ def smart_opportunity_selection():
                 "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
-                "pullback_type": (item.get("market_intelligence") or {}).get("entry_behavior"),
+                "pullback_type": next((x.split(":", 1)[0] for x in evidence
+                                        if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,
                 "candle_timeframe": str(INTERVAL),
                 "closed_candle_frame": closed_df.copy(),
                 "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
                 "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
-                "entry_zone_low": safe_float((item.get("order_block") or {}).get("low"), 0.0),
-                "entry_zone_high": safe_float((item.get("order_block") or {}).get("high"), 0.0),
-                "market_intelligence": dict(item.get("market_intelligence") or {}),
-                "trading_mode": str((item.get("market_intelligence") or {}).get("mode", "UNCLASSIFIED")),
-                "entry_behavior": str((item.get("market_intelligence") or {}).get("entry_behavior", "WAIT_FOR_STRUCTURE")),
-                "entry_behavior_confidence": safe_float((item.get("market_intelligence") or {}).get("confidence", 0.0), 0.0),
-                "entry_behavior_reasons": list((item.get("market_intelligence") or {}).get("reason_codes", [])),
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
             try:
