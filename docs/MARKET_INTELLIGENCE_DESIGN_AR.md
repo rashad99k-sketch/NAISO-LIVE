@@ -32,6 +32,12 @@ A wick alone is not a confirmed breakout. These event labels are evidence for th
 The mode label and entry behavior are analytical metadata; they do not replace or bypass the existing RORO entry authority. TradeManagementBoard remains the single routine management decision authority and the existing execution/verification pipeline remains the only order path. This branch is still a review candidate, not a LIVE release. Passing CI does not replace end-to-end PAPER validation of a full entry-to-close lifecycle.
 
 
+## Closed-candle chart pattern observer
+- BULL_FLAG / BEAR_FLAG require a measured impulse, a bounded flag retracement, and closed-candle breakout confirmation for the confirmed stage.
+- FLAT_TOP / FLAT_BOTTOM require repeated boundary tests and a directionally converging base (higher lows under a flat top; lower highs above a flat bottom).
+- Patterns are emitted as observational context with stage, direction, confidence, reference level, and reason codes.
+- These pattern labels do not independently authorize entries, change sizing, modify protection, or issue exits. The existing institutional authority and management board retain those responsibilities.
+
 ## Mode semantics and operator visibility
 - trading_mode is the entry/setup identity: SNIPER requires a side-aligned liquidity sweep, a same-direction CHoCH/MSS, and a valid causal OB/FVG zone; TREND requires directional regime, ADX and continuation confirmation; SCALP requires a confirmed range/weak regime plus adequate liquidity. Otherwise the entry mode stays UNCLASSIFIED.
 - profit_mode is the separate, live management policy: RANGE_SCALP, TREND_RIDE, or the conservative TWO_STAGE_50_50 fallback. It is re-evaluated on completed candles and stabilized before switching.
