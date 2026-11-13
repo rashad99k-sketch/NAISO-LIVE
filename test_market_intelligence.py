@@ -115,9 +115,9 @@ def test_build_decision_never_grants_unproven_behavior():
 
 def test_zone_event_is_directional_for_sell_breakout():
     rows = [
-        candle(1, 101, 102, 99, 100),
-        candle(2, 100, 101, 97, 98),
-        candle(3, 98, 99, 96, 97),
+        candle(1, 100, 101, 99, 99.5),
+        candle(2, 99.5, 100, 97, 97.5),
+        candle(3, 97.5, 99, 96, 97),
     ]
     result = classify_zone_event(rows, side="SELL", zone_low=98, zone_high=100, atr=1)
     assert result["event"] == ZoneEvent.BREAKOUT_CONFIRMED.value
