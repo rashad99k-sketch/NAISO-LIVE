@@ -3369,6 +3369,8 @@ class LiveTradeManager:
             "market_intelligence": {
                 **(STATE.get("market_intelligence") or {}),
                 "zone_side": str(STATE.get("side") or "").upper(),
+                "trading_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "zone_event_fresh": (
                     safe_float(STATE.get("zone_event_last_candle_ts"), 0.0) > 0
                     and 0 <= time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
@@ -3628,7 +3630,7 @@ class LiveTradeManager:
             _zone_low = safe_float(STATE.get("entry_zone_low"), 0.0)
             _zone_high = safe_float(STATE.get("entry_zone_high"), 0.0)
             _last_zone_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
-            if _zone_low > 0 and _zone_high > _zone_low and len(df_live) >= 3 and closed_candle_ts > _last_zone_ts:
+            if last_closed_ts is not None and _zone_low > 0 and _zone_high > _zone_low and len(df_live) >= 3 and last_closed_ts > _last_zone_ts:
                 _zone_frame = df_live.tail(12).copy()
                 if "timestamp" not in _zone_frame.columns:
                     _zone_frame["timestamp"] = _zone_frame.index
@@ -3643,7 +3645,7 @@ class LiveTradeManager:
                     _zone_rows, side=side, zone_low=_zone_low, zone_high=_zone_high, atr=atr
                 )
                 if _zone_result.get("event") != "INSUFFICIENT_DATA":
-                    _event_ts = safe_float(_zone_result.get("timestamp"), closed_candle_ts)
+                    _event_ts = safe_float(_zone_result.get("timestamp"), last_closed_ts)
                     if _event_ts > _last_zone_ts:
                         _prior_event = str(STATE.get("zone_event") or "").upper()
                         _prior_streak = int(safe_float(STATE.get("failed_breakout_streak"), 0))
@@ -5018,6 +5020,9 @@ STATE = {
     "entry_zone_high": 0.0,
     "entry_behavior_confidence": 0.0,
     "entry_behavior_reasons": [],
+    "trading_mode": "UNCLASSIFIED",
+    "entry_behavior": "WAIT_FOR_STRUCTURE",
+    "market_intelligence": {},
 }
 paper = {"balance": 10000.0, "position": None}
 _ACTIVE_TRADE = False
@@ -5908,6 +5913,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
             "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
             "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
+            "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(institutional_entry_ctx.get("entry_behavior") or (institutional_entry_ctx.get("market_intelligence") or {}).get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
             "market_intelligence": {
                 **(institutional_entry_ctx.get("market_intelligence") or {}),
                 "zone_side": side,
@@ -9570,6 +9577,18 @@ def sniper_engine_v2():
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup, "event_id": event_id, "evidence": evidence,
                 "structural_stop": structural_stop, "pullback_type": "SNIPER_ZONE_RETEST",
+                "trading_mode": "SNIPER",
+                "entry_behavior": "RETEST",
+                "entry_zone_low": safe_float(zone.get("low"), 0.0),
+                "entry_zone_high": safe_float(zone.get("high"), 0.0),
+                "entry_behavior_confidence": 0.88,
+                "entry_behavior_reasons": ["sniper_pivot_retest", "liquidity_mss_confirmed"],
+                "market_intelligence": {
+                    "mode": "SNIPER", "entry_behavior": "RETEST",
+                    "reference_low": safe_float(zone.get("low"), 0.0),
+                    "reference_high": safe_float(zone.get("high"), 0.0),
+                    "zone_side": side,
+                },
                 "exchange_symbol": symbol, "sniper_v2": True,
                 "capital_allocation_tier": "STANDARD_20_PERCENT",
                 "sizing_eligible_strong": False, "sizing_balance_basis": "WALLET_TOTAL",
@@ -10326,11 +10345,21 @@ def smart_opportunity_selection():
                 item["rejection_reason"] = "profit_targets_invalid"
                 continue
             evidence = list(item.get("evidence") or [])
+            market_intelligence = item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {}
+
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
+                "trading_mode": str(item.get("trading_mode") or market_intelligence.get("mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
+                "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
+                "entry_behavior_confidence": safe_float(item.get("entry_behavior_confidence", market_intelligence.get("confidence")), 0.0),
+                "entry_behavior_reasons": list(item.get("entry_behavior_reasons") or market_intelligence.get("reason_codes") or []),
+                "market_intelligence": dict(market_intelligence),
+
                 "pullback_type": next((x.split(":", 1)[0] for x in evidence
                                         if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,
