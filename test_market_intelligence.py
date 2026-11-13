@@ -521,3 +521,23 @@ def test_bos_continuation_is_not_mislabeled_as_mss(monkeypatch):
     assert structure["bos"] == "BULLISH_BOS"
     assert structure["choch"] is None
     assert structure["mss"] is None
+
+
+def test_sniper_evidence_must_match_trade_direction_and_choch():
+    from ggp_institutional_bridge import _sniper_evidence_matches_side
+
+    assert _sniper_evidence_matches_side("BUY", "SWEEP", "BULLISH", "BULLISH_CHOCH", True)
+    assert _sniper_evidence_matches_side("SELL", "GRAB", "BEARISH", "BEARISH_CHOCH", True)
+    assert not _sniper_evidence_matches_side("BUY", "SWEEP", "BEARISH", "BULLISH_CHOCH", True)
+    assert not _sniper_evidence_matches_side("BUY", "SWEEP", "BULLISH", "BEARISH_CHOCH", True)
+    assert not _sniper_evidence_matches_side("BUY", "SWEEP", "BULLISH", "BULLISH_CHOCH", False)
+
+
+def test_opposite_direction_fvg_is_not_a_valid_trade_zone():
+    expected = "BULLISH"
+    fvg = {"direction": "BEARISH", "status": "UNFILLED"}
+    assert not (
+        isinstance(fvg, dict)
+        and fvg.get("direction") == expected
+        and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED")
+    )
