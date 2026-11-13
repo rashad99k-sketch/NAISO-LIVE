@@ -30,3 +30,10 @@ A wick alone is not a confirmed breakout. These event labels are evidence for th
 
 ## Integration status
 The mode label and entry behavior are analytical metadata; they do not replace or bypass the existing RORO entry authority. TradeManagementBoard remains the single routine management decision authority and the existing execution/verification pipeline remains the only order path. This branch is still a review candidate, not a LIVE release. Passing CI does not replace end-to-end PAPER validation of a full entry-to-close lifecycle.
+
+
+## Mode semantics and operator visibility
+- trading_mode is the entry/setup identity: SNIPER requires a side-aligned liquidity sweep, a same-direction CHoCH/MSS, and a valid causal OB/FVG zone; TREND requires directional regime, ADX and continuation confirmation; SCALP requires a confirmed range/weak regime plus adequate liquidity. Otherwise the entry mode stays UNCLASSIFIED.
+- profit_mode is the separate, live management policy: RANGE_SCALP, TREND_RIDE, or the conservative TWO_STAGE_50_50 fallback. It is re-evaluated on completed candles and stabilized before switching.
+- Management events and logs expose both the immutable entry mode and the current management mode. This is observability only; it does not alter order sizing, leverage, TP/SL, or execution.
+- A BOS continuation is not a reversal MSS. Opposite-side sweeps, opposite-direction CHoCH, and opposite-direction FVGs cannot qualify a SNIPER setup.
