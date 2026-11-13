@@ -308,18 +308,25 @@ def build_scalp_target(side, entry_price, opposing_pool_level,
     selected, reason = select_scalp_target_pct(
         distance_pct, candidates=candidates, pool_buffer_pct=pool_buffer_pct
     )
-    if selected <= 0:
-        return {"status": "NO_TARGET", "target_price": 0.0, "target_pct": 0.0,
-                "entry_distance_pct": round(distance_pct, 6), "reason": reason}
+    if selected < 0.5:
+        return {"status": "NO_TARGET", "target_price": 0.0, "tp1_target_price": 0.0,
+                "target_pct": 0.0, "tp1_target_pct": 0.0,
+                "entry_distance_pct": round(distance_pct, 6),
+                "reason": "insufficient_room_for_two_stage_50_50_scalp_target"}
     target = entry * (1.0 + selected / 100.0) if direction == "BUY" else entry * (1.0 - selected / 100.0)
+    tp1_pct = selected / 2.0
+    tp1_target = entry * (1.0 + tp1_pct / 100.0) if direction == "BUY" else entry * (1.0 - tp1_pct / 100.0)
     before_pool = target < pool if direction == "BUY" else target > pool
     if not before_pool:
-        return {"status": "NO_TARGET", "target_price": 0.0, "target_pct": 0.0,
+        return {"status": "NO_TARGET", "target_price": 0.0, "tp1_target_price": 0.0,
+                "target_pct": 0.0, "tp1_target_pct": 0.0,
                 "entry_distance_pct": round(distance_pct, 6),
                 "reason": "target_geometry_crosses_opposing_pool"}
     return {"status": "VALID", "target_price": round(float(target), 12),
-            "target_pct": float(selected), "entry_distance_pct": round(distance_pct, 6),
-            "reason": reason + "_entry_anchored_before_opposing_pool"}
+            "tp1_target_price": round(float(tp1_target), 12),
+            "target_pct": float(selected), "tp1_target_pct": float(tp1_pct),
+            "entry_distance_pct": round(distance_pct, 6),
+            "reason": reason + "_entry_anchored_two_stage_50_50_before_opposing_pool"}
 
 
 def is_confirmed_failed_breakout_evidence(market_intelligence: Any, side: str) -> bool:
