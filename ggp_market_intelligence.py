@@ -450,52 +450,95 @@ def validate_order_block_zone(*, side: str, zone: Dict[str, Any],
                               candles: Sequence[Dict[str, Any]], atr: Any,
                               min_strength: float = 5.0,
                               max_distance_atr: float = 1.5) -> Dict[str, Any]:
-    """Revalidate a causal OB's geometry, displacement, age, mitigation and invalidation."""
+    """Validate an OB's source candle, displacement, mitigation and invalidation.
+
+    The source candle and displacement candle must both be present in the
+    completed-candle input. Malformed or incomplete input fails closed.
+    """
     direction = str(side or "").upper()
     a = _num(atr)
     if direction not in {"BUY", "SELL"} or not isinstance(zone, dict) or a is None or a <= 0:
         return {"valid": False, "status": "UNKNOWN", "reason": "invalid_side_zone_or_atr"}
+
     low, high = _num(zone.get("low")), _num(zone.get("high"))
     strength, distance = _num(zone.get("strength")), _num(zone.get("distance_atr"))
-    if low is None or high is None or low <= 0 or high <= low or strength is None or distance is None:
-        return {"valid": False, "status": "INVALID", "reason": "invalid_order_block_geometry"}
-    if strength < float(min_strength):
-        return {"valid": False, "status": "WEAK", "reason": "order_block_strength_below_minimum"}
-    if distance > float(max_distance_atr):
-        return {"valid": False, "status": "TOO_FAR", "reason": "order_block_outside_entry_window"}
-    rows = list(candles or [])
     origin = _num(zone.get("timestamp"))
     impulse_ts = _num(zone.get("impulse_timestamp"))
-    if origin is None or impulse_ts is None or impulse_ts <= origin:
-        return {"valid": False, "status": "INVALID", "reason": "order_block_causality_timestamps_missing"}
-    post = []
-    for row in rows:
+    if (low is None or high is None or low <= 0 or high <= low
+            or strength is None or distance is None or origin is None
+            or impulse_ts is None or impulse_ts <= origin):
+        return {"valid": False, "status": "INVALID", "reason": "invalid_order_block_geometry_or_causality"}
+    if strength < float(min_strength):
+        return {"valid": False, "status": "WEAK", "reason": "order_block_strength_below_minimum"}
+    if distance < 0 or distance > float(max_distance_atr):
+        return {"valid": False, "status": "TOO_FAR", "reason": "order_block_outside_entry_window"}
+
+    normalized = []
+    for row in list(candles or []):
         if not isinstance(row, dict):
-            continue
-        ts = _num(row.get("timestamp"))
-        close = _num(row.get("close"))
-        high_v, low_v = _num(row.get("high")), _num(row.get("low"))
-        if ts is None or close is None or high_v is None or low_v is None:
-            continue
-        if ts > impulse_ts:
-            post.append({"timestamp": ts, "close": close, "high": high_v, "low": low_v})
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "invalid_order_block_candle"}
+        values = {key: _num(row.get(key)) for key in ("open", "high", "low", "close", "timestamp")}
+        if any(value is None for value in values.values()):
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "incomplete_order_block_candle"}
+        if (values["low"] <= 0
+                or values["high"] < max(values["open"], values["close"], values["low"])
+                or values["low"] > min(values["open"], values["close"], values["high"])):
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "invalid_order_block_ohlc"}
+        if normalized and values["timestamp"] <= normalized[-1]["timestamp"]:
+            return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "non_monotonic_order_block_timestamps"}
+        normalized.append(values)
+
+    source = next((row for row in normalized if row["timestamp"] == origin), None)
+    impulse = next((row for row in normalized if row["timestamp"] == impulse_ts), None)
+    if source is None or impulse is None:
+        return {"valid": False, "status": "INVALID", "reason": "order_block_source_or_impulse_candle_missing"}
+
+    if direction == "BUY":
+        source_is_causal = source["close"] < source["open"]
+        expected_low, expected_high = source["low"], source["open"]
+        displacement_ok = (
+            impulse["timestamp"] > origin
+            and impulse["close"] > source["high"]
+            and (impulse["close"] - impulse["open"]) >= 0.60 * a
+        )
+    else:
+        source_is_causal = source["close"] > source["open"]
+        expected_low, expected_high = source["open"], source["high"]
+        displacement_ok = (
+            impulse["timestamp"] > origin
+            and impulse["close"] < source["low"]
+            and (impulse["open"] - impulse["close"]) >= 0.60 * a
+        )
+
+    geometry_tolerance = max(1e-10, a * 1e-6, max(abs(expected_low), abs(expected_high)) * 1e-9)
+    if (not source_is_causal
+            or abs(low - expected_low) > geometry_tolerance
+            or abs(high - expected_high) > geometry_tolerance):
+        return {"valid": False, "status": "INVALID", "reason": "order_block_geometry_not_causal_to_source_candle"}
+    if not displacement_ok:
+        return {"valid": False, "status": "INVALID", "reason": "order_block_displacement_not_confirmed"}
+
+    post = [row for row in normalized if row["timestamp"] > impulse_ts]
     if direction == "BUY":
         invalid = any(row["close"] < low for row in post)
-        penetration = max(0.0, min(high - low, high - min((r["low"] for r in post), default=high)))
+        penetration = max(0.0, min(high - low, high - min((row["low"] for row in post), default=high)))
     else:
         invalid = any(row["close"] > high for row in post)
-        penetration = max(0.0, min(high - low, max((r["high"] for r in post), default=low) - low))
-    fill_pct = penetration / (high - low) * 100.0
+        penetration = max(0.0, min(high - low, max((row["high"] for row in post), default=low) - low))
+    fill_pct = max(0.0, min(100.0, penetration / (high - low) * 100.0))
+
     if invalid:
-        return {"valid": False, "status": "INVALIDATED", "reason": "close_through_order_block_invalidation_edge",
-                "fill_pct": round(fill_pct, 1)}
+        return {"valid": False, "status": "INVALIDATED",
+                "reason": "close_through_order_block_invalidation_edge", "fill_pct": round(fill_pct, 1)}
     if fill_pct >= 99.9:
-        return {"valid": False, "status": "FULLY_MITIGATED", "reason": "order_block_fully_mitigated",
-                "fill_pct": round(fill_pct, 1)}
+        return {"valid": False, "status": "FULLY_MITIGATED",
+                "reason": "order_block_fully_mitigated", "fill_pct": round(fill_pct, 1)}
     return {"valid": True, "status": "FRESH" if fill_pct <= 0 else "PARTIALLY_MITIGATED",
-            "reason": "causal_displacement_and_zone_integrity_confirmed",
+            "reason": "causal_source_displacement_and_zone_integrity_confirmed",
             "fill_pct": round(fill_pct, 1), "low": low, "high": high,
             "strength": strength, "distance_atr": distance}
+
+
 
 def is_confirmed_failed_breakout_evidence(market_intelligence: Any, side: str) -> bool:
     """Return whether a fresh, same-side, two-candle failed-breakout proof is usable.
