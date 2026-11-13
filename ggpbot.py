@@ -80,7 +80,10 @@ from ggp_market_data import (
     FETCH_MIN_CANDLES,
     timeframe_seconds as _timeframe_seconds,
 )
-from ggp_market_intelligence import (\n    classify_zone_event, advance_failed_breakout_confirmation,\n    is_confirmed_failed_breakout_evidence,\n)
+from ggp_market_intelligence import (
+    classify_zone_event, advance_failed_breakout_confirmation,
+    is_confirmed_failed_breakout_evidence,
+)
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
