@@ -3341,10 +3341,8 @@ class LiveTradeManager:
                         STATE["zone_event_last_candle_ts"] = int(_zone_result.get("timestamp") or closed_candle_ts)
                         STATE["market_intelligence"] = {
                             **(STATE.get("market_intelligence") or {}),
-                            "zone_event": _zone_result.get("event"),
                             "zone_event_confirmed": bool(_zone_result.get("confirmed")),
                             "zone_event_confidence": safe_float(_zone_result.get("confidence"), 0.0),
-                            "zone_reference_level": safe_float(_zone_result.get("level"), 0.0),
                             "zone_event_reasons": list(_zone_result.get("reason_codes") or []),
                             "zone_event_timestamp": STATE["zone_event_last_candle_ts"],
                         }
@@ -3628,10 +3626,8 @@ class LiveTradeManager:
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
             "market_intelligence": dict(STATE.get("market_intelligence") or {}),
-            "zone_event": str(STATE.get("zone_event", "INSUFFICIENT_DATA")),
             "zone_event_confirmed": bool((STATE.get("market_intelligence") or {}).get("zone_event_confirmed", False)),
             "zone_event_confidence": safe_float((STATE.get("market_intelligence") or {}).get("zone_event_confidence"), 0.0),
-            "zone_reference_level": safe_float((STATE.get("market_intelligence") or {}).get("zone_reference_level"), 0.0),
             "entry_trading_mode": str(STATE.get("entry_trading_mode", "UNCLASSIFIED")),
             "entry_behavior": str(STATE.get("entry_behavior", "WAIT_FOR_STRUCTURE")),
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
@@ -4950,16 +4946,11 @@ STATE = {
     "peak_roe": 0.0,
     "peak_drawdown_roe": 0.0,
         "ema_profit_state": "INSUFFICIENT_DATA",
-    "market_intelligence": {},
-    "zone_event": "INSUFFICIENT_DATA",
     "zone_event_last_candle_ts": 0,
     "entry_zone_low": 0.0,
     "entry_zone_high": 0.0,
-    "entry_trading_mode": "UNCLASSIFIED",
-    "entry_behavior": "WAIT_FOR_STRUCTURE",
     "entry_behavior_confidence": 0.0,
     "entry_behavior_reasons": [],
-    "zone_reference_level": 0.0
 }
 paper = {"balance": 10000.0, "position": None}
 _ACTIVE_TRADE = False
