@@ -3634,7 +3634,6 @@ class LiveTradeManager:
             "zone_reference_level": safe_float((STATE.get("market_intelligence") or {}).get("zone_reference_level"), 0.0),
             "entry_trading_mode": str(STATE.get("entry_trading_mode", "UNCLASSIFIED")),
             "entry_behavior": str(STATE.get("entry_behavior", "WAIT_FOR_STRUCTURE")),
-            "market_intelligence": dict(STATE.get("market_intelligence") or {}),
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
             "partial_done": STATE.get("partial_closed", False),
             "execution_unresolved": STATE.get("execution_unresolved", False),
