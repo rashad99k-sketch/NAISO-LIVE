@@ -435,3 +435,17 @@ def test_management_observer_passes_fresh_zone_evidence_into_same_trade_state_co
     assert '"zone_side": str(side or "").upper()' in observer
     assert '"failed_breakout_streak": _failure_streak' in observer
     assert 'self.board.evaluate(context)' in source
+
+
+def test_management_board_receives_post_observer_fresh_market_intelligence_snapshot():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    observer = source.index("# Closed-candle zone lifecycle; context only, no order side effects.")
+    refresh = source.index("# Refresh the intelligence snapshot AFTER the closed-candle observer.", observer)
+    board = source.index("decision = self.board.evaluate(context)", refresh)
+    segment = source[observer:board]
+    assert 'context["market_intelligence"] = _mi_context' in segment
+    assert segment.index('context["market_intelligence"] = _mi_context') < segment.index(
+        "decision = self.board.evaluate(context)") if "decision = self.board.evaluate(context)" in segment else True
+    assert '"failed_breakout_thesis_credit_applied": bool(' in segment
+    assert '"zone_event_fresh": (' in segment
