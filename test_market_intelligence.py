@@ -774,6 +774,8 @@ def test_state_has_unique_opposing_liquidity_defaults():
     assert state.count('"opposing_liquidity_status":') == 1
     assert state.count('"opposing_liquidity_level":') == 1
     assert state.count('"scalp_target_selected_pct":') == 1
+    assert state.count('"scalp_target_price":') == 1
+    assert state.count('"scalp_target_status":') == 1
 
 
 def test_trade_entry_modes_remain_distinct_from_profit_management_modes():
