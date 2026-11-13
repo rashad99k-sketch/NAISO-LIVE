@@ -120,7 +120,9 @@ def _confirmed_pivots(df: pd.DataFrame, end: Optional[int] = None, left_right: i
 def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr: float, side: str):
     # Fourth value is the timestamp when the zone became knowable to the strategy.
     direction = str(side or "").upper()
-    levels = [(float(fallback_level), float(fallback_level), "BOS_LEVEL", None)]
+    # Location-first mode forbids a naked BOS level from substituting for an institutional zone.
+    location_first = bool(context.get("location_first_required"))
+    levels = [] if location_first else [(float(fallback_level), float(fallback_level), "BOS_LEVEL", None)]
     ob = context.get("order_block")
     if isinstance(ob, dict):
         try:
@@ -165,6 +167,30 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
                     levels.append((low, high, expected_type, available_ts))
                 except (KeyError, TypeError, ValueError, OverflowError):
                     continue
+    if location_first:
+        # Retain only fresh, side-aligned causal zones close enough to execute.
+        reference_price = context.get("reference_price")
+        max_distance_atr = float(context.get("max_location_distance_atr", 1.5) or 1.5)
+        actionable = []
+        for low, high, name, available_ts in levels:
+            if name not in ("ORDER_BLOCK", "FVG", "SUPPORT", "RESISTANCE"):
+                continue
+            if available_ts is None or int(available_ts) <= 0:
+                continue
+            timeframe_ms = max(1, int(context.get("timeframe_ms", 900_000)))
+            latest_ts = int(context.get("latest_timestamp", available_ts))
+            if max(0, latest_ts - int(available_ts)) / timeframe_ms > 48:
+                continue
+            if reference_price is not None:
+                try:
+                    px = float(reference_price)
+                    distance = max(low - px, 0.0, px - high) / float(atr)
+                    if not math.isfinite(distance) or distance > max_distance_atr:
+                        continue
+                except (TypeError, ValueError, ZeroDivisionError):
+                    continue
+            actionable.append((low, high, name, available_ts))
+        return actionable
     return levels
 
 
@@ -301,6 +327,15 @@ class ReversalEngine:
                                          int(x.timestamp.iloc[sweep_idx]), level, None, 35.0)
         # A retest must occur on a candle AFTER the MSS candle, followed by a later trigger candle.
         zones = _zone_retest_candidates(context, float(structural_level), atr, side)
+        if context.get("location_first_required") and not zones:
+            return InstitutionalDecision(
+                DecisionState.WAITING_FOR_RETEST.value, setup_name, side,
+                "waiting_for_fresh_institutional_location",
+                ("sweep_or_failed_auction", "closed_mss"),
+                ("no_fresh_nearby_order_block_or_fvg",),
+                _event_id(symbol, side, setup_name, int(x.timestamp.iloc[sweep_idx])),
+                int(x.timestamp.iloc[sweep_idx]), level, None, 60.0,
+            )
         retest_idx = None; retest_zone = ""
         for r in range(bos_idx + 1, len(x) - 1):
             candle = x.iloc[r]
@@ -400,6 +435,15 @@ class ContinuationEngine:
                                          _event_id(symbol, side, "TREND_CONTINUATION_RETEST", int(x.timestamp.iloc[bos_idx])),
                                          int(x.timestamp.iloc[bos_idx]), broken_level, None, 45.0)
         zones = _zone_retest_candidates(context, broken_level, atr, side)
+        if context.get("location_first_required") and not zones:
+            return InstitutionalDecision(
+                DecisionState.WAITING_FOR_RETEST.value, "TREND_CONTINUATION_RETEST", side,
+                "waiting_for_fresh_institutional_location",
+                (bos_name, "displacement"),
+                ("no_fresh_nearby_order_block_or_fvg",),
+                _event_id(symbol, side, "TREND_CONTINUATION_RETEST", int(x.timestamp.iloc[bos_idx])),
+                int(x.timestamp.iloc[bos_idx]), broken_level, None, 55.0,
+            )
         # Prefer a nearby causal zone, but keep a shallow pullback path for strong trends.
         if causal_level is not None:
             zones.insert(0, (float(causal_level), float(causal_level), "CAUSAL_LEVEL", int(x.timestamp.iloc[bos_idx])))
@@ -417,8 +461,8 @@ class ContinuationEngine:
                     break
             if retest_idx is not None:
                 break
-        if retest_idx is None:
-            # Micro pullback: short, shallow countertrend candles followed by a closed trigger.
+        if retest_idx is None and not context.get("location_first_required"):
+            # Legacy micro-pullback fallback remains available only outside strict location-first mode.
             begin = max(bos_idx + 1, len(x) - 4)
             segment = x.iloc[begin:-1]
             if len(segment) >= 1:
