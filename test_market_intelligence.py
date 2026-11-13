@@ -1156,3 +1156,42 @@ def test_institutional_entry_behavior_is_hard_gated_in_paper_and_live_execution(
     open_source = source[open_start:open_end]
     assert "ENTRY_BEHAVIOR_FINAL_BLOCK" in open_source
     assert "validate_entry_behavior_trigger(" in open_source
+
+
+def test_buy_retest_is_directional_mirror_and_waits_for_closed_reclaim():
+    rows = [
+        candle(1000, 10.5, 10.8, 10.2, 10.4),
+        candle(2000, 10.4, 10.6, 10.0, 10.2),
+        candle(3000, 10.2, 10.3, 9.9, 10.0),
+        candle(4000, 10.0, 10.6, 9.95, 10.5),
+    ]
+    result = validate_entry_behavior_trigger(
+        side="BUY", behavior="RETEST", candles=rows, entry_price=10.4,
+        atr=1.0, reference_level=10.0,
+    )
+    assert result["valid"] is True
+
+
+def test_buy_pullback_and_micro_pullback_require_their_own_trigger():
+    pullback_rows = [
+        candle(1000, 9.0, 9.3, 8.8, 9.1),
+        candle(2000, 9.1, 9.5, 8.9, 9.2),
+        candle(3000, 9.2, 10.1, 9.8, 10.0),
+        candle(4000, 9.8, 10.5, 9.7, 10.3),
+    ]
+    pullback = validate_entry_behavior_trigger(
+        side="BUY", behavior="PULLBACK", candles=pullback_rows,
+        entry_price=10.2, atr=1.0, zone_low=9.0, zone_high=10.0,
+    )
+    assert pullback["valid"] is True
+
+    micro_rows = [
+        candle(1000, 10.0, 12.1, 9.9, 12.0),
+        candle(2000, 12.0, 12.05, 11.6, 11.7),
+        candle(3000, 11.8, 12.5, 11.75, 12.4),
+    ]
+    micro = validate_entry_behavior_trigger(
+        side="BUY", behavior="MICRO_PULLBACK", candles=micro_rows,
+        entry_price=12.3, atr=1.0,
+    )
+    assert micro["valid"] is True
