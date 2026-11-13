@@ -247,6 +247,45 @@ def build_intelligence_decision(*, regime: str = "UNKNOWN", adx: Any = None,
 
 
 
+def select_opposing_liquidity_pool(levels, side, current_price):
+    """Return nearest confirmed opposing swing pool beyond current price."""
+    direction = str(side or "").strip().upper()
+    current = _num(current_price)
+    if direction not in {"BUY", "SELL"} or current is None or current <= 0:
+        return {"status": "UNKNOWN", "level": None, "distance_pct": None}
+    candidates = []
+    for raw in levels or ():
+        value = _num(raw)
+        if value is None or value <= 0:
+            continue
+        distance = value - current if direction == "BUY" else current - value
+        if distance > 0:
+            candidates.append((distance, value))
+    if not candidates:
+        return {"status": "NO_OPPOSING_POOL", "level": None, "distance_pct": None}
+    distance, level = min(candidates, key=lambda item: item[0])
+    return {"status": "VALID", "level": float(level),
+            "distance_pct": round(float(distance / current * 100.0), 6)}
+
+
+def select_scalp_target_pct(opposing_distance_pct, candidates=(0.25, 0.5, 1.0, 2.0),
+                            pool_buffer_pct=0.05):
+    """Choose the largest configured target that remains before opposing liquidity."""
+    distance = _num(opposing_distance_pct)
+    buffer = _num(pool_buffer_pct)
+    if distance is None or distance <= 0 or buffer is None or buffer < 0:
+        return 0.0, "opposing_liquidity_unavailable"
+    eligible = []
+    for raw in candidates or ():
+        value = _num(raw)
+        if value is not None and value > 0 and value + buffer <= distance:
+            eligible.append(value)
+    if not eligible:
+        return 0.0, "opposing_pool_too_close_for_minimum_target"
+    selected = max(eligible)
+    return float(selected), f"largest_target_before_opposing_pool_{selected:g}pct"
+
+
 def is_confirmed_failed_breakout_evidence(market_intelligence: Any, side: str) -> bool:
     """Return whether a fresh, same-side, two-candle failed-breakout proof is usable.
 
