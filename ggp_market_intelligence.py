@@ -329,6 +329,174 @@ def build_scalp_target(side, entry_price, opposing_pool_level,
             "reason": reason + "_entry_anchored_two_stage_50_50_before_opposing_pool"}
 
 
+
+def build_support_resistance_zones(candles: Sequence[Dict[str, Any]], *,
+                                   price: Any, atr: Any,
+                                   lookback: int = 120, pivot_span: int = 2,
+                                   cluster_atr: float = 0.22,
+                                   min_touches: int = 2,
+                                   max_zones: int = 6) -> Dict[str, Any]:
+    """Build confirmed, clustered support/resistance zones from closed OHLC candles.
+
+    A pivot is usable only after pivot_span right-side candles exist. Nearby
+    pivots are clustered using ATR-scaled tolerance. A zone is actionable only
+    after repeated pivot tests, a measurable reaction, and no subsequent close
+    through its far boundary. This is descriptive market structure, not a signal.
+    """
+    current, atr_v = _num(price), _num(atr)
+    if current is None or current <= 0 or atr_v is None or atr_v <= 0:
+        return {"status": "UNKNOWN", "supports": [], "resistances": [],
+                "reason": "invalid_price_or_atr"}
+    span = max(1, min(5, int(pivot_span)))
+    rows = list(candles or [])[-max(20, int(lookback)):]
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return {"status": "UNKNOWN", "supports": [], "resistances": [],
+                    "reason": "invalid_candle"}
+        values = {key: _num(row.get(key)) for key in ("open", "high", "low", "close", "timestamp")}
+        if any(value is None for value in values.values()):
+            return {"status": "UNKNOWN", "supports": [], "resistances": [],
+                    "reason": "incomplete_candle"}
+        if (values["low"] <= 0 or values["high"] < max(values["open"], values["close"], values["low"])
+                or values["low"] > min(values["open"], values["close"], values["high"])):
+            return {"status": "UNKNOWN", "supports": [], "resistances": [],
+                    "reason": "invalid_ohlc"}
+        if normalized and values["timestamp"] <= normalized[-1]["timestamp"]:
+            return {"status": "UNKNOWN", "supports": [], "resistances": [],
+                    "reason": "non_monotonic_timestamps"}
+        normalized.append(values)
+    if len(normalized) < max(2 * span + 1, 20):
+        return {"status": "INSUFFICIENT_DATA", "supports": [], "resistances": [],
+                "reason": "insufficient_closed_candles"}
+
+    highs, lows = [], []
+    for idx in range(span, len(normalized) - span):
+        row = normalized[idx]
+        left = normalized[idx-span:idx]
+        right = normalized[idx+1:idx+span+1]
+        if row["high"] > max(x["high"] for x in left) and row["high"] >= max(x["high"] for x in right):
+            highs.append((idx, row["high"], row["timestamp"]))
+        if row["low"] < min(x["low"] for x in left) and row["low"] <= min(x["low"] for x in right):
+            lows.append((idx, row["low"], row["timestamp"]))
+
+    tolerance = max(atr_v * max(0.05, float(cluster_atr)), current * 0.0002)
+    pad = max(atr_v * 0.06, current * 0.00005)
+
+    def make_zones(pivots, kind):
+        groups = []
+        for pivot in pivots:
+            placed = None
+            for group in groups:
+                center = sum(item[1] for item in group) / len(group)
+                if abs(pivot[1] - center) <= tolerance:
+                    placed = group
+                    break
+            if placed is None:
+                groups.append([pivot])
+            else:
+                placed.append(pivot)
+        zones = []
+        for group in groups:
+            count = len(group)
+            center = sum(item[1] for item in group) / count
+            raw_low, raw_high = min(item[1] for item in group), max(item[1] for item in group)
+            half_cap = 0.30 * atr_v
+            low = max(1e-12, max(raw_low - pad, center - half_cap))
+            high = min(raw_high + pad, center + half_cap)
+            last_idx, _, last_ts = group[-1]
+            later = normalized[last_idx + 1:]
+            if kind == "SUPPORT":
+                broken = any(x["close"] < low for x in later)
+                reactions = []
+                for idx, level, _ in group:
+                    future = normalized[idx + 1:min(idx + 7, len(normalized))]
+                    if future:
+                        reactions.append(max(0.0, max(x["high"] for x in future) - level) / atr_v)
+            else:
+                broken = any(x["close"] > high for x in later)
+                reactions = []
+                for idx, level, _ in group:
+                    future = normalized[idx + 1:min(idx + 7, len(normalized))]
+                    if future:
+                        reactions.append(max(0.0, level - min(x["low"] for x in future)) / atr_v)
+            reaction = sum(reactions) / len(reactions) if reactions else 0.0
+            age = len(normalized) - 1 - last_idx
+            distance = (current - center) / atr_v if kind == "SUPPORT" else (center - current) / atr_v
+            if distance < -0.10:
+                continue
+            strength = min(10.0, 2.0 + min(count, 4) * 1.25
+                           + min(reaction, 2.0) * 1.0
+                           - min(age, 120) * 0.012)
+            status = "BROKEN" if broken else "CONFIRMED" if count >= max(2, int(min_touches)) and reaction >= 0.35 else "DEVELOPING"
+            zones.append({
+                "type": kind, "low": round(float(low), 12), "high": round(float(high), 12),
+                "level": round(float(center), 12), "touches": count,
+                "reaction_atr": round(float(reaction), 3), "distance_atr": round(float(max(0.0, distance)), 3),
+                "age_bars": age, "strength": round(float(max(0.0, strength)), 2),
+                "status": status, "last_pivot_timestamp": int(last_ts),
+            })
+        zones.sort(key=lambda z: (z["status"] == "CONFIRMED", z["strength"], -z["distance_atr"]), reverse=True)
+        return zones[:max(1, int(max_zones))]
+
+    supports = make_zones(lows, "SUPPORT")
+    resistances = make_zones(highs, "RESISTANCE")
+    return {"status": "VALID", "supports": supports, "resistances": resistances,
+            "tolerance": round(float(tolerance), 12), "atr": round(float(atr_v), 12),
+            "source": "CONFIRMED_SWINGS_CLUSTERED_CLOSED_CANDLES"}
+
+
+def validate_order_block_zone(*, side: str, zone: Dict[str, Any],
+                              candles: Sequence[Dict[str, Any]], atr: Any,
+                              min_strength: float = 5.0,
+                              max_distance_atr: float = 1.5) -> Dict[str, Any]:
+    """Revalidate a causal OB's geometry, displacement, age, mitigation and invalidation."""
+    direction = str(side or "").upper()
+    a = _num(atr)
+    if direction not in {"BUY", "SELL"} or not isinstance(zone, dict) or a is None or a <= 0:
+        return {"valid": False, "status": "UNKNOWN", "reason": "invalid_side_zone_or_atr"}
+    low, high = _num(zone.get("low")), _num(zone.get("high"))
+    strength, distance = _num(zone.get("strength")), _num(zone.get("distance_atr"))
+    if low is None or high is None or low <= 0 or high <= low or strength is None or distance is None:
+        return {"valid": False, "status": "INVALID", "reason": "invalid_order_block_geometry"}
+    if strength < float(min_strength):
+        return {"valid": False, "status": "WEAK", "reason": "order_block_strength_below_minimum"}
+    if distance > float(max_distance_atr):
+        return {"valid": False, "status": "TOO_FAR", "reason": "order_block_outside_entry_window"}
+    rows = list(candles or [])
+    origin = _num(zone.get("timestamp"))
+    impulse_ts = _num(zone.get("impulse_timestamp"))
+    if origin is None or impulse_ts is None or impulse_ts <= origin:
+        return {"valid": False, "status": "INVALID", "reason": "order_block_causality_timestamps_missing"}
+    post = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ts = _num(row.get("timestamp"))
+        close = _num(row.get("close"))
+        high_v, low_v = _num(row.get("high")), _num(row.get("low"))
+        if ts is None or close is None or high_v is None or low_v is None:
+            continue
+        if ts > impulse_ts:
+            post.append({"timestamp": ts, "close": close, "high": high_v, "low": low_v})
+    if direction == "BUY":
+        invalid = any(row["close"] < low for row in post)
+        penetration = max(0.0, min(high - low, high - min((r["low"] for r in post), default=high)))
+    else:
+        invalid = any(row["close"] > high for row in post)
+        penetration = max(0.0, min(high - low, max((r["high"] for r in post), default=low) - low))
+    fill_pct = penetration / (high - low) * 100.0
+    if invalid:
+        return {"valid": False, "status": "INVALIDATED", "reason": "close_through_order_block_invalidation_edge",
+                "fill_pct": round(fill_pct, 1)}
+    if fill_pct >= 99.9:
+        return {"valid": False, "status": "FULLY_MITIGATED", "reason": "order_block_fully_mitigated",
+                "fill_pct": round(fill_pct, 1)}
+    return {"valid": True, "status": "FRESH" if fill_pct <= 0 else "PARTIALLY_MITIGATED",
+            "reason": "causal_displacement_and_zone_integrity_confirmed",
+            "fill_pct": round(fill_pct, 1), "low": low, "high": high,
+            "strength": strength, "distance_atr": distance}
+
 def is_confirmed_failed_breakout_evidence(market_intelligence: Any, side: str) -> bool:
     """Return whether a fresh, same-side, two-candle failed-breakout proof is usable.
 
