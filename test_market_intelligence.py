@@ -1128,3 +1128,26 @@ def test_bearish_order_block_validation_is_directionally_symmetric():
     broken = candles + [candle(4000, 10.7, 11.2, 10.6, 11.1)]
     invalid = validate_order_block_zone(side="SELL", zone=zone, candles=broken, atr=1.0)
     assert invalid["status"] == "INVALIDATED"
+
+
+def test_institutional_bridge_publishes_directional_support_resistance_and_validated_ob():
+    from pathlib import Path
+
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert "build_support_resistance_zones(" in source
+    assert "validate_order_block_zone(" in source
+    assert '"support_resistance": support_resistance' in source
+    assert '"support_resistance_aligned": sr_aligned' in source
+    assert 'sr.get("supports" if side == "BUY" else "resistances", [])' in source
+
+
+def test_legacy_scanner_support_resistance_wrapper_uses_confirmed_zone_engine():
+    from pathlib import Path
+
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    start = source.index("def get_clustered_zones(")
+    end = source.index("\ndef detect_liquidity_cluster(", start)
+    wrapper = source[start:end]
+    assert "build_support_resistance_zones(" in wrapper
+    assert 'z.get("status") == "CONFIRMED"' in wrapper
+    assert "return supports, resistances" in wrapper
