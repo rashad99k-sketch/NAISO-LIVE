@@ -1,6 +1,6 @@
 import pandas as pd
 
-from roro_institutional import _zone_retest_candidates
+from roro_institutional import _location_event_id, _zone_retest_candidates
 
 
 def _context(**overrides):
@@ -51,3 +51,22 @@ def test_location_first_rejects_stale_zone():
 def test_legacy_callers_keep_bos_fallback():
     zones = _zone_retest_candidates({}, fallback_level=101.0, atr=1.0, side="BUY")
     assert zones == [(101.0, 101.0, "BOS_LEVEL", None)]
+
+
+
+def test_same_zone_same_structure_is_deduplicated_but_new_structure_is_allowed():
+    first = _location_event_id("BTC/USDT", "BUY", "ORDER_BLOCK", 1000, 2000)
+    repeated = _location_event_id("BTC/USDT", "BUY", "ORDER_BLOCK", 1000, 2000)
+    new_structure = _location_event_id("BTC/USDT", "BUY", "ORDER_BLOCK", 1000, 3000)
+    new_zone = _location_event_id("BTC/USDT", "BUY", "ORDER_BLOCK", 1500, 2000)
+    assert first == repeated
+    assert first != new_structure
+    assert first != new_zone
+
+
+def test_location_first_rejects_weak_order_block():
+    context = _context(order_block={
+        "low": 99.0, "high": 100.5, "timestamp": 1_699_999_000_000,
+        "impulse_timestamp": 1_699_999_100_000, "strength": 4.9,
+    })
+    assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
