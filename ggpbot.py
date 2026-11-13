@@ -3703,6 +3703,33 @@ class LiveTradeManager:
                 "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60
             )
 
+        # Refresh the intelligence snapshot AFTER the closed-candle observer.
+        # The management context is constructed earlier in this cycle, so without
+        # this hand-off the board would only ever see the previous candle's evidence.
+        try:
+            _mi_context = dict(STATE.get("market_intelligence") or {})
+            _mi_event_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+            _mi_context.update({
+                "zone_event_fresh": (
+                    _mi_event_ts > 0
+                    and 0 <= time.time() - _mi_event_ts
+                    <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                ),
+                "zone_side": str(side or "").upper(),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_thesis_credit_applied": bool(
+                    STATE.get("failed_breakout_thesis_credit_applied", False)
+                ),
+            })
+            context["market_intelligence"] = _mi_context
+        except Exception as _mi_context_error:
+            context["market_intelligence"] = {}
+            log_execution(
+                f"[MARKET_INTELLIGENCE_CONTEXT] {symbol}: "
+                f"{type(_mi_context_error).__name__}: {_mi_context_error}",
+                "WARN", debounce_key=f"mi_context_{symbol}", debounce_sec=60
+            )
+
         # ========== GET DECISION FROM BOARD ==========
         decision = self.board.evaluate(context)
         self._last_decision = decision
