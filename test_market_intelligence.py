@@ -717,3 +717,48 @@ def test_opposing_liquidity_analysis_is_wired_to_closed_candle_management():
     assert "select_scalp_target_pct(" in source
     assert '"scalp_target_selected_pct"' in source
 
+
+
+def test_live_entry_state_carries_market_intelligence():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    start = source.index('        STATE.update({\n            "open": True, "side": side, "entry": price', source.index("pending_management_state"))
+    end = source.index("        TRADE_STATE.update({", start)
+    block = source[start:end]
+    assert '"entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low")' in block
+    assert '"entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high")' in block
+    assert '"trading_mode": str(institutional_entry_ctx.get("trading_mode")' in block
+    assert '"market_intelligence": {' in block
+
+
+def test_opposing_liquidity_and_scalp_target_are_connected_to_management():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert "build_liquidity_pools(df_live.tail(120).reset_index(drop=True))" in source
+    assert '"opposing_liquidity": {' in source
+    assert "select_scalp_target_pct(" in source
+
+
+def test_failed_breakout_is_not_confirmed_until_two_closed_candles():
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event="INSIDE_ZONE", previous_timestamp=1800, previous_streak=0,
+        current_event=ZoneEvent.FAILED_BREAKOUT.value, current_timestamp=2700,
+        timeframe_seconds=900,
+    )
+    evidence = {
+        "zone_event": event, "zone_event_confirmed": False, "zone_event_fresh": True,
+        "zone_event_confidence": 0.78, "zone_side": "BUY", "failed_breakout_streak": streak,
+        "failed_breakout_thesis_credit_applied": False,
+    }
+    assert streak == 1
+    assert not is_confirmed_failed_breakout_evidence(evidence, "BUY")
+    event, streak = advance_failed_breakout_confirmation(
+        previous_event=event, previous_timestamp=2700, previous_streak=streak,
+        current_event=ZoneEvent.INSIDE_ZONE.value, current_timestamp=3600,
+        timeframe_seconds=900,
+    )
+    assert event == ZoneEvent.FAILED_BREAKOUT.value
+    assert streak == 2
+    assert is_confirmed_failed_breakout_evidence({**evidence,
+        "zone_event_confirmed": True, "failed_breakout_streak": streak}, "BUY")
+
