@@ -2495,7 +2495,7 @@ class TradeManagementBoard:
             thesis_reasons.append("confirmed_failed_breakout_reentry")
 
         thesis_action, thesis_reason = thesis_failure_action(
-            side, roe, thesis_score, ctx.get("thesis_failure_reasons") or [],
+            side, roe, thesis_score, thesis_reasons,
             structural_invalidation=bool(ctx.get("structural_invalidation")))
         if thesis_action == "EXIT":
             return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
@@ -3663,6 +3663,8 @@ class LiveTradeManager:
             "market_intelligence": {
                 **(STATE.get("market_intelligence") or {}),
                 "zone_side": str(STATE.get("side") or "").upper(),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_last_candle_ts": safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0),
                 "zone_event_fresh": (
                     safe_float(STATE.get("zone_event_last_candle_ts"), 0.0) > 0
                     and (time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0))
