@@ -355,7 +355,7 @@ def validate_entry_behavior_trigger(*, side: str, behavior: str, candles: Sequen
     if entry is None or entry <= 0 or atr_v is None or atr_v <= 0 or max_drift is None or max_drift <= 0:
         return {"valid": False, "status": "DATA_UNAVAILABLE", "reason": "invalid_entry_or_atr"}
     rows = list(candles or [])
-    if len(rows) < 4:
+    if len(rows) < 3:
         return {"valid": False, "status": "WAITING_FOR_CONFIRMATION",
                 "reason": "insufficient_closed_candles"}
     normalized = []
