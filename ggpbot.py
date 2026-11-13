@@ -83,7 +83,7 @@ from ggp_market_data import (
 from ggp_market_intelligence import (
     classify_zone_event, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence,
-)
+)from ggp_institutional_bridge import build_liquidity_pools
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -5946,6 +5946,23 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "risk_budget_basis": "TARGET_MARGIN",
             "risk_budget_usdt": sizing.max_risk_usdt,
             "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "zone_event": "INSIDE_ZONE" if safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+            "zone_event_last_candle_ts": 0.0,
+            "failed_breakout_streak": 0,
+            "failed_breakout_last_candle_ts": 0.0,
+            "failed_breakout_thesis_credit_applied": False,
+            "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
+            "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
+            "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
+            "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(institutional_entry_ctx.get("entry_behavior") or (institutional_entry_ctx.get("market_intelligence") or {}).get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "market_intelligence": {
+                **(institutional_entry_ctx.get("market_intelligence") or {}),
+                "zone_side": side,
+                "failed_breakout_streak": 0,
+                "failed_breakout_thesis_credit_applied": False,
+            },
             "zone_event": "INSIDE_ZONE" if safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
             "zone_event_last_candle_ts": 0.0,
             "failed_breakout_streak": 0,
