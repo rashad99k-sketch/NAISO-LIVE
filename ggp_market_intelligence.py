@@ -113,7 +113,9 @@ def classify_entry_behavior(*, setup_type: str = "", regime: str = "UNKNOWN",
     bos = _num(bos_level)
     disp, cont, vol = _num(displacement_atr), _num(continuation_probability), _num(volatility_atr)
 
-    if ("RETEST" in setup or bos is not None) and (mss_confirmed or "CONTINUATION" in setup):
+    # A BOS price alone is not proof that this setup requires a retest.
+    # Require an explicit setup label, or a confirmed sweep -> MSS sequence.
+    if "RETEST" in setup and (mss_confirmed or bos is not None):
         return EntryBehavior.RETEST.value, 0.82, ("break_structure_reference", "retest_required")
 
     if sweep_confirmed and mss_confirmed and causal_zone_valid:
