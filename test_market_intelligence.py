@@ -4,7 +4,8 @@ from ggp_market_intelligence import (
     TradingMode, EntryBehavior, ZoneEvent,
     classify_trading_mode, classify_entry_behavior, classify_zone_event,
     build_intelligence_decision, advance_failed_breakout_confirmation,
-    is_confirmed_failed_breakout_evidence,
+    is_confirmed_failed_breakout_evidence, select_opposing_liquidity_pool,
+    select_scalp_target_pct,
 )
 
 
