@@ -19,7 +19,8 @@ from roro_institutional import (
 )
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
-from ggp_market_intelligence import build_intelligence_decision, classify_price_pattern
+from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
+                                     build_support_resistance_zones, validate_order_block_zone)
 
 
 REVERSAL = ReversalEngine()
@@ -375,6 +376,25 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
         ob = find_causal_order_block(df, side, price, atr) if np.isfinite(atr) else None
     except Exception:
         ob = None
+    if isinstance(ob, dict):
+        ob_validation = validate_order_block_zone(
+            side=side, zone=ob, candles=df.to_dict("records"), atr=atr,
+            min_strength=5.0, max_distance_atr=1.5,
+        )
+        ob["validation"] = ob_validation
+        ob["status"] = ob_validation.get("status", "UNKNOWN")
+        ob["fill_pct"] = ob_validation.get("fill_pct", 0.0)
+        ob["valid"] = bool(ob_validation.get("valid"))
+        if not ob["valid"]:
+            ob = None
+    try:
+        support_resistance = build_support_resistance_zones(
+            df.to_dict("records"), price=price, atr=atr, lookback=120,
+            pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=6,
+        ) if np.isfinite(atr) else {"status": "UNKNOWN", "supports": [], "resistances": []}
+    except Exception as exc:
+        support_resistance = {"status": "UNKNOWN", "supports": [], "resistances": [],
+                              "reason": f"zone_analysis_error:{type(exc).__name__}"}
     fvg = detect_fvg(df, side=side, atr=atr if np.isfinite(atr) else None)
     volume_base = float(df.volume.iloc[-21:-1].mean()) if len(df) >= 21 else 0.0
     volume_ratio = float(df.volume.iloc[-1]) / volume_base if volume_base > 0 else None
@@ -399,12 +419,19 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     ob_fvg_overlap = False
     if ob_valid and fvg_valid:
         ob_fvg_overlap = max(float(ob["low"]), float(fvg["lower"])) <= min(float(ob["high"]), float(fvg["upper"])) + 0.15 * atr
+    sr = support_resistance if isinstance(support_resistance, dict) else {}
+    sr_candidates = sr.get("supports" if side == "BUY" else "resistances", [])
+    sr_aligned_zone = next((z for z in sr_candidates
+                            if isinstance(z, dict) and z.get("status") == "CONFIRMED"
+                            and float(z.get("distance_atr", 999) or 999) <= 1.5
+                            and float(z.get("strength", 0) or 0) >= 5.0), None)
+    sr_aligned = sr_aligned_zone is not None
     liq_event, liq_direction, liq_level = getattr(liquidity, "event", "UNKNOWN"), getattr(liquidity, "direction", "UNKNOWN"), getattr(liquidity, "level", None)
     liq_near = bool(liq_direction == expected and liq_event in ("SWEEP", "GRAB", "RUN") and liq_level is not None
                      and np.isfinite(atr) and atr > 0 and abs(price - float(liq_level)) <= 1.5 * atr)
     value_aligned = (side == "BUY" and value_zone == "DISCOUNT") or (side == "SELL" and value_zone == "PREMIUM")
-    ref_count = int(ob_valid) + int(fvg_valid) + int(liq_near) + int(value_aligned)
-    golden_score = min(100, int(ob_valid) * 25 + int(fvg_valid) * 20 + int(ob_fvg_overlap) * 20 + int(liq_near) * 20 + int(value_aligned) * 15)
+    ref_count = int(ob_valid) + int(fvg_valid) + int(liq_near) + int(value_aligned) + int(sr_aligned)
+    golden_score = min(100, int(ob_valid) * 25 + int(fvg_valid) * 20 + int(ob_fvg_overlap) * 15 + int(liq_near) * 15 + int(value_aligned) * 10 + int(sr_aligned) * 15)
     if ob_fvg_overlap or (ref_count >= 3 and (ob_valid or fvg_valid)):
         golden_state = "GOLDEN_CONFLUENCE"
     elif (ob_valid or fvg_valid) and value_aligned:
@@ -418,6 +445,7 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     golden = {
         "state": golden_state, "direction": expected, "value_zone": value_zone,
         "ob_valid": ob_valid, "fvg_valid": fvg_valid, "ob_fvg_overlap": ob_fvg_overlap,
+        "support_resistance_aligned": sr_aligned, "aligned_sr_zone": sr_aligned_zone,
         "liquidity_aligned_near": liq_near, "aligned_reference_count": ref_count,
         "score": golden_score,
         "source_definition": "OB/FVG/value/liquidity confluence; not a Fibonacci 61.8% claim",
@@ -425,6 +453,7 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     return {
         "atr": atr, "price": price, "regime": regime, "structure": structure,
         "liquidity": liquidity, "order_block": ob, "fvg": fvg,
+        "support_resistance": support_resistance, "support_resistance_aligned": sr_aligned,
         "volume_ratio": volume_ratio,
         "volume_confirmed": bool(volume_ratio is not None and volume_ratio >= 1.1),
         "golden_zone": golden,
@@ -465,25 +494,16 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     reg, liq, ob, fvg = context["regime"], context["liquidity"], context["order_block"], context["fvg"]
     ob_state = "UNKNOWN"
     if isinstance(ob, dict):
-        ob_low, ob_high = float(ob.get("low", 0) or 0), float(ob.get("high", 0) or 0)
-        width = max(0.0, ob_high - ob_low)
-        impulse_ts = int(ob.get("impulse_timestamp") or ob.get("timestamp") or 0)
-        post_impulse = closed[closed.timestamp > impulse_ts]
-        if width > 0 and not post_impulse.empty:
-            if side == "BUY":
-                penetration = max(0.0, min(width, ob_high - float(post_impulse.low.min())))
-                far_close = bool((post_impulse.close < ob_low).any())
-            else:
-                penetration = max(0.0, min(width, float(post_impulse.high.max()) - ob_low))
-                far_close = bool((post_impulse.close > ob_high).any())
-            fill_pct = max(0.0, min(100.0, penetration / width * 100.0))
-            ob_state = "INVALIDATED" if far_close else "MITIGATED" if fill_pct >= 99.9 else "TESTED" if fill_pct > 0 else "FRESH"
-            ob["fill_pct"] = round(fill_pct, 1)
+        validation = ob.get("validation") if isinstance(ob.get("validation"), dict) else {}
+        # The validator in _build_context is the single source of OB lifecycle state.
+        # Do not recompute the same mitigation metric here with a second label set.
+        if validation.get("valid") is True:
+            ob_state = str(validation.get("status") or ob.get("status") or "UNKNOWN").upper()
             ob["status"] = ob_state
+            ob["fill_pct"] = float(validation.get("fill_pct", ob.get("fill_pct", 0.0)) or 0.0)
         else:
-            ob_state = "FRESH"
-            ob["fill_pct"] = 0.0
-            ob["status"] = ob_state
+            ob = None
+
     liq_name, liq_direction = getattr(liq, "event", "UNKNOWN"), getattr(liq, "direction", "UNKNOWN")
     if decision.setup_type == "FAILED_AUCTION_REVERSAL":
         liq_name, liq_direction = "FAILED_AUCTION", "BULLISH" if side == "BUY" else "BEARISH"
@@ -560,6 +580,8 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "liquidity": {"event": liq_name, "direction": liq_direction, "level": getattr(liq, "level", None),
                       "confidence": getattr(liq, "confidence", 0), "reasons": list(getattr(liq, "reasons", []))},
         "order_block": ob, "order_block_state": ob_state, "fvg": fvg, "golden_zone": golden,
+        "support_resistance": context.get("support_resistance", {"status": "UNKNOWN", "supports": [], "resistances": []}),
+        "support_resistance_aligned": bool(context.get("support_resistance_aligned", False)),
         "volume_ratio": context["volume_ratio"], "volume_confirmed": context["volume_confirmed"],
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),

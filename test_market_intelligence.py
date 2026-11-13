@@ -6,11 +6,59 @@ from ggp_market_intelligence import (
     build_intelligence_decision, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, select_opposing_liquidity_pool,
     select_scalp_target_pct, build_scalp_target, classify_price_pattern,
+    build_support_resistance_zones, validate_order_block_zone,
 )
 
 
 def candle(ts, o, h, l, c):
     return {"timestamp": ts, "open": o, "high": h, "low": l, "close": c}
+
+
+def test_directional_sr_zones_enter_retest_candidates_only_after_confirmation():
+    from roro_institutional import _zone_retest_candidates
+
+    support = {
+        "type": "SUPPORT", "low": 99.0, "high": 100.0, "strength": 6.5,
+        "distance_atr": 0.5, "status": "CONFIRMED",
+        "last_pivot_timestamp": 1000, "confirmed_at_timestamp": 3000,
+    }
+    resistance = {
+        "type": "RESISTANCE", "low": 110.0, "high": 111.0, "strength": 7.0,
+        "distance_atr": 0.8, "status": "CONFIRMED",
+        "last_pivot_timestamp": 2000, "confirmed_at_timestamp": 4000,
+    }
+    developing_support = {**support, "low": 98.0, "high": 98.5, "status": "DEVELOPING"}
+    context = {
+        "support_resistance": {
+            "supports": [support, developing_support],
+            "resistances": [resistance],
+        },
+        "order_block": None,
+        "fvg": None,
+    }
+
+    buy_zones = _zone_retest_candidates(context, 105.0, 1.0, "BUY")
+    sell_zones = _zone_retest_candidates(context, 105.0, 1.0, "SELL")
+
+    assert (99.0, 100.0, "SUPPORT", 3000) in buy_zones
+    assert not any(zone[2] == "RESISTANCE" for zone in buy_zones)
+    assert (110.0, 111.0, "RESISTANCE", 4000) in sell_zones
+    assert not any(zone[2] == "SUPPORT" for zone in sell_zones)
+
+
+def test_support_resistance_candidates_fail_closed_on_missing_confirmation_timestamp():
+    from roro_institutional import _zone_retest_candidates
+
+    zone = {
+        "type": "SUPPORT", "low": 99.0, "high": 100.0, "strength": 8.0,
+        "distance_atr": 0.2, "status": "CONFIRMED",
+        "last_pivot_timestamp": 1000,
+    }
+    zones = _zone_retest_candidates(
+        {"support_resistance": {"supports": [zone], "resistances": []}},
+        105.0, 1.0, "BUY",
+    )
+    assert not any(candidate[2] == "SUPPORT" for candidate in zones)
 
 
 def test_unknown_inputs_fail_closed():
@@ -1053,3 +1101,163 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
     monkeypatch.setattr(bot, "_last_api_call", clock[0])
     bot.rate_limit(fetch_ticker)
     assert waits[-1] == pytest.approx(bot.MIN_API_INTERVAL)
+
+
+def _sr_fixture():
+    rows = []
+    for idx in range(24):
+        o, c, h, lo = 12.0, 12.1, 13.0, 11.0
+        if idx in (4, 14):
+            lo, h, o, c = 10.0, 12.4, 11.8, 12.1
+        if idx in (9, 19):
+            h, lo, o, c = 14.0, 11.6, 12.2, 11.9
+        rows.append(candle((idx + 1) * 900000, o, h, lo, c))
+    return rows
+
+
+def test_support_resistance_clusters_confirmed_pivots_and_reports_zone_geometry():
+    zones = build_support_resistance_zones(
+        _sr_fixture(), price=12.0, atr=1.0, lookback=120,
+        pivot_span=2, cluster_atr=0.22, min_touches=2,
+    )
+    assert zones["status"] == "VALID"
+    support = next(z for z in zones["supports"] if z["status"] == "CONFIRMED")
+    resistance = next(z for z in zones["resistances"] if z["status"] == "CONFIRMED")
+    assert support["type"] == "SUPPORT"
+    assert support["touches"] >= 2
+    assert support["low"] < support["level"] < support["high"]
+    assert support["confirmed_at_timestamp"] > support["last_pivot_timestamp"]
+    assert resistance["type"] == "RESISTANCE"
+    assert resistance["touches"] >= 2
+    assert resistance["low"] < resistance["level"] < resistance["high"]
+    assert resistance["confirmed_at_timestamp"] > resistance["last_pivot_timestamp"]
+
+
+def test_support_resistance_fails_closed_on_invalid_or_non_monotonic_candles():
+    invalid = build_support_resistance_zones(_sr_fixture(), price=0, atr=1)
+    assert invalid["status"] == "UNKNOWN"
+    rows = _sr_fixture()
+    rows[-1] = {**rows[-1], "timestamp": rows[-2]["timestamp"]}
+    result = build_support_resistance_zones(rows, price=12, atr=1)
+    assert result["status"] == "UNKNOWN"
+    assert result["reason"] == "non_monotonic_timestamps"
+
+
+def test_bullish_order_block_validation_tracks_partial_mitigation_and_invalidation():
+    zone = {"low": 9.0, "high": 9.5, "strength": 7.0,
+            "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
+    candles = [
+        candle(1000, 9.5, 9.9, 9.0, 9.2),
+        candle(2000, 9.2, 10.2, 9.1, 10.1),
+        candle(3000, 10.1, 10.5, 9.2, 10.2),
+    ]
+    valid = validate_order_block_zone(side="BUY", zone=zone, candles=candles, atr=1.0)
+    assert valid["valid"] is True
+    assert valid["status"] == "PARTIALLY_MITIGATED"
+    assert valid["fill_pct"] == pytest.approx(60.0)
+
+    fully_mitigated = candles + [candle(4000, 10.2, 10.4, 9.0, 10.1)]
+    consumed = validate_order_block_zone(side="BUY", zone=zone, candles=fully_mitigated, atr=1.0)
+    assert consumed["valid"] is False
+    assert consumed["status"] == "FULLY_MITIGATED"
+
+    broken = fully_mitigated + [candle(5000, 9.5, 9.7, 8.8, 8.9)]
+    invalid = validate_order_block_zone(side="BUY", zone=zone, candles=broken, atr=1.0)
+    assert invalid["valid"] is False
+    assert invalid["status"] == "INVALIDATED"
+
+
+def test_bearish_order_block_validation_is_directionally_symmetric():
+    zone = {"low": 10.5, "high": 11.0, "strength": 7.0,
+            "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
+    candles = [
+        candle(1000, 10.5, 11.0, 10.1, 10.8),
+        candle(2000, 10.8, 10.9, 9.8, 9.9),
+        candle(3000, 9.9, 10.8, 9.5, 9.8),
+    ]
+    valid = validate_order_block_zone(side="SELL", zone=zone, candles=candles, atr=1.0)
+    assert valid["valid"] is True
+    assert valid["status"] == "PARTIALLY_MITIGATED"
+    assert valid["fill_pct"] == pytest.approx(60.0)
+
+    fully_mitigated = candles + [candle(4000, 9.8, 11.0, 9.6, 10.0)]
+    consumed = validate_order_block_zone(side="SELL", zone=zone, candles=fully_mitigated, atr=1.0)
+    assert consumed["valid"] is False
+    assert consumed["status"] == "FULLY_MITIGATED"
+
+    broken = fully_mitigated + [candle(5000, 10.7, 11.2, 10.6, 11.1)]
+    invalid = validate_order_block_zone(side="SELL", zone=zone, candles=broken, atr=1.0)
+    assert invalid["status"] == "INVALIDATED"
+
+
+def test_order_block_validator_rejects_malformed_or_noncausal_candles():
+    zone = {"low": 9.0, "high": 9.5, "strength": 7.0,
+            "distance_atr": 0.4, "timestamp": 1000, "impulse_timestamp": 2000}
+    malformed = [
+        candle(1000, 9.5, 9.9, 9.0, 9.2),
+        candle(2000, 9.2, 9.1, 9.0, 10.1),
+        candle(3000, 10.1, 10.5, 9.2, 10.2),
+    ]
+    result = validate_order_block_zone(side="BUY", zone=zone, candles=malformed, atr=1.0)
+    assert result["valid"] is False
+    assert result["status"] == "DATA_UNAVAILABLE"
+
+    bad_geometry = {**zone, "high": 9.8}
+    causal_rows = [
+        candle(1000, 9.5, 9.9, 9.0, 9.2),
+        candle(2000, 9.2, 10.2, 9.1, 10.1),
+        candle(3000, 10.1, 10.5, 9.2, 10.2),
+    ]
+    result = validate_order_block_zone(side="BUY", zone=bad_geometry, candles=causal_rows, atr=1.0)
+    assert result["valid"] is False
+    assert result["status"] == "INVALID"
+
+
+def test_institutional_bridge_publishes_directional_support_resistance_and_validated_ob():
+    from pathlib import Path
+
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert "build_support_resistance_zones(" in source
+    assert "validate_order_block_zone(" in source
+    assert '"support_resistance": support_resistance' in source
+    assert '"support_resistance_aligned": sr_aligned' in source
+    assert 'sr.get("supports" if side == "BUY" else "resistances", [])' in source
+
+
+def test_institutional_engine_consumes_directional_confirmed_sr_for_retests():
+    from pathlib import Path
+
+    source = Path("roro_institutional.py").read_text(encoding="utf-8")
+    start = source.index("def _zone_retest_candidates(")
+    end = source.index("\ndef _find_failed_auction(", start)
+    helper = source[start:end]
+    assert 'expected_type = "SUPPORT" if direction == "BUY" else "RESISTANCE"' in helper
+    assert 'status != "CONFIRMED"' in helper
+    assert 'zone["confirmed_at_timestamp"]' in helper
+    assert 'levels.append((low, high, expected_type, available_ts))' in helper
+
+
+def test_institutional_bridge_uses_one_authoritative_ob_validation_state():
+    from pathlib import Path
+
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    analyze_start = source.index("def analyze_symbol(")
+    analyze_end = source.index("\ndef analyze_symbol_both(", analyze_start)
+    analyzer = source[analyze_start:analyze_end]
+    assert 'validation.get("valid") is True' in analyzer
+    assert 'validation.get("status")' in analyzer
+    assert 'ob["status"] = ob_state' in analyzer
+    assert "post_impulse.low.min()" not in analyzer
+    assert "post_impulse.high.max()" not in analyzer
+
+
+def test_legacy_scanner_support_resistance_wrapper_uses_confirmed_zone_engine():
+    from pathlib import Path
+
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    start = source.index("def get_clustered_zones(")
+    end = source.index("\ndef detect_liquidity_cluster(", start)
+    wrapper = source[start:end]
+    assert "build_support_resistance_zones(" in wrapper
+    assert 'z.get("status") == "CONFIRMED"' in wrapper
+    assert "return supports, resistances" in wrapper

@@ -119,6 +119,7 @@ def _confirmed_pivots(df: pd.DataFrame, end: Optional[int] = None, left_right: i
 
 def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr: float, side: str):
     # Fourth value is the timestamp when the zone became knowable to the strategy.
+    direction = str(side or "").upper()
     levels = [(float(fallback_level), float(fallback_level), "BOS_LEVEL", None)]
     ob = context.get("order_block")
     if isinstance(ob, dict):
@@ -137,6 +138,33 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
                            int(available_ts) if available_ts is not None else None))
         except (KeyError, TypeError, ValueError):
             pass
+
+    # Consume only the zone that is structurally aligned with the proposed side.
+    # confirmed_at_timestamp prevents using a pivot before its right-side bars closed.
+    sr = context.get("support_resistance")
+    expected_type = "SUPPORT" if direction == "BUY" else "RESISTANCE" if direction == "SELL" else ""
+    sr_key = "supports" if direction == "BUY" else "resistances" if direction == "SELL" else ""
+    if expected_type and isinstance(sr, dict):
+        zones = sr.get(sr_key, [])
+        if isinstance(zones, list):
+            for zone in zones:
+                if not isinstance(zone, dict):
+                    continue
+                try:
+                    zone_type = str(zone.get("type") or "").upper()
+                    status = str(zone.get("status") or "").upper()
+                    low, high = float(zone.get("low")), float(zone.get("high"))
+                    strength = float(zone.get("strength", 0) or 0)
+                    distance = float(zone.get("distance_atr", float("inf")))
+                    available_ts = int(zone["confirmed_at_timestamp"])
+                    if (zone_type != expected_type or status != "CONFIRMED"
+                            or not (0 < low < high) or strength < 5.0
+                            or not math.isfinite(distance) or distance > 1.5
+                            or available_ts <= 0):
+                        continue
+                    levels.append((low, high, expected_type, available_ts))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
     return levels
 
 

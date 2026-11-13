@@ -83,6 +83,7 @@ from ggp_market_data import (
 from ggp_market_intelligence import (
     classify_zone_event, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, build_scalp_target,
+    build_support_resistance_zones,
 )
 from ggp_institutional_bridge import build_liquidity_pools
 
@@ -4664,33 +4665,44 @@ def detect_structure_shift(df):
     return None
 
 def get_clustered_zones(df, lookback=120, cluster_pct=0.002):
-    highs = df['high'].values[-lookback:]
-    lows = df['low'].values[-lookback:]
-    swing_highs = []
-    for i in range(2, len(highs)-2):
-        if highs[i] == max(highs[i-2:i+3]):
-            swing_highs.append(highs[i])
-    swing_lows = []
-    for i in range(2, len(lows)-2):
-        if lows[i] == min(lows[i-2:i+3]):
-            swing_lows.append(lows[i])
-    def cluster(points, pct):
-        if not points:
-            return []
-        points = sorted(points)
-        clusters = []
-        current = [points[0]]
-        for p in points[1:]:
-            if abs(p - current[-1]) / p < pct:
-                current.append(p)
-            else:
-                clusters.append(sum(current)/len(current))
-                current = [p]
-        clusters.append(sum(current)/len(current))
-        return clusters
-    res_levels = cluster(swing_highs, cluster_pct)
-    sup_levels = cluster(swing_lows, cluster_pct)
-    return sup_levels, res_levels
+    """Compatibility wrapper over the canonical confirmed S/R zone engine."""
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 20:
+        return [], []
+    try:
+        validator = globals().get("roro_validate_closed_frame")
+        if not callable(validator):
+            return [], []
+        now_ms, _time_source = _entry_exchange_time_ms()
+        closed = validator(
+            df.copy(), now_ms=int(now_ms),
+            timeframe_s=int(_roro_timeframe_seconds(str(INTERVAL))),
+        )
+        if not isinstance(closed, pd.DataFrame) or len(closed) < 20:
+            return [], []
+        atr_series = compute_atr(closed)
+        atr_value = safe_float(atr_series.iloc[-1], 0.0) if atr_series is not None and len(atr_series) else 0.0
+        price = safe_float(closed["close"].iloc[-1], 0.0)
+        if atr_value <= 0 or price <= 0:
+            return [], []
+        zones = build_support_resistance_zones(
+            closed.tail(max(20, int(lookback))).to_dict("records"),
+            price=price, atr=atr_value, lookback=lookback,
+            pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=8,
+        )
+        if zones.get("status") != "VALID":
+            return [], []
+        supports = [
+            float(z["level"]) for z in zones.get("supports", [])
+            if z.get("status") == "CONFIRMED" and float(z.get("strength", 0) or 0) >= 5.0
+        ]
+        resistances = [
+            float(z["level"]) for z in zones.get("resistances", [])
+            if z.get("status") == "CONFIRMED" and float(z.get("strength", 0) or 0) >= 5.0
+        ]
+        return supports, resistances
+    except Exception as exc:
+        log_execution(f"[STRUCTURE_ZONES] S/R calculation unavailable: {type(exc).__name__}: {exc}", "WARN")
+        return [], []
 
 def detect_liquidity_cluster(df, lb=20, tol=0.001):
     highs = df['high'].iloc[-lb:]
@@ -5197,6 +5209,7 @@ STATE = {
     "failed_breakout_thesis_credit_applied": False,
     "entry_zone_low": 0.0,
     "entry_zone_high": 0.0,
+    "support_resistance": {"status": "UNKNOWN", "supports": [], "resistances": []},
     "entry_behavior_confidence": 0.0,
     "entry_behavior_reasons": [],
     "trading_mode": "UNCLASSIFIED",
@@ -6090,6 +6103,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "failed_breakout_thesis_credit_applied": False,
             "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
             "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "support_resistance": dict(institutional_entry_ctx.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
             "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
             "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
             "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
@@ -6209,6 +6223,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "failed_breakout_thesis_credit_applied": False,
             "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
             "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "support_resistance": dict(institutional_entry_ctx.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
             "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
             "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
             "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
@@ -10560,6 +10575,7 @@ def smart_opportunity_selection():
                 "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
                 "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
+                "support_resistance": dict(item.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
                 "entry_behavior_confidence": safe_float(item.get("entry_behavior_confidence", market_intelligence.get("confidence")), 0.0),
                 "entry_behavior_reasons": list(item.get("entry_behavior_reasons") or market_intelligence.get("reason_codes") or []),
                 "market_intelligence": dict(market_intelligence),
