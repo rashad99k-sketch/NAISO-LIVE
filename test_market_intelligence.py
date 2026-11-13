@@ -14,6 +14,53 @@ def candle(ts, o, h, l, c):
     return {"timestamp": ts, "open": o, "high": h, "low": l, "close": c}
 
 
+def test_directional_sr_zones_enter_retest_candidates_only_after_confirmation():
+    from roro_institutional import _zone_retest_candidates
+
+    support = {
+        "type": "SUPPORT", "low": 99.0, "high": 100.0, "strength": 6.5,
+        "distance_atr": 0.5, "status": "CONFIRMED",
+        "last_pivot_timestamp": 1000, "confirmed_at_timestamp": 3000,
+    }
+    resistance = {
+        "type": "RESISTANCE", "low": 110.0, "high": 111.0, "strength": 7.0,
+        "distance_atr": 0.8, "status": "CONFIRMED",
+        "last_pivot_timestamp": 2000, "confirmed_at_timestamp": 4000,
+    }
+    developing_support = {**support, "low": 98.0, "high": 98.5, "status": "DEVELOPING"}
+    context = {
+        "support_resistance": {
+            "supports": [support, developing_support],
+            "resistances": [resistance],
+        },
+        "order_block": None,
+        "fvg": None,
+    }
+
+    buy_zones = _zone_retest_candidates(context, 105.0, 1.0, "BUY")
+    sell_zones = _zone_retest_candidates(context, 105.0, 1.0, "SELL")
+
+    assert (99.0, 100.0, "SUPPORT", 3000) in buy_zones
+    assert not any(zone[2] == "RESISTANCE" for zone in buy_zones)
+    assert (110.0, 111.0, "RESISTANCE", 4000) in sell_zones
+    assert not any(zone[2] == "SUPPORT" for zone in sell_zones)
+
+
+def test_support_resistance_candidates_fail_closed_on_missing_confirmation_timestamp():
+    from roro_institutional import _zone_retest_candidates
+
+    zone = {
+        "type": "SUPPORT", "low": 99.0, "high": 100.0, "strength": 8.0,
+        "distance_atr": 0.2, "status": "CONFIRMED",
+        "last_pivot_timestamp": 1000,
+    }
+    zones = _zone_retest_candidates(
+        {"support_resistance": {"supports": [zone], "resistances": []}},
+        105.0, 1.0, "BUY",
+    )
+    assert not any(candidate[2] == "SUPPORT" for candidate in zones)
+
+
 def test_unknown_inputs_fail_closed():
     mode, confidence, reasons = classify_trading_mode(regime="UNKNOWN", data_quality="UNKNOWN")
     assert mode == TradingMode.UNCLASSIFIED.value
@@ -1079,9 +1126,11 @@ def test_support_resistance_clusters_confirmed_pivots_and_reports_zone_geometry(
     assert support["type"] == "SUPPORT"
     assert support["touches"] >= 2
     assert support["low"] < support["level"] < support["high"]
+    assert support["confirmed_at_timestamp"] > support["last_pivot_timestamp"]
     assert resistance["type"] == "RESISTANCE"
     assert resistance["touches"] >= 2
     assert resistance["low"] < resistance["level"] < resistance["high"]
+    assert resistance["confirmed_at_timestamp"] > resistance["last_pivot_timestamp"]
 
 
 def test_support_resistance_fails_closed_on_invalid_or_non_monotonic_candles():
@@ -1173,6 +1222,19 @@ def test_institutional_bridge_publishes_directional_support_resistance_and_valid
     assert '"support_resistance": support_resistance' in source
     assert '"support_resistance_aligned": sr_aligned' in source
     assert 'sr.get("supports" if side == "BUY" else "resistances", [])' in source
+
+
+def test_institutional_engine_consumes_directional_confirmed_sr_for_retests():
+    from pathlib import Path
+
+    source = Path("roro_institutional.py").read_text(encoding="utf-8")
+    start = source.index("def _zone_retest_candidates(")
+    end = source.index("\ndef _find_failed_auction(", start)
+    helper = source[start:end]
+    assert 'expected_type = "SUPPORT" if direction == "BUY" else "RESISTANCE"' in helper
+    assert 'status != "CONFIRMED"' in helper
+    assert 'zone["confirmed_at_timestamp"]' in helper
+    assert 'levels.append((low, high, expected_type, available_ts))' in helper
 
 
 def test_institutional_bridge_uses_one_authoritative_ob_validation_state():
