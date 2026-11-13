@@ -315,6 +315,22 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return merged
 
 
+def _sniper_evidence_matches_side(side: str, liquidity_event: str,
+                                    liquidity_direction: str, market_structure_shift: Any,
+                                    causal_zone_valid: bool) -> bool:
+    """Require the sweep and reversal MSS to agree with the proposed trade side."""
+    direction = str(side or "").upper()
+    expected = "BULLISH" if direction == "BUY" else "BEARISH" if direction == "SELL" else ""
+    expected_mss = f"{expected}_CHOCH" if expected else ""
+    return bool(
+        expected
+        and str(liquidity_event or "").upper() in {"SWEEP", "GRAB"}
+        and str(liquidity_direction or "").upper() == expected
+        and str(market_structure_shift or "").upper() == expected_mss
+        and causal_zone_valid
+    )
+
+
 def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     atr = _atr(df)
     price = float(df.close.iloc[-1])
@@ -438,7 +454,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
                      and ob_state not in ("MITIGATED", "INVALIDATED"))
         except (TypeError, ValueError):
             ob_ok = False
-    fvg_ok = bool(fvg and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
+    fvg_ok = bool(isinstance(fvg, dict) and fvg.get("direction") == expected\n                 and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"))
     d, golden = _decision_result(decision), context["golden_zone"]
     # Explainable mode/entry-behavior classification. This is analytical metadata only;
     # UnifiedEntryAuthority and execute_entry remain the sole entry authorization path.
@@ -469,8 +485,8 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         liquidity_quality=("GOOD" if float(_liq_conf or 0) >= 65.0 else "ADEQUATE" if float(_liq_conf or 0) >= 50.0 else "UNKNOWN"),
         displacement_atr=_disp_atr,
         setup_type=decision.setup_type,
-        sweep_confirmed=liq_name in ("SWEEP", "GRAB"),
-        mss_confirmed=bool(context["structure"].get("mss")),
+        sweep_confirmed=_sniper_evidence_matches_side(\n            side, liq_name, liq_direction, context["structure"].get("mss"), bool(ob_ok or fvg_ok)\n        ),
+        mss_confirmed=(\n            str(context["structure"].get("mss") or "").upper()\n            == ("BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH")\n        ),
         causal_zone_valid=bool(ob_ok or fvg_ok),
         bos_level=(context["structure"].get("swing_high") if side == "BUY" else context["structure"].get("swing_low")),
         reference_low=_zone_low, reference_high=_zone_high,
