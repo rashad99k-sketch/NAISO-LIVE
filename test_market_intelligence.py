@@ -541,3 +541,12 @@ def test_opposite_direction_fvg_is_not_a_valid_trade_zone():
         and fvg.get("direction") == expected
         and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED")
     )
+
+
+def test_trade_management_context_exposes_entry_mode_separately_from_profit_mode():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert '"entry_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED")' in source
+    assert '"profit_mode": STATE.get("profit_mode", STANDARD_MODE)' in source
+    assert '"entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED")' in source
+    assert 'management_mode={current_mode}' in source
