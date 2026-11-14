@@ -29,6 +29,12 @@ import numpy as np
 from flask import Flask, jsonify, request
 import requests
 
+from ggp_close_recovery import (
+    amount_step_from_market,
+    floor_amount_to_step,
+    is_contract_amount_precision_error,
+)
+
 # Load project-local configuration safely. PAPER mode remains the default.
 ENV_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE_PATH = os.path.join(ENV_DIR, ".env")
@@ -2096,6 +2102,14 @@ class ExchangeSyncService:
                     STATE["open"] = True
                     STATE["current_symbol"] = symbol
                     STATE["entry_time"] = time.time()
+            if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required") or STATE.get("pending_close_order_id"):
+                if not _resolve_pending_close_from_snapshot(symbol, snap):
+                    log_execution(
+                        f"[RECONCILIATION] {symbol}: position is OPEN but pending close outcome is not terminal/verified; "
+                        "management remains safely paused",
+                        "WARN", debounce_key=f"close_reconcile_pending_{symbol}", debounce_sec=30,
+                    )
+                    return "OPEN_UNRESOLVED"
             log_execution(f"[RECONCILIATION] Completed: ROE={snap.roe_pct:.2f}%, Qty={snap.qty}", "SUCCESS")
             self.event_bus.emit("reconciled", snap)
             return "OPEN"
@@ -2654,6 +2668,59 @@ def _close_failure(message, *, unresolved=True):
     return False
 
 
+def _close_amount_step(symbol):
+    """Read a contract amount step without guessing when CCXT metadata is ambiguous."""
+    cached = safe_float(STATE.get("close_amount_step"), 0.0)
+    if cached > 0:
+        return cached
+    try:
+        market = ex.market(normalize_symbol(symbol))
+        step = amount_step_from_market(market, getattr(ex, "precisionMode", None))
+        if step and step > 0:
+            STATE["close_amount_step"] = float(step)
+            return float(step)
+    except Exception as exc:
+        log_execution(f"[CLOSE_RECOVERY] amount-step metadata unavailable for {symbol}: {exc}",
+                      "WARN", debounce_key=f"close_amount_step_{symbol}", debounce_sec=120)
+    return 0.0
+
+
+def _close_rejection_position_state(symbol, before_qty):
+    """A rejected amount order is retryable only if BingX still shows the same exposure."""
+    status, position = fetch_position_tri_state(symbol)
+    if status == "FLAT":
+        _clear_confirmed_flat(symbol, reason="EXCHANGE_FLAT_AFTER_REJECTED_CLOSE")
+        return "FLAT"
+    if status != "OPEN":
+        return "UNKNOWN"
+    observed = _position_contracts(position)
+    tolerance = max(abs(float(before_qty)) * 0.001, 1e-10)
+    return "UNCHANGED" if abs(observed - float(before_qty)) <= tolerance else "CHANGED"
+
+
+def _release_confirmed_close_rejection(symbol, reason):
+    """Release only a proven no-order/no-fill rejection; leave the live trade intact."""
+    STATE.update({
+        "execution_unresolved": False,
+        "close_reconciliation_required": False,
+        "pending_close_order_id": None,
+        "pending_close_reason": None,
+        "pending_close_before_qty": 0.0,
+        "pending_close_requested_qty": 0.0,
+        "pending_close_target_remaining_qty": None,
+        "pending_close_started_at": 0.0,
+    })
+    globals()["RECOVERY_BLOCK_ENTRIES"] = False
+    MEMORY["recovery_status"] = "CLOSE_REJECTED_NO_FILL_RECOVERED"
+    _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
+    log_execution(
+        f"[CLOSE_RECOVERY] {symbol}: confirmed amount rejection with unchanged BingX exposure; "
+        f"management resumed; reason={reason}",
+        "WARN",
+    )
+    return True
+
+
 def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaining_qty=None,
                             close_reason="BOT_STRICT_CLOSE"):
     """Submit one reduce-only MARKET order and verify the actual BingX position delta.
@@ -2730,6 +2797,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         STATE["exchange_qty"] = before
         TRADE_STATE["qty"] = before
 
+    had_target_remaining = target_remaining_qty is not None
     if target_remaining_qty is not None:
         requested = max(0.0, before-max(0.0, safe_float(target_remaining_qty)))
     elif qty is not None:
@@ -2742,10 +2810,42 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         return False
 
     sym = normalize_symbol(symbol)
+    market_meta = {}
+    try:
+        market_meta = ex.market(sym)
+    except Exception:
+        market_meta = {}
+    amount_step = amount_step_from_market(market_meta, getattr(ex, "precisionMode", None))
+    if amount_step and amount_step > 0:
+        STATE["close_amount_step"] = float(amount_step)
+        requested = floor_amount_to_step(requested, amount_step)
+        if had_target_remaining:
+            target_remaining_qty = max(0.0, before-requested)
+    if requested <= 0:
+        log_execution(
+            f"[CLOSE_RECOVERY] {symbol}: partial close is below the smallest executable amount; "
+            "no order sent and normal management remains active",
+            "WARN", debounce_key=f"close_below_step_{symbol}_{close_reason}", debounce_sec=60,
+        )
+        return False
+    limits = market_meta.get("limits") if isinstance(market_meta, dict) else {}
+    amount_limits = limits.get("amount") if isinstance(limits, dict) else {}
+    min_amount = safe_float(amount_limits.get("min"), 0.0) if isinstance(amount_limits, dict) else 0.0
+    if min_amount > 0 and requested + 1e-12 < min_amount:
+        log_execution(
+            f"[CLOSE_RECOVERY] {symbol}: requested close {requested:g} is below market minimum "
+            f"{min_amount:g}; no order sent and normal management remains active",
+            "WARN", debounce_key=f"close_below_min_{symbol}_{close_reason}", debounce_sec=60,
+        )
+        return False
+
     try:
         requested = float(ex.amount_to_precision(sym, requested))
         if requested <= 0:
-            return _close_failure("close quantity rounded to zero", unresolved=False)
+            log_execution(f"[CLOSE_RECOVERY] {symbol}: close quantity formatted to zero; no order sent", "WARN")
+            return False
+        if had_target_remaining:
+            target_remaining_qty = max(0.0, before-requested)
         close_side = "sell" if side == "BUY" else "buy"
         mode_result = BingXPositionModeAdapter(ex).read(sym)
         if mode_result.mode is PositionMode.UNKNOWN:
@@ -2755,8 +2855,45 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
-        order = ex.create_order(sym, "market", close_side, requested,
-                                params=close_params)
+        # The sole exception is CCXT's explicit natural-contract amount rejection. That
+        # validation rejection is not an unknown fill: first prove BingX exposure is
+        # unchanged, then make at most one downward-only integer-contract correction.
+        try:
+            order = ex.create_order(sym, "market", close_side, requested,
+                                    params=close_params)
+        except Exception as submit_exc:
+            if not is_contract_amount_precision_error(submit_exc):
+                raise
+            rejection_state = _close_rejection_position_state(symbol, before)
+            if rejection_state == "FLAT":
+                return False
+            if rejection_state != "UNCHANGED":
+                return _close_failure(
+                    f"amount precision rejection but BingX exposure could not be proven unchanged "
+                    f"(state={rejection_state}); no retry sent"
+                )
+            STATE["close_amount_step"] = 1.0
+            retry_requested = floor_amount_to_step(requested, 1.0)
+            if retry_requested <= 0 or retry_requested >= requested - 1e-10:
+                _release_confirmed_close_rejection(symbol, str(submit_exc))
+                return False
+            retry_requested = float(ex.amount_to_precision(sym, retry_requested))
+            if retry_requested <= 0:
+                _release_confirmed_close_rejection(symbol, "integer contract correction rounded to zero")
+                return False
+            # A correction may only reduce the requested close; never round up.
+            if retry_requested > requested + 1e-10:
+                return _close_failure("integer contract correction would increase close quantity; retry blocked")
+            order = ex.create_order(sym, "market", close_side, retry_requested,
+                                    params=close_params)
+            requested = retry_requested
+            if had_target_remaining:
+                target_remaining_qty = max(0.0, before-requested)
+            log_execution(
+                f"[CLOSE_RECOVERY] {symbol}: corrected rejected fractional contract amount "
+                f"to {requested:g}; one verified retry submitted",
+                "WARN",
+            )
         if not isinstance(order, dict):
             return _close_failure("BingX returned no structured close-order response")
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
@@ -2775,6 +2912,13 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                 del bot_ids[:-50]
         _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
     except Exception as exc:
+        if is_contract_amount_precision_error(exc):
+            rejection_state = _close_rejection_position_state(symbol, before)
+            if rejection_state == "FLAT":
+                return False
+            if rejection_state == "UNCHANGED":
+                _release_confirmed_close_rejection(symbol, str(exc))
+                return False
         return _close_failure(f"market close submission ambiguous: {type(exc).__name__}: {exc}")
 
     post_status, post_position, order_state = "UNKNOWN", None, order
@@ -3920,7 +4064,10 @@ class LiveTradeManager:
                                   target_remaining_qty=target_remaining):
                 remaining = safe_float(STATE.get("remaining_qty"))
                 filled = safe_float(STATE.get("last_close_filled_qty"), max(0.0, before_remaining - remaining))
-                if initial > 0 and remaining <= initial * 0.505:
+                tp1_target_remaining = safe_float(target_remaining, initial * 0.5)
+                tp1_step = _close_amount_step(symbol)
+                tp1_tolerance = max(initial * 0.005, tp1_step * 0.51 if tp1_step > 0 else 0.0)
+                if initial > 0 and remaining <= tp1_target_remaining + tp1_tolerance:
                     STATE["partial_closed"] = True
                     STATE["tp1_hit"] = True
                     be_buffer = max(safe_float(STATE.get("entry")) * 0.0010, safe_float(STATE.get("atr")) * 0.10)
@@ -11304,7 +11451,10 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
                   "remaining_qty": after, "exchange_qty": after})
     if reason == "TP1":
         STATE["tp1_filled_qty"] = safe_float(STATE.get("tp1_filled_qty"), 0.0)+filled_by_delta
-        if STATE.get("initial_qty", 0) > 0 and after <= safe_float(STATE.get("initial_qty"))*0.505:
+        initial_qty = safe_float(STATE.get("initial_qty"), 0.0)
+        tp1_step = _close_amount_step(symbol) if initial_qty > 0 else 0.0
+        tp1_tolerance = max(initial_qty * 0.005, tp1_step * 0.51 if tp1_step > 0 else 0.0)
+        if initial_qty > 0 and after <= initial_qty * 0.5 + tp1_tolerance:
             STATE["tp1_hit"] = True
             STATE["partial_closed"] = True
     elif reason == "TP2":
