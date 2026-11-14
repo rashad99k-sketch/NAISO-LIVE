@@ -31,5 +31,9 @@ jobs:
           pip install -r requirements.txt
       - name: Compile touched runtime modules
         run: python -m compileall -q ggpbot.py ggp_close_recovery.py ggp_recovery.py
-      - name: Run focused recovery and lifecycle regression tests
-        run: pytest -q test_close_recovery_guard.py test_recovery_lifecycle.py
+      - name: Run focused recovery and lifecycle regression tests three times
+        run: |
+          for attempt in 1 2 3; do
+            echo "Close recovery regression pass ${attempt}/3"
+            pytest -q test_close_recovery_guard.py test_recovery_lifecycle.py || exit 1
+          done
