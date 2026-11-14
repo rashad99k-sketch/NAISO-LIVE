@@ -1275,3 +1275,24 @@ def test_restart_restores_pending_close_then_live_manager_resumes_after_client_i
     assert ggpbot.STATE["execution_unresolved"] is False
     assert ggpbot.STATE["close_reconciliation_required"] is False
     assert ggpbot.STATE["remaining_qty"] == pytest.approx(1.0)
+
+
+
+def test_tp1_fill_evidence_accepts_recorded_client_order_id(monkeypatch):
+    _fresh_state()
+    client_id = "naiso-close-tp1-evidence"
+    order = {
+        "id": "tp1-evidence-order-1", "clientOrderId": client_id,
+        "symbol": "BTC/USDT:USDT", "side": "sell", "type": "market",
+        "positionSide": "LONG", "status": "closed", "filled": 1.0,
+        "timestamp": int(time.time() * 1000), "info": {},
+    }
+    exchange = MockExchange(position=_long_position(qty=1.0))
+    exchange.fetch_closed_orders = lambda *args: [order]
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+
+    assert ggpbot._tp1_fill_verified_on_exchange(
+        "BTC/USDT:USDT", "BUY", expected_fill_qty=1.0,
+        position_side="LONG", position_mode="HEDGE",
+        close_order_ids=[client_id], trade_entry_ts=time.time() - 60,
+    ) is True
