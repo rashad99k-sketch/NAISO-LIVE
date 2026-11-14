@@ -22,7 +22,7 @@ def amount_step_from_market(market: Any, precision_mode: Any) -> Optional[float]
         value = Decimal(str(raw))
     except (InvalidOperation, TypeError, ValueError):
         return None
-    if not value.is_finite() or value <= 0:
+    if not value.is_finite() or value < 0:
         return None
 
     # CCXT constants: DECIMAL_PLACES=2, SIGNIFICANT_DIGITS=3, TICK_SIZE=4.
@@ -31,7 +31,7 @@ def amount_step_from_market(market: Any, precision_mode: Any) -> Optional[float]
     except (TypeError, ValueError):
         return None
     if mode == 4:  # TICK_SIZE: precision.amount is the actual step.
-        return float(value)
+        return float(value) if value > 0 else None
     if mode == 2:  # DECIMAL_PLACES: precision.amount is decimal places.
         places = int(value)
         if value != Decimal(places) or places < 0:
@@ -76,3 +76,31 @@ def is_contract_amount_precision_error(error: Any) -> bool:
         "amount of " in message
         and "must be greater than minimum amount precision of 1" in message
     )
+
+
+
+def recover_integer_contract_amount(requested: Any, before_qty: Any, observed_qty: Any,
+                                    position_status: str) -> Optional[float]:
+    """Return one smaller integer-contract retry only after unchanged OPEN exposure.
+
+    None means the exchange position is not proven unchanged. Zero means there is
+    no safe smaller positive integer amount to retry. A positive result is safe to
+    use for exactly one retry after an explicit CCXT amount-precision rejection.
+    """
+    if str(position_status or "").upper() != "OPEN":
+        return None
+    try:
+        before = Decimal(str(before_qty))
+        observed = Decimal(str(observed_qty))
+        amount = Decimal(str(requested))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not all(x.is_finite() for x in (before, observed, amount)) or before <= 0 or amount <= 0:
+        return None
+    tolerance = max(before * Decimal("0.001"), Decimal("1e-10"))
+    if abs(observed - before) > tolerance:
+        return None
+    retry = floor_amount_to_step(amount, 1)
+    if retry <= 0 or retry >= float(amount) - 1e-10:
+        return 0.0
+    return retry
