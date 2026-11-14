@@ -3054,7 +3054,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
     tolerance = max(before*0.002, 1e-10)
     if filled <= tolerance:
         if order_status in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} and post_status == "OPEN":
-            STATE.update({"pending_close_order_id": None, "pending_close_reason": None,
+            STATE.update({"pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
                           "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
                           "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
                           "execution_unresolved": False, "close_reconciliation_required": False})
@@ -3093,7 +3093,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                       "last_close_pnl_source": pnl_source, "last_close_verified": True,
                       "last_exchange_close_status": post_status, "execution_unresolved": False,
                       "close_reconciliation_required": False, "close_verified": post_status == "FLAT",
-                      "pending_close_order_id": None, "pending_close_reason": None,
+                      "pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
                       "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
                       "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
                       "last_close_pnl_complete": bool(STATE.get("last_close_pnl_complete", True) and pnl_source == "BINGX_ORDER_REALIZED_PNL")})
@@ -6382,7 +6382,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "close_verified": False, "last_close_verified": False, "last_close_order_id": None,
             "last_close_reason": None, "last_close_fill_price": None, "last_close_filled_qty": 0.0,
             "last_close_realized_pnl": 0.0, "last_close_pnl_source": None, "last_close_pnl_complete": True,
-            "bot_close_order_ids": [], "pending_close_order_id": None, "pending_close_reason": None,
+            "bot_close_order_ids": [], "pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
             "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
             "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
             "structural_invalidation": False, "thesis_failure_reasons": [],
@@ -6512,7 +6512,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "close_verified": False, "last_close_verified": False, "last_close_order_id": None,
             "last_close_reason": None, "last_close_fill_price": None, "last_close_filled_qty": 0.0,
             "last_close_realized_pnl": 0.0, "last_close_pnl_source": None, "last_close_pnl_complete": True,
-            "bot_close_order_ids": [], "pending_close_order_id": None, "pending_close_reason": None,
+            "bot_close_order_ids": [], "pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
             "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
             "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
             "structural_invalidation": False, "thesis_failure_reasons": [],
@@ -11479,15 +11479,23 @@ def _clear_confirmed_flat(symbol, reason="EXCHANGE_FLAT_CONFIRMED"):
 def _resolve_pending_close_from_snapshot(symbol, snap):
     """Resolve an ambiguous bot close after a fresh OPEN snapshot and terminal order read."""
     order_id = STATE.get("pending_close_order_id")
-    if not order_id:
+    client_order_id = STATE.get("pending_close_client_order_id")
+    if not order_id and not client_order_id:
+        # Legacy unresolved records without a durable client ID cannot be attributed
+        # safely from a position-size delta alone. Keep the hold rather than guess.
         return not bool(STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"))
-    try:
-        order = safe_api_call(ex.fetch_order, str(order_id), normalize_symbol(symbol)) if hasattr(ex, "fetch_order") else None
-    except Exception as exc:
-        log_execution(f"[CLOSE_RECOVERY] cannot read pending order {order_id}: {exc}", "WARN")
-        return False
+    order = _fetch_close_order_by_identity(
+        symbol, order_id=order_id, client_order_id=client_order_id
+    )
     if not isinstance(order, dict):
+        log_execution(
+            f"[CLOSE_RECOVERY] pending close lookup is not confirmed "
+            f"(exchange_id={order_id or 'missing'}, client_id={client_order_id or 'missing'}); "
+            "management remains safely paused",
+            "WARN", debounce_key=f"pending_close_lookup_{symbol}", debounce_sec=30,
+        )
         return False
+    resolved_order_id = order.get("id") or (order.get("info") or {}).get("orderId") or order_id or client_order_id
     status = str(order.get("status") or "UNKNOWN").upper()
     terminal = status in {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
     if not terminal:
@@ -11498,7 +11506,7 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
     if before > 0 and filled_by_delta <= max(before*0.002, 1e-10):
         # A terminal rejected/cancelled order with no position delta is safe to clear.
         if status in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}:
-            STATE.update({"pending_close_order_id": None, "pending_close_reason": None,
+            STATE.update({"pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
                           "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
                           "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
                           "execution_unresolved": False, "close_reconciliation_required": False})
@@ -11522,7 +11530,7 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
     complete = realized is not None
     if realized is None:
         realized = 0.0
-    STATE.update({"last_close_order_id": str(order_id), "last_close_reason": reason,
+    STATE.update({"last_close_order_id": str(resolved_order_id), "last_close_reason": reason,
                   "last_close_fill_price": avg or STATE.get("last_close_fill_price"),
                   "last_close_filled_qty": filled_by_delta,
                   "last_close_order_realized_pnl": realized if complete else None,
@@ -11530,7 +11538,7 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
                   "last_close_realized_pnl": safe_float(STATE.get("last_close_realized_pnl"), 0.0)+realized,
                   "last_close_pnl_source": "BINGX_ORDER_REALIZED_PNL" if complete else "REALIZED_PNL_UNAVAILABLE",
                   "last_close_pnl_complete": bool(STATE.get("last_close_pnl_complete", True) and complete),
-                  "pending_close_order_id": None, "pending_close_reason": None,
+                  "pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
                   "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
                   "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
                   "execution_unresolved": False, "close_reconciliation_required": False,
