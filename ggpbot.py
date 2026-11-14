@@ -2694,12 +2694,13 @@ def _close_rejection_position_state(symbol, before_qty):
     status, position = fetch_position_tri_state(symbol)
     if status == "FLAT":
         _clear_confirmed_flat(symbol, reason="EXCHANGE_FLAT_AFTER_REJECTED_CLOSE")
-        return "FLAT"
+        return "FLAT", 0.0
     if status != "OPEN":
-        return "UNKNOWN"
+        return "UNKNOWN", None
     observed = _position_contracts(position)
     tolerance = max(abs(float(before_qty)) * 0.001, 1e-10)
-    return "UNCHANGED" if abs(observed - float(before_qty)) <= tolerance else "CHANGED"
+    state = "UNCHANGED" if abs(observed - float(before_qty)) <= tolerance else "CHANGED"
+    return state, observed
 
 
 def _release_confirmed_close_rejection(symbol, reason):
@@ -2728,8 +2729,9 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                             close_reason="BOT_STRICT_CLOSE"):
     """Submit one reduce-only MARKET order and verify the actual BingX position delta.
 
-    No automatic retry is used for non-idempotent MARKET orders. Ambiguous outcomes
-    block new entries until exchange reconciliation establishes the actual position.
+    MARKET orders are never blindly retried. Only an explicit CCXT contract-amount
+    validation rejection may receive one downward-only retry after fresh position
+    read-back proves the original exposure is unchanged.
     """
     if not STATE.get("open"):
         return False
@@ -2870,7 +2872,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         except Exception as submit_exc:
             if not is_contract_amount_precision_error(submit_exc):
                 raise
-            rejection_state = _close_rejection_position_state(symbol, before)
+            rejection_state, observed_qty = _close_rejection_position_state(symbol, before)
             if rejection_state == "FLAT":
                 return False
             if rejection_state != "UNCHANGED":
@@ -2880,7 +2882,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                 )
             STATE["close_amount_step"] = 1.0
             STATE["close_amount_step_symbol"] = sym
-            retry_requested = recover_integer_contract_amount(requested, before, before, "OPEN")
+            retry_requested = recover_integer_contract_amount(requested, before, observed_qty, "OPEN")
             if retry_requested is None:
                 return _close_failure("contract amount correction was not eligible after position check")
             if retry_requested <= 0:
@@ -2922,7 +2924,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
     except Exception as exc:
         if is_contract_amount_precision_error(exc):
-            rejection_state = _close_rejection_position_state(symbol, before)
+            rejection_state, _observed_qty = _close_rejection_position_state(symbol, before)
             if rejection_state == "FLAT":
                 return False
             if rejection_state == "UNCHANGED":
