@@ -11774,7 +11774,8 @@ def _collect_tp1_close_order_ids(saved_state, journal_row=None):
         if not isinstance(container, dict):
             continue
         sources.append(container.get("bot_close_order_ids"))
-        sources.append([container.get("pending_close_order_id")])
+        sources.append([container.get("pending_close_order_id"),
+                        container.get("pending_close_client_order_id")])
         sources.append([container.get("last_close_order_id")])
         sources.append([container.get("last_exchange_close_order_id")])
     for source in sources:
@@ -11849,6 +11850,8 @@ def _tp1_fill_verified_on_exchange(symbol, side, expected_fill_qty=None, toleran
         info = order.get("info") if isinstance(order.get("info"), dict) else {}
         order_id = str(order.get("id") or order.get("orderId") or order.get("orderID")
                        or info.get("orderId") or info.get("orderID") or "")
+        client_order_id = str(order.get("clientOrderId") or order.get("clientOrderID")
+                              or info.get("clientOrderId") or info.get("clientOrderID") or "")
         status = str(order.get("status") or order.get("state") or info.get("status")
                      or info.get("orderStatus") or "").upper()
         filled = safe_float(order.get("filled") or info.get("executedQty") or order.get("executedQty"), 0.0)
@@ -11887,7 +11890,8 @@ def _tp1_fill_verified_on_exchange(symbol, side, expected_fill_qty=None, toleran
         # 7) link to this trade
         order_ts = safe_float(order.get("timestamp") or info.get("time") or info.get("updateTime")
                               or order.get("time") or info.get("createTime"), 0.0)
-        linked_by_id = bool(order_id and order_id in recorded_ids)
+        linked_by_id = bool((order_id and order_id in recorded_ids) or
+                             (client_order_id and client_order_id in recorded_ids))
         type_blob = " ".join(type_values)
         tagged = any(tag in type_blob for tag in ("PARTIAL", "TP1", "TAKE_PROFIT"))
         if not linked_by_id:
