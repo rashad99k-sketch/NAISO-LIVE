@@ -206,9 +206,17 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
                 metadata = dict(fvg or {})
             else:
                 sr_zones = (sr or {}).get("supports" if name == "SUPPORT" else "resistances", [])
-                metadata = next((dict(z) for z in sr_zones if isinstance(z, dict)
-                                and float(z.get("low", 0) or 0) == low
-                                and float(z.get("high", 0) or 0) == high), {})
+                metadata = {}
+                for sr_zone in sr_zones:
+                    if not isinstance(sr_zone, dict):
+                        continue
+                    try:
+                        if (float(sr_zone.get("low", 0) or 0) == low
+                                and float(sr_zone.get("high", 0) or 0) == high):
+                            metadata = dict(sr_zone)
+                            break
+                    except (TypeError, ValueError):
+                        continue
             metadata.update({
                 "kind": name, "low": low, "high": high,
                 "available_timestamp": available_ts,
