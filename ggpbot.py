@@ -86,6 +86,7 @@ from ggp_market_intelligence import (
     build_support_resistance_zones,
 )
 from ggp_institutional_bridge import build_liquidity_pools
+from location_authority import validate_location_zone
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -10572,43 +10573,46 @@ def smart_opportunity_selection():
             live_price = get_ticker_safe(exchange_sym)
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
 
-            # Final no-chase check uses the actual execution reference price, not only
-            # the earlier closed-candle analysis price. This closes the post-scan drift gap.
-            atr_for_location = float(atr_value)
-            actionable_distances = []
+            # Final no-chase check uses the latest execution reference price.
+            # The exact same authority used by RORO analysis validates the zone again.
+            latest_closed_ts = int(closed_df["timestamp"].iloc[-1])
+            timeframe_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000)
+            location_candidates = []
             ob_for_location = item.get("order_block")
-            if isinstance(ob_for_location, dict) and ob_for_location.get("valid", True):
-                try:
-                    if float(ob_for_location.get("strength", 0) or 0) >= 5.0:
-                        ob_low = float(ob_for_location.get("low"))
-                        ob_high = float(ob_for_location.get("high"))
-                        if 0 < ob_low < ob_high:
-                            actionable_distances.append(max(ob_low - price, 0.0, price - ob_high) / atr_for_location)
-                except (TypeError, ValueError):
-                    pass
+            if isinstance(ob_for_location, dict):
+                ob_zone = dict(ob_for_location)
+                ob_zone.update({
+                    "kind": "ORDER_BLOCK",
+                    "available_timestamp": ob_zone.get("impulse_timestamp", ob_zone.get("timestamp")),
+                })
+                location_candidates.append(ob_zone)
             fvg_for_location = item.get("fvg")
             if isinstance(fvg_for_location, dict):
-                try:
-                    expected_fvg = "BULLISH" if side == "BUY" else "BEARISH"
-                    if (str(fvg_for_location.get("direction", "")).upper() == expected_fvg
-                            and str(fvg_for_location.get("status", "")).upper() in ("UNFILLED", "PARTIALLY_FILLED")
-                            and float(fvg_for_location.get("size_atr", 0) or 0) >= 0.08):
-                        fvg_low = float(fvg_for_location.get("lower"))
-                        fvg_high = float(fvg_for_location.get("upper"))
-                        if 0 < fvg_low < fvg_high:
-                            actionable_distances.append(max(fvg_low - price, 0.0, price - fvg_high) / atr_for_location)
-                except (TypeError, ValueError):
-                    pass
-            golden_for_location = item.get("golden_zone") if isinstance(item.get("golden_zone"), dict) else {}
-            sr_for_location = golden_for_location.get("aligned_sr_zone")
-            if isinstance(sr_for_location, dict) and str(sr_for_location.get("status", "")).upper() == "CONFIRMED":
-                try:
-                    sr_low, sr_high = float(sr_for_location.get("low")), float(sr_for_location.get("high"))
-                    if 0 < sr_low < sr_high and float(sr_for_location.get("strength", 0) or 0) >= 5.0:
-                        actionable_distances.append(max(sr_low - price, 0.0, price - sr_high) / atr_for_location)
-                except (TypeError, ValueError):
-                    pass
-            if not actionable_distances or min(actionable_distances) > 1.5:
+                fvg_zone = dict(fvg_for_location)
+                fvg_zone.update({"kind": "FVG", "low": fvg_zone.get("lower"),
+                                 "high": fvg_zone.get("upper"),
+                                 "available_timestamp": fvg_zone.get("timestamp")})
+                location_candidates.append(fvg_zone)
+            sr_for_location = item.get("support_resistance")
+            if isinstance(sr_for_location, dict):
+                sr_key = "supports" if side == "BUY" else "resistances"
+                for sr_zone in sr_for_location.get(sr_key, []):
+                    if isinstance(sr_zone, dict):
+                        sr_candidate = dict(sr_zone)
+                        sr_candidate.update({
+                            "kind": "SUPPORT" if side == "BUY" else "RESISTANCE",
+                            "available_timestamp": sr_candidate.get("confirmed_at_timestamp"),
+                        })
+                        location_candidates.append(sr_candidate)
+            location_checks = [
+                validate_location_zone(
+                    zone, side, price, float(atr_value), latest_closed_ts, timeframe_ms,
+                    max_age_bars=48, max_distance_atr=1.5,
+                )
+                for zone in location_candidates
+            ]
+            actionable_locations = [check for check in location_checks if check.get("valid")]
+            if not actionable_locations:
                 item["decision_state"] = "NO_CHASE"
                 item["rejection_reason"] = "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE"
                 log_execution(
