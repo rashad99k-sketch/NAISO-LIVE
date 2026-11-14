@@ -343,8 +343,7 @@ def test_partial_tp1_fill_with_exchange_evidence_reconciles(tmp_path, monkeypatc
     assert not ggpbot.STATE.get("bot_close_order_ids")
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["remaining_qty"] == 0.5
-    assert not bool(ggpbot.STATE["tp1_hit"])
-    assert ggpbot.STATE["remaining_qty"] == pytest.approx(9999.0)
+    assert ggpbot.STATE["tp1_hit"] is True
 
 
 def test_tp1_evidence_rejects_wrong_position_side(tmp_path, monkeypatch):
@@ -1337,7 +1336,8 @@ def test_reconcile_rechecks_read_only_until_delayed_close_order_becomes_visible(
     assert ggpbot.STATE["pending_close_client_order_id"] is None
     assert ggpbot.STATE["execution_unresolved"] is False
     assert ggpbot.STATE["close_reconciliation_required"] is False
-    assert ggpbot.STATE["tp1_hit"] is True
+    assert not bool(ggpbot.STATE["tp1_hit"])
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(9999.0)
 
 
 def test_verified_close_detects_one_contract_fill_on_large_position(tmp_path, monkeypatch):
