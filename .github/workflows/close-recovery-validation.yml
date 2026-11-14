@@ -1,0 +1,35 @@
+name: Close Recovery Guard Validation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "ggpbot.py"
+      - "ggp_close_recovery.py"
+      - "ggp_recovery.py"
+      - "test_close_recovery_guard.py"
+      - "test_recovery_lifecycle.py"
+      - "requirements.txt"
+
+permissions:
+  contents: read
+
+jobs:
+  close-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Compile touched runtime modules
+        run: python -m compileall -q ggpbot.py ggp_close_recovery.py ggp_recovery.py
+      - name: Run focused recovery and lifecycle regression tests
+        run: pytest -q test_close_recovery_guard.py test_recovery_lifecycle.py
