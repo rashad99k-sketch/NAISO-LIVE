@@ -950,3 +950,121 @@ def test_restart_hedge_short_position_restores(tmp_path, monkeypatch):
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["side"] == "SELL"
     assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+
+
+
+# --------------------------------------------------------------------------- #
+# Close recovery: durable client identity and final runtime reconcile wiring
+# --------------------------------------------------------------------------- #
+def _seed_pending_close_client_id(*, exchange_order=None, before_qty=2.0, reason="TP1"):
+    _fresh_state()
+    symbol = "BTC/USDT:USDT"
+    client_id = "naiso-close-test-001"
+    ggpbot.STATE.update({
+        "open": True, "current_symbol": symbol, "symbol": symbol,
+        "side": "BUY", "entry": 100.0, "qty": before_qty, "initial_qty": before_qty,
+        "remaining_qty": before_qty, "exchange_qty": before_qty,
+        "trade_id": "T-CLOSE-RECOVERY", "native_sl_verified": True,
+        "recovery_hold": False, "execution_unresolved": True,
+        "close_reconciliation_required": True,
+        "pending_close_order_id": None,
+        "pending_close_client_order_id": client_id,
+        "pending_close_reason": reason,
+        "pending_close_before_qty": before_qty,
+        "pending_close_requested_qty": before_qty / 2.0,
+        "pending_close_target_remaining_qty": before_qty / 2.0,
+        "pending_close_started_at": time.time(),
+    })
+    return symbol, client_id
+
+
+def _open_snapshot(qty=1.0):
+    snap = ggpbot.PositionSnapshot()
+    snap.symbol = "BTC/USDT:USDT"
+    snap.side = "BUY"
+    snap.qty = qty
+    snap.entry_price = 100.0
+    snap.mark_price = 101.0
+    snap.unrealized_pnl = (snap.mark_price - snap.entry_price) * qty
+    snap.margin = 5.0
+    snap.roe_pct = 20.0
+    snap.leverage = 20.0
+    snap.liquidation_price = 0.0
+    snap.updated_at = time.time()
+    snap.source = "test"
+    return snap
+
+
+def test_pending_close_without_exchange_id_recovers_by_persisted_client_id(monkeypatch):
+    symbol, client_id = _seed_pending_close_client_id()
+    order = {
+        "id": "close-exchange-77", "clientOrderId": client_id,
+        "status": "closed", "filled": 1.0, "remaining": 0.0, "average": 101.0,
+        "info": {},
+    }
+    exchange = MockExchange(position=_long_position(qty=1.0), entry_order=order)
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+
+    assert ggpbot._resolve_pending_close_from_snapshot(symbol, _open_snapshot(1.0)) is True
+    assert ggpbot.STATE["last_close_order_id"] == "close-exchange-77"
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(1.0)
+    assert ggpbot.STATE["tp1_hit"] is True
+    assert ggpbot.STATE["pending_close_client_order_id"] is None
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
+
+
+def test_final_exchange_reconcile_override_resolves_client_id_and_resumes(monkeypatch):
+    symbol, client_id = _seed_pending_close_client_id()
+    order = {
+        "id": "close-exchange-88", "clientOrderId": client_id,
+        "status": "closed", "filled": 1.0, "remaining": 0.0, "average": 101.0,
+        "info": {},
+    }
+    exchange = MockExchange(position=_long_position(qty=1.0), entry_order=order)
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+
+    class EventBus:
+        def __init__(self):
+            self.events = []
+        def emit(self, name, payload):
+            self.events.append((name, payload))
+
+    sync = ggpbot.ExchangeSyncService(EventBus())
+    snap = _open_snapshot(1.0)
+    sync.fetch_live_snapshot = lambda requested_symbol: snap
+    sync.last_fetch_status = "OPEN"
+
+    result = sync.reconcile(symbol, ggpbot.STATE, force=True)
+    assert result == "OPEN"
+    assert any(name == "reconciled" for name, _ in sync.event_bus.events)
+    assert ggpbot.STATE["pending_close_client_order_id"] is None
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(1.0)
+
+
+def test_final_exchange_reconcile_keeps_hold_when_client_order_is_not_found(monkeypatch):
+    symbol, client_id = _seed_pending_close_client_id()
+    exchange = MockExchange(position=_long_position(qty=2.0), entry_order=None)
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+
+    class EventBus:
+        def emit(self, name, payload):
+            pass
+
+    sync = ggpbot.ExchangeSyncService(EventBus())
+    snap = _open_snapshot(2.0)
+    sync.fetch_live_snapshot = lambda requested_symbol: snap
+    sync.last_fetch_status = "OPEN"
+
+    result = sync.reconcile(symbol, ggpbot.STATE, force=True)
+    assert result == "OPEN_UNRESOLVED"
+    assert ggpbot.STATE["pending_close_client_order_id"] == client_id
+    assert ggpbot.STATE["execution_unresolved"] is True
+    assert ggpbot.STATE["close_reconciliation_required"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
