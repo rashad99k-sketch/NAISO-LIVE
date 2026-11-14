@@ -1157,3 +1157,69 @@ def test_close_intent_journal_failure_prevents_market_submission(monkeypatch):
     assert exchange.create_calls == []
     assert ggpbot.STATE["execution_unresolved"] is False
     assert ggpbot.STATE["pending_close_client_order_id"] is None
+
+
+
+def test_restart_keeps_pending_close_reconcilable_without_falsely_marking_tp1():
+    saved = {
+        "open": True, "trade_id": "T-PENDING-RESTART",
+        "current_symbol": "BTC/USDT:USDT", "side": "BUY",
+        "entry": 100.0, "entry_time": time.time() - 60,
+        "qty": 2.0, "initial_qty": 2.0, "actual_filled_qty": 2.0,
+        "remaining_qty": 2.0, "exchange_qty": 2.0,
+        "synthetic_sl": 95.0, "sl": 95.0, "native_sl_original_price": 95.0,
+        "tp1_price": 105.0, "tp2_price": 110.0,
+        "native_sl_verified": True, "native_sl_order_id": "sl-1",
+        "execution_unresolved": True, "close_reconciliation_required": True,
+        "pending_close_order_id": None,
+        "pending_close_client_order_id": "naiso-close-restart-1",
+        "pending_close_reason": "TP1", "pending_close_before_qty": 2.0,
+        "pending_close_requested_qty": 1.0,
+        "pending_close_target_remaining_qty": 1.0,
+        "pending_close_started_at": time.time() - 5,
+        "tp1_hit": False, "partial_closed": False,
+    }
+    row = {
+        "trade_id": "T-PENDING-RESTART", "symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry_price": 100.0, "entry_qty": 2.0,
+        "actual_filled_qty": 2.0, "initial_sl": 95.0, "state": saved,
+        "position_mode": "HEDGE", "position_side": "LONG",
+    }
+    snapshot = _open_snapshot(1.0)
+
+    restored, missing = build_restored_management_state(
+        row, snapshot, position_mode="HEDGE", position_side="LONG",
+        tp1_fill_verified=False,
+    )
+    assert missing == ()
+    assert restored["execution_unresolved"] is True
+    assert restored["close_reconciliation_required"] is True
+    assert restored["pending_close_client_order_id"] == "naiso-close-restart-1"
+    assert restored["tp1_hit"] is False
+    assert restored["partial_closed"] is False
+
+
+def test_restart_without_pending_close_identity_stays_in_recovery_hold():
+    saved = {
+        "open": True, "trade_id": "T-LEGACY-UNRESOLVED",
+        "current_symbol": "BTC/USDT:USDT", "side": "BUY",
+        "entry": 100.0, "entry_time": time.time() - 60,
+        "qty": 2.0, "initial_qty": 2.0, "actual_filled_qty": 2.0,
+        "remaining_qty": 2.0, "exchange_qty": 2.0,
+        "synthetic_sl": 95.0, "sl": 95.0, "native_sl_original_price": 95.0,
+        "tp1_price": 105.0, "tp2_price": 110.0,
+        "execution_unresolved": True, "close_reconciliation_required": True,
+        "pending_close_order_id": None, "pending_close_client_order_id": None,
+        "tp1_hit": False, "partial_closed": False,
+    }
+    row = {"trade_id": "T-LEGACY-UNRESOLVED", "symbol": "BTC/USDT:USDT",
+           "side": "BUY", "entry_price": 100.0, "entry_qty": 2.0,
+           "actual_filled_qty": 2.0, "initial_sl": 95.0, "state": saved,
+           "position_mode": "HEDGE", "position_side": "LONG"}
+    restored, missing = build_restored_management_state(
+        row, _open_snapshot(1.0), position_mode="HEDGE", position_side="LONG",
+        tp1_fill_verified=False,
+    )
+    assert "close_reconciliation_pending" in missing
+    assert "unverified_position_reduction_requires_tp1_fill_evidence" in missing
+    assert restored["recovery_hold"] is True
