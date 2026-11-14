@@ -10496,40 +10496,47 @@ def smart_opportunity_selection():
     def _location_first_rank(pair):
         _, candidate = pair
         side_value = str(candidate.get("side") or "").upper()
-        atr_value = candidate.get("atr")
-        price_value = candidate.get("price")
-        latest_ts = int(candidate.get("latest_timestamp", 0) or 0)
-        timeframe_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000)
-        zones = []
+        price_value = safe_float(candidate.get("price"), 0.0)
+        market_intel = candidate.get("market_intelligence") if isinstance(candidate.get("market_intelligence"), dict) else {}
+        atr_value = safe_float(candidate.get("atr"), 0.0)
+        if atr_value <= 0 and price_value > 0:
+            # The bridge exposes ATR as a percentage in its internal intelligence
+            # snapshot; convert it only for ranking, never for entry authorization.
+            atr_pct = safe_float(market_intel.get("volatility_atr"), 0.0)
+            atr_value = price_value * atr_pct / 100.0 if atr_pct > 0 else 0.0
+        distances = []
         ob = candidate.get("order_block")
-        if isinstance(ob, dict):
-            zone = dict(ob)
-            zone.update({"kind": "ORDER_BLOCK",
-                         "available_timestamp": zone.get("impulse_timestamp", zone.get("timestamp"))})
-            zones.append(zone)
+        if isinstance(ob, dict) and ob.get("valid", True):
+            try:
+                distance = float(ob.get("distance_atr"))
+                if math.isfinite(distance) and distance >= 0 and float(ob.get("strength", 0) or 0) >= 5.0:
+                    distances.append(distance)
+            except (TypeError, ValueError):
+                pass
         fvg = candidate.get("fvg")
         if isinstance(fvg, dict):
-            zone = dict(fvg)
-            zone.update({"kind": "FVG", "low": zone.get("lower"), "high": zone.get("upper"),
-                         "available_timestamp": zone.get("timestamp")})
-            zones.append(zone)
+            try:
+                expected = "BULLISH" if side_value == "BUY" else "BEARISH"
+                low, high = float(fvg.get("lower")), float(fvg.get("upper"))
+                if (str(fvg.get("direction") or "").upper() == expected
+                        and str(fvg.get("status") or "").upper() in ("UNFILLED", "PARTIALLY_FILLED")
+                        and float(fvg.get("size_atr", 0) or 0) >= 0.08
+                        and atr_value > 0 and price_value > 0 and 0 < low < high):
+                    distances.append(max(low - price_value, 0.0, price_value - high) / atr_value)
+            except (TypeError, ValueError):
+                pass
         sr = candidate.get("support_resistance")
         if isinstance(sr, dict):
             key = "supports" if side_value == "BUY" else "resistances"
-            for row in sr.get(key, []):
-                if isinstance(row, dict):
-                    zone = dict(row)
-                    zone.update({"kind": "SUPPORT" if side_value == "BUY" else "RESISTANCE",
-                                 "available_timestamp": zone.get("confirmed_at_timestamp")})
-                    zones.append(zone)
-        distances = []
-        for zone in zones:
-            checked = validate_location_zone(
-                zone, side_value, price_value, atr_value, latest_ts, timeframe_ms,
-                max_age_bars=48, max_distance_atr=1.5,
-            )
-            if checked.get("valid"):
-                distances.append(float(checked["distance_atr"]))
+            for zone in sr.get(key, []):
+                if not isinstance(zone, dict) or str(zone.get("status") or "").upper() != "CONFIRMED":
+                    continue
+                try:
+                    distance = float(zone.get("distance_atr"))
+                    if math.isfinite(distance) and distance >= 0 and float(zone.get("strength", 0) or 0) >= 5.0:
+                        distances.append(distance)
+                except (TypeError, ValueError):
+                    continue
         golden = candidate.get("golden_zone") if isinstance(candidate.get("golden_zone"), dict) else {}
         location_distance = min(distances) if distances else 999.0
         location_quality = float(golden.get("score", 0) or 0)
