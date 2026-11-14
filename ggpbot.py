@@ -3288,13 +3288,16 @@ class LiveTradeManager:
                 if self._emergency_exit_if_valid(symbol, now):
                     self._log_live_status()
                     return
-        if STATE.get("execution_unresolved"):
+        if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
             if now - self.last_position_sync_ts >= 2:
                 self.exchange_sync.reconcile(symbol, STATE)
                 self.last_position_sync_ts = now
-            log_execution(f"[EXECUTION_UNRESOLVED] {symbol}: management actions paused until exchange order outcome is reconciled", "ERROR",
-                          debounce_key=f"execution_unresolved_{symbol}", debounce_sec=30)
-            return
+            # A successful reconciliation releases the gate immediately. If it
+            # remains unresolved, do not run management or submit another order.
+            if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
+                log_execution(f"[EXECUTION_UNRESOLVED] {symbol}: management actions paused until exchange order outcome is reconciled", "ERROR",
+                              debounce_key=f"execution_unresolved_{symbol}", debounce_sec=30)
+                return
         if not PAPER_MODE and (STATE.get("recovery_hold") or not STATE.get("native_sl_verified")):
             log_execution(f"[MANAGEMENT_BLOCKED] {symbol}: Recovery Hold / Native SL verification is not complete; no TP or synthetic close actions", "CRITICAL",
                           debounce_key=f"management_protection_gate_{symbol}", debounce_sec=30)
