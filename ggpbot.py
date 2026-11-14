@@ -2706,22 +2706,30 @@ def _fetch_close_order_by_identity(symbol, order_id=None, client_order_id=None):
         return None
     if client_order_id and not order_id:
         order = fetch_order_by_client_id(fetch, normalize_symbol(symbol), client_order_id)
-    else:
+        return order if isinstance(order, dict) else None
+    try:
+        order = fetch(identity, normalize_symbol(symbol),
+                      {"clientOrderId": str(client_order_id)} if client_order_id else {})
+    except TypeError:
         try:
-            order = fetch(identity, normalize_symbol(symbol),
-                          {"clientOrderId": str(client_order_id)} if client_order_id else {})
-        except TypeError:
-            try:
-                order = fetch(identity, normalize_symbol(symbol))
-            except Exception as exc:
-                log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
-                              debounce_key=f"close_lookup_{identity}", debounce_sec=30)
-                return None
+            order = fetch(identity, normalize_symbol(symbol))
         except Exception as exc:
             log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
                           debounce_key=f"close_lookup_{identity}", debounce_sec=30)
-            return None
-    return order if isinstance(order, dict) else None
+            order = None
+    except Exception as exc:
+        log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
+                      debounce_key=f"close_lookup_{identity}", debounce_sec=30)
+        order = None
+    if isinstance(order, dict):
+        return order
+    # Exchange IDs can be temporarily unqueryable while the client ID is already
+    # indexed. Try the persisted client identity as a read-only fallback.
+    if client_order_id:
+        fallback = fetch_order_by_client_id(fetch, normalize_symbol(symbol), client_order_id)
+        if isinstance(fallback, dict):
+            return fallback
+    return None
 
 
 def _release_confirmed_close_rejection(symbol, reason):
