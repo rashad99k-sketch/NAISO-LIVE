@@ -62,6 +62,7 @@ def test_only_exact_contract_precision_error_is_classified():
         (1.0, 3, 3, "OPEN", 0.0),
         (0.5, 1, 1, "OPEN", 0.0),
         (24.5, 49, 48, "OPEN", None),
+        (5000.5, 10000, 9999, "OPEN", None),
         (24.5, 49, 49, "UNKNOWN", None),
         (24.5, 49, 0, "FLAT", None),
     ],
