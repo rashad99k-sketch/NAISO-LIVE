@@ -5,6 +5,7 @@ from ggp_close_recovery import (
     ceil_amount_to_step,
     floor_amount_to_step,
     is_contract_amount_precision_error,
+    recover_integer_contract_amount,
 )
 
 
@@ -49,3 +50,27 @@ def test_only_exact_contract_precision_error_is_classified():
     )
     assert not is_contract_amount_precision_error("Request timeout")
     assert not is_contract_amount_precision_error("insufficient margin")
+
+
+
+@pytest.mark.parametrize(
+    "requested,before,observed,status,expected",
+    [
+        (24.5, 49, 49, "OPEN", 24.0),
+        (12.5, 25, 25, "OPEN", 12.0),
+        (1.5, 3, 3, "OPEN", 1.0),
+        (1.0, 3, 3, "OPEN", 0.0),
+        (0.5, 1, 1, "OPEN", 0.0),
+        (24.5, 49, 48, "OPEN", None),
+        (24.5, 49, 49, "UNKNOWN", None),
+        (24.5, 49, 0, "FLAT", None),
+    ],
+)
+def test_retry_requires_unchanged_open_exposure(requested, before, observed, status, expected):
+    assert recover_integer_contract_amount(requested, before, observed, status) == expected
+
+
+def test_zero_decimal_places_means_whole_contracts():
+    assert amount_step_from_market(
+        {"contract": True, "precision": {"amount": 0}}, 2
+    ) == 1.0
