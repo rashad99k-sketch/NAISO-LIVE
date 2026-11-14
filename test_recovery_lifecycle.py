@@ -1417,5 +1417,7 @@ def test_explicit_contract_precision_rejection_gets_one_downward_retry(tmp_path,
     assert first[4]["clientOrderId"] != corrected[4]["clientOrderId"]
     assert ggpbot.STATE["last_close_filled_qty"] == pytest.approx(1.0)
     assert ggpbot.STATE["remaining_qty"] == pytest.approx(2.0)
-    assert ggpbot.STATE["tp1_hit"] is True
+    assert ggpbot.STATE["tp1_filled_qty"] == pytest.approx(1.0)
+    # TP1 stage promotion remains owned by LiveTradeManager after this verified close.
+    assert not bool(ggpbot.STATE["tp1_hit"])
     assert ggpbot.STATE["execution_unresolved"] is False
