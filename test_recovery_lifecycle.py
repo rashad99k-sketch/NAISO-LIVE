@@ -1374,3 +1374,48 @@ def test_verified_close_detects_one_contract_fill_on_large_position(tmp_path, mo
     assert ggpbot.STATE["last_close_filled_qty"] == pytest.approx(1.0)
     assert ggpbot.STATE["remaining_qty"] == pytest.approx(9999.0)
     assert ggpbot.STATE["execution_unresolved"] is False
+
+
+def test_explicit_contract_precision_rejection_gets_one_downward_retry(tmp_path, monkeypatch):
+    journal, _ = _seed_journal(tmp_path, filled=3.0)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "open": True, "current_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 3.0, "initial_qty": 3.0,
+        "remaining_qty": 3.0, "exchange_qty": 3.0, "trade_id": "T-SCEN",
+        "native_sl_verified": True, "recovery_hold": False,
+    })
+
+    class RejectFractionThenAcceptInteger(MockExchange):
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            if len(self.create_calls) == 1:
+                raise ValueError(
+                    "bingx amount of BTC/USDT:USDT must be greater than minimum amount precision of 1"
+                )
+            client_id = (params or {}).get("clientOrderId")
+            self.position["contracts"] -= amount
+            self.position["info"]["positionAmt"] = str(self.position["contracts"])
+            self.entry_order = {
+                "id": "integer-contract-close", "clientOrderId": client_id,
+                "status": "closed", "filled": amount, "remaining": 0.0,
+                "average": 101.0, "info": {},
+            }
+            return self.entry_order
+
+    exchange = RejectFractionThenAcceptInteger(position=_long_position(qty=3.0))
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    assert ggpbot._verified_market_reduce_impl(
+        "BTC/USDT:USDT", ratio=0.5, close_reason="TP1"
+    ) is True
+    assert len(exchange.create_calls) == 2
+    first, corrected = exchange.create_calls
+    assert first[3] == pytest.approx(1.5)
+    assert corrected[3] == pytest.approx(1.0)
+    assert first[4]["clientOrderId"] != corrected[4]["clientOrderId"]
+    assert ggpbot.STATE["last_close_filled_qty"] == pytest.approx(1.0)
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(2.0)
+    assert ggpbot.STATE["tp1_hit"] is True
+    assert ggpbot.STATE["execution_unresolved"] is False
