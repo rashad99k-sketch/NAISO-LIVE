@@ -2988,7 +2988,10 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                       "pending_close_target_remaining_qty": target_remaining_qty,
                       "pending_close_started_at": time.time(), "execution_unresolved": True,
                       "close_reconciliation_required": True})
-        bot_ids = STATE.setdefault("bot_close_order_ids", [])
+        bot_ids = STATE.get("bot_close_order_ids")
+        if not isinstance(bot_ids, list):
+            bot_ids = []
+            STATE["bot_close_order_ids"] = bot_ids
         if order_id not in bot_ids:
             bot_ids.append(order_id)
             if len(bot_ids) > 50:
