@@ -2967,7 +2967,10 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                     "pending_close_started_at": time.time(),
                 })
                 if not _persist_trade_journal_snapshot(force=True):
-                    return _close_failure("corrected close intent could not be journaled; retry blocked")
+                    _release_confirmed_close_rejection(
+                        symbol, "corrected close intent could not be journaled; retry not sent"
+                    )
+                    return False
                 try:
                     order = ex.create_order(sym, "market", close_side, requested,
                                             params=close_params)
