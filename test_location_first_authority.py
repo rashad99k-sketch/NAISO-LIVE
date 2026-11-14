@@ -147,3 +147,61 @@ def test_central_location_authority_accepts_confirmed_aligned_support():
         "available_timestamp": 1_699_999_100_000,
     }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
     assert result["valid"] is True
+
+
+
+def test_central_authority_rejects_nan_order_block_strength():
+    result = validate_location_zone({
+        "kind": "ORDER_BLOCK", "low": 99.0, "high": 100.5,
+        "zone_definition": "BULLISH_LOW_TO_OPEN", "strength": float("nan"),
+        "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is False
+    assert result["reason"] == "order_block_quality_below_threshold"
+
+
+def test_central_authority_rejects_contradictory_ob_geometry_and_direction():
+    result = validate_location_zone({
+        "kind": "ORDER_BLOCK", "low": 99.0, "high": 100.5,
+        "zone_definition": "BEARISH_OPEN_TO_HIGH", "direction": "BULLISH",
+        "strength": 8.0, "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is False
+    assert result["reason"] == "order_block_direction_unconfirmed"
+
+
+def test_central_authority_rejects_infinite_fvg_size():
+    result = validate_location_zone({
+        "kind": "FVG", "low": 99.0, "high": 100.5, "direction": "BULLISH",
+        "status": "UNFILLED", "size_atr": float("inf"),
+        "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is False
+    assert result["reason"] == "fvg_too_small"
+
+
+def test_central_authority_rejects_nan_support_strength():
+    result = validate_location_zone({
+        "kind": "SUPPORT", "low": 99.0, "high": 100.5,
+        "status": "CONFIRMED", "strength": float("nan"),
+        "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is False
+    assert result["reason"] == "support_resistance_quality_below_threshold"
+
+
+def test_central_authority_rejects_non_finite_no_chase_threshold():
+    result = validate_location_zone({
+        "kind": "ORDER_BLOCK", "low": 99.0, "high": 100.5,
+        "zone_definition": "BULLISH_LOW_TO_OPEN", "strength": 8.0,
+        "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000,
+       max_distance_atr=float("nan"))
+    assert result["valid"] is False
+    assert result["reason"] == "invalid_no_chase_threshold"
+
+
+def test_central_authority_rejects_non_mapping_zone_without_raising():
+    result = validate_location_zone(None, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is False
+    assert result["reason"] == "malformed_location_zone"
