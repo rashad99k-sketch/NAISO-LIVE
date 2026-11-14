@@ -34,6 +34,7 @@ from ggp_close_recovery import (
     floor_amount_to_step,
     is_contract_amount_precision_error,
     recover_integer_contract_amount,
+    fetch_order_by_client_id,
 )
 
 # Load project-local configuration safely. PAPER mode remains the default.
@@ -2711,19 +2712,24 @@ def _fetch_close_order_by_identity(symbol, order_id=None, client_order_id=None):
     identity = str(order_id or client_order_id or "").strip()
     if not identity:
         return None
-    params = {"clientOrderId": str(client_order_id)} if client_order_id else {}
-    try:
-        return fetch(identity, normalize_symbol(symbol), params) if params else fetch(identity, normalize_symbol(symbol))
-    except TypeError:
+    if client_order_id and not order_id:
+        order = fetch_order_by_client_id(fetch, normalize_symbol(symbol), client_order_id)
+    else:
         try:
-            return fetch(identity, normalize_symbol(symbol))
+            order = fetch(identity, normalize_symbol(symbol),
+                          {"clientOrderId": str(client_order_id)} if client_order_id else {})
+        except TypeError:
+            try:
+                order = fetch(identity, normalize_symbol(symbol))
+            except Exception as exc:
+                log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
+                              debounce_key=f"close_lookup_{identity}", debounce_sec=30)
+                return None
         except Exception as exc:
             log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
                           debounce_key=f"close_lookup_{identity}", debounce_sec=30)
-    except Exception as exc:
-        log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
-                      debounce_key=f"close_lookup_{identity}", debounce_sec=30)
-    return None
+            return None
+    return order if isinstance(order, dict) else None
 
 
 def _release_confirmed_close_rejection(symbol, reason):
@@ -2911,6 +2917,8 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             })
             return _close_failure("close intent could not be durably journaled; MARKET order not sent",
                                   unresolved=False)
+        globals()["RECOVERY_BLOCK_ENTRIES"] = True
+        MEMORY["recovery_status"] = "CLOSE_SUBMISSION_PENDING"
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
         # First resolve a lost response by client ID. Only an explicit amount-precision
         # rejection plus unchanged exchange exposure permits one downward-only correction.
