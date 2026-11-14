@@ -43,33 +43,44 @@ def validate_location_zone(
         age_bars = (latest - formed_at) / duration
         if age_bars > max(0, int(max_age_bars)):
             return {**result, "reason": "stale_zone", "age_bars": age_bars}
+        max_distance = float(max_distance_atr)
+        if not math.isfinite(max_distance) or max_distance < 0:
+            return {**result, "reason": "invalid_no_chase_threshold"}
         distance = max(low - px, 0.0, px - high) / volatility
-        if not math.isfinite(distance) or distance > float(max_distance_atr):
+        if not math.isfinite(distance) or distance > max_distance:
             return {**result, "reason": "zone_outside_no_chase_distance", "distance_atr": distance}
         if kind == "ORDER_BLOCK":
             definition = str(zone.get("zone_definition") or "").upper()
             expected_definition = "BULLISH_LOW_TO_OPEN" if direction == "BUY" else "BEARISH_OPEN_TO_HIGH"
             ob_direction = str(zone.get("direction") or "").upper()
-            if definition != expected_definition and ob_direction != expected_direction:
+            # A supplied canonical geometry definition must match exactly; a
+            # contradictory direction field cannot override it.
+            if definition:
+                if definition != expected_definition:
+                    return {**result, "reason": "order_block_direction_unconfirmed"}
+            elif ob_direction != expected_direction:
                 return {**result, "reason": "order_block_direction_unconfirmed"}
-            if float(zone.get("strength", 0) or 0) < 5.0:
+            strength = float(zone.get("strength", 0) or 0)
+            if not math.isfinite(strength) or strength < 5.0:
                 return {**result, "reason": "order_block_quality_below_threshold"}
         elif kind == "FVG":
             if str(zone.get("direction") or "").upper() != expected_direction:
                 return {**result, "reason": "fvg_direction_mismatch"}
             if str(zone.get("status") or "").upper() not in {"UNFILLED", "PARTIALLY_FILLED"}:
                 return {**result, "reason": "fvg_not_actionable"}
-            if float(zone.get("size_atr", 0) or 0) < 0.08:
+            size_atr = float(zone.get("size_atr", 0) or 0)
+            if not math.isfinite(size_atr) or size_atr < 0.08:
                 return {**result, "reason": "fvg_too_small"}
         else:
             if kind != expected_sr or str(zone.get("status") or "").upper() != "CONFIRMED":
                 return {**result, "reason": "support_resistance_not_side_aligned_or_confirmed"}
-            if float(zone.get("strength", 0) or 0) < 5.0:
+            strength = float(zone.get("strength", 0) or 0)
+            if not math.isfinite(strength) or strength < 5.0:
                 return {**result, "reason": "support_resistance_quality_below_threshold"}
         return {
             "valid": True, "reason": "location_valid", "kind": kind,
             "low": low, "high": high, "distance_atr": distance,
             "age_bars": age_bars, "available_timestamp": formed_at,
         }
-    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+    except (AttributeError, TypeError, ValueError, OverflowError, ZeroDivisionError):
         return {**result, "reason": "malformed_location_zone"}
