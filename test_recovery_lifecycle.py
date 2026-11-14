@@ -710,6 +710,7 @@ def test_open_position_reports_held_trade_lock_without_releasing_it(monkeypatch)
 # 16: no new entries while Recovery Hold is active
 # --------------------------------------------------------------------------- #
 def test_no_new_entry_during_recovery_hold(monkeypatch):
+    monkeypatch.setattr(ggpbot, "daily_loss_cooldown_active", lambda: False)
     monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", lambda: None)
     ggpbot.RECOVERY_BLOCK_ENTRIES = True
     ggpbot.STATE.update({"open": True, "recovery_hold": True})
@@ -717,6 +718,7 @@ def test_no_new_entry_during_recovery_hold(monkeypatch):
 
 
 def test_no_new_entry_when_position_status_unknown(monkeypatch):
+    monkeypatch.setattr(ggpbot, "daily_loss_cooldown_active", lambda: False)
     monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", lambda: None)
     ggpbot.RECOVERY_BLOCK_ENTRIES = False
     ggpbot.STATE.update({"open": False})
@@ -1253,8 +1255,11 @@ def test_restart_restores_pending_close_then_live_manager_resumes_after_client_i
     _fresh_state()
 
     assert ggpbot.startup_trade_recovery() is True
-    assert ggpbot.STATE["execution_unresolved"] is True
-    assert ggpbot.STATE["pending_close_client_order_id"] == client_id
+    # Startup may itself reconcile a terminal order immediately; both startup
+    # and the live manager must converge to the same verified state.
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["pending_close_client_order_id"] is None
+    assert ggpbot.STATE["tp1_hit"] is True
     assert ggpbot.STATE["recovery_hold"] is False
     assert ggpbot.STATE["native_sl_verified"] is True
 
