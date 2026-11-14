@@ -141,16 +141,34 @@ def test_dashboard_health_and_data_routes_respond_without_exchange_calls(monkeyp
     monkeypatch.setitem(ggpbot.MEMORY, "health", {"api": "TEST", "status": "HEALTHY"})
     monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {})
 
-    client = ggpbot.app.test_client()
-    health = client.get("/health")
-    data = client.get("/data")
+    import socket
+    import requests
 
-    assert health.status_code == 200
-    assert health.get_json()["ok"] is True
-    assert data.status_code == 200
-    payload = data.get_json()
-    assert payload["balance"] == 25.0
-    assert payload["free_balance"] == 20.0
-    assert payload["mode"] == "PAPER"
-    assert payload["regime"] == "SYNTHETIC_TEST"
-    assert "watchlist" in payload
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    previous_servers = list(ggpbot.DASHBOARD_SERVERS)
+    previous_ports = list(ggpbot.DASHBOARD_ACTIVE_PORTS)
+    monkeypatch.setenv("PORT", str(port))
+    try:
+        started = ggpbot.start_dashboard_servers()
+        assert started == [port]
+        health = requests.get(f"http://127.0.0.1:{port}/health", timeout=3)
+        data = requests.get(f"http://127.0.0.1:{port}/data", timeout=3)
+
+        assert health.status_code == 200
+        assert health.json()["ok"] is True
+        assert data.status_code == 200
+        payload = data.json()
+        assert payload["balance"] == 25.0
+        assert payload["free_balance"] == 20.0
+        assert payload["mode"] == "PAPER"
+        assert payload["regime"] == "SYNTHETIC_TEST"
+        assert "watchlist" in payload
+    finally:
+        for server, thread in ggpbot.DASHBOARD_SERVERS[len(previous_servers):]:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+        ggpbot.DASHBOARD_SERVERS[:] = previous_servers
+        ggpbot.DASHBOARD_ACTIVE_PORTS[:] = previous_ports
