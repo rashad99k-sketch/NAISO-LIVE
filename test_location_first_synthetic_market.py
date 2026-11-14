@@ -134,12 +134,12 @@ def test_dashboard_health_and_data_routes_respond_without_exchange_calls(monkeyp
     monkeypatch.setattr(ggpbot, "cleanup_watchlist", lambda: None)
     monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
     monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
-    ggpbot.STATE["open"] = False
-    ggpbot.DASHBOARD_STATE["position"] = None
-    ggpbot.MEMORY["last_scan"] = 0
-    ggpbot.MEMORY["regime"] = "SYNTHETIC_TEST"
-    ggpbot.MEMORY["health"] = {"api": "TEST", "status": "HEALTHY"}
-    ggpbot.MEMORY["watchlist"] = {}
+    monkeypatch.setitem(ggpbot.STATE, "open", False)
+    monkeypatch.setitem(ggpbot.DASHBOARD_STATE, "position", None)
+    monkeypatch.setitem(ggpbot.MEMORY, "last_scan", 0)
+    monkeypatch.setitem(ggpbot.MEMORY, "regime", "SYNTHETIC_TEST")
+    monkeypatch.setitem(ggpbot.MEMORY, "health", {"api": "TEST", "status": "HEALTHY"})
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {})
 
     client = ggpbot.app.test_client()
     health = client.get("/health")
