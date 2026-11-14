@@ -11510,6 +11510,7 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
         )
         return False
     resolved_order_id = order.get("id") or (order.get("info") or {}).get("orderId") or order_id or client_order_id
+    order_id = resolved_order_id
     status = str(order.get("status") or "UNKNOWN").upper()
     terminal = status in {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
     if not terminal:
