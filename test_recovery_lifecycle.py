@@ -1068,3 +1068,92 @@ def test_final_exchange_reconcile_keeps_hold_when_client_order_is_not_found(monk
     assert ggpbot.STATE["execution_unresolved"] is True
     assert ggpbot.STATE["close_reconciliation_required"] is True
     assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+
+
+
+def test_market_close_timeout_after_exchange_acceptance_resolves_by_client_id(tmp_path, monkeypatch):
+    journal, _ = _seed_journal(tmp_path, filled=2.0)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "open": True, "current_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 2.0, "initial_qty": 2.0,
+        "remaining_qty": 2.0, "exchange_qty": 2.0, "trade_id": "T-SCEN",
+        "native_sl_verified": True, "recovery_hold": False,
+    })
+
+    class AcceptedThenTimeout(MockExchange):
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            client_id = (params or {}).get("clientOrderId")
+            self.entry_order = {
+                "id": "close-timeout-accepted", "clientOrderId": client_id,
+                "status": "closed", "filled": amount, "remaining": 0.0,
+                "average": 101.0, "info": {},
+            }
+            self.position["contracts"] = self.position["contracts"] - amount
+            self.position["info"]["positionAmt"] = str(self.position["contracts"])
+            raise TimeoutError("response lost after BingX accepted close")
+
+    exchange = AcceptedThenTimeout(position=_long_position(qty=2.0))
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    assert ggpbot._verified_market_reduce_impl(
+        "BTC/USDT:USDT", ratio=0.5, close_reason="TP1"
+    ) is True
+    assert len(exchange.create_calls) == 1
+    assert exchange.create_calls[0][4]["clientOrderId"].startswith("naiso-close-")
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(1.0)
+    assert ggpbot.STATE["pending_close_client_order_id"] is None
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+
+
+def test_market_close_ambiguous_timeout_is_never_replayed(tmp_path, monkeypatch):
+    journal, _ = _seed_journal(tmp_path, filled=2.0)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "open": True, "current_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 2.0, "initial_qty": 2.0,
+        "remaining_qty": 2.0, "exchange_qty": 2.0, "trade_id": "T-SCEN",
+        "native_sl_verified": True, "recovery_hold": False,
+    })
+
+    class LostResponse(MockExchange):
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            raise TimeoutError("network timeout; no order visible yet")
+
+    exchange = LostResponse(position=_long_position(qty=2.0))
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    assert ggpbot._verified_market_reduce_impl(
+        "BTC/USDT:USDT", ratio=0.5, close_reason="TP1"
+    ) is False
+    assert len(exchange.create_calls) == 1
+    assert ggpbot.STATE["pending_close_client_order_id"] is not None
+    assert ggpbot.STATE["execution_unresolved"] is True
+    assert ggpbot.STATE["close_reconciliation_required"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+
+
+def test_close_intent_journal_failure_prevents_market_submission(monkeypatch):
+    _fresh_state()
+    ggpbot.STATE.update({
+        "open": True, "current_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 2.0, "initial_qty": 2.0,
+        "remaining_qty": 2.0, "exchange_qty": 2.0, "trade_id": "T-JOURNAL-FAIL",
+        "native_sl_verified": True, "recovery_hold": False,
+    })
+    exchange = MockExchange(position=_long_position(qty=2.0))
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", object())
+    monkeypatch.setattr(ggpbot, "_persist_trade_journal_snapshot", lambda force=False: False)
+
+    assert ggpbot._verified_market_reduce_impl(
+        "BTC/USDT:USDT", ratio=0.5, close_reason="TP1"
+    ) is False
+    assert exchange.create_calls == []
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["pending_close_client_order_id"] is None
