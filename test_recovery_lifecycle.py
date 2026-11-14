@@ -1255,11 +1255,9 @@ def test_restart_restores_pending_close_then_live_manager_resumes_after_client_i
     _fresh_state()
 
     assert ggpbot.startup_trade_recovery() is True
-    # Startup may itself reconcile a terminal order immediately; both startup
-    # and the live manager must converge to the same verified state.
-    assert ggpbot.STATE["execution_unresolved"] is False
-    assert ggpbot.STATE["pending_close_client_order_id"] is None
-    assert ggpbot.STATE["tp1_hit"] is True
+    # Startup restores the durable close intent. The live manager must then
+    # reconcile it through the final ExchangeSyncService override before
+    # normal management is allowed to run.
     assert ggpbot.STATE["recovery_hold"] is False
     assert ggpbot.STATE["native_sl_verified"] is True
 
