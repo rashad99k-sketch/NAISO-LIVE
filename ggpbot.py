@@ -2693,7 +2693,7 @@ def _close_rejection_position_state(symbol, before_qty):
     observed = _position_contracts(position)
     # Use an absolute quantity tolerance. A relative tolerance can hide a
     # one-contract partial fill on large positions and cause a duplicate close.
-    tolerance = 1e-8
+    tolerance = 1e-10
     state = "UNCHANGED" if abs(observed - float(before_qty)) <= tolerance else "CHANGED"
     return state, observed
 
@@ -3037,7 +3037,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                 break
             if post_status == "OPEN":
                 after = _position_contracts(post_position)
-                has_delta = after < before-max(before*0.001, 1e-10)
+                has_delta = after < before - 1e-10
                 if has_delta and (order_status in terminal_statuses or not can_fetch_order):
                     break
                 if order_status in terminal_statuses and not has_delta:
@@ -3070,7 +3070,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         return _close_failure(f"order {order_id} is not terminal ({order_status}); waiting for reconciliation")
 
     filled = max(0.0, before-after)
-    tolerance = max(before*0.002, 1e-10)
+    tolerance = 1e-10
     if filled <= tolerance:
         if order_status in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} and post_status == "OPEN":
             STATE.update({"pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
@@ -11523,7 +11523,7 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
     before = safe_float(STATE.get("pending_close_before_qty"))
     after = safe_float(snap.qty)
     filled_by_delta = max(0.0, before-after) if before > 0 else 0.0
-    if before > 0 and filled_by_delta <= max(before*0.002, 1e-10):
+    if before > 0 and filled_by_delta <= 1e-10:
         # A terminal rejected/cancelled order with no position delta is safe to clear.
         if status in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}:
             STATE.update({"pending_close_order_id": None, "pending_close_client_order_id": None, "pending_close_reason": None,
