@@ -2844,8 +2844,12 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
     except Exception:
         market_meta = {}
     amount_step = amount_step_from_market(market_meta, getattr(ex, "precisionMode", None))
-    if not amount_step and str(STATE.get("close_amount_step_symbol") or "") == sym:
-        amount_step = safe_float(STATE.get("close_amount_step"), 0.0)
+    if str(STATE.get("close_amount_step_symbol") or "") == sym:
+        # A step learned from an explicit BingX rejection is stronger evidence
+        # than a more permissive generic CCXT precision value for this symbol.
+        cached_step = safe_float(STATE.get("close_amount_step"), 0.0)
+        if cached_step > 0:
+            amount_step = max(amount_step or 0.0, cached_step)
     if amount_step and amount_step > 0:
         STATE["close_amount_step"] = float(amount_step)
         STATE["close_amount_step_symbol"] = sym
