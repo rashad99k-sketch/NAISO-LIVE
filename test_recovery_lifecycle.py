@@ -343,7 +343,8 @@ def test_partial_tp1_fill_with_exchange_evidence_reconciles(tmp_path, monkeypatc
     assert not ggpbot.STATE.get("bot_close_order_ids")
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["remaining_qty"] == 0.5
-    assert ggpbot.STATE["tp1_hit"] is True
+    assert not bool(ggpbot.STATE["tp1_hit"])
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(9999.0)
 
 
 def test_tp1_evidence_rejects_wrong_position_side(tmp_path, monkeypatch):
@@ -1300,8 +1301,8 @@ def test_tp1_fill_evidence_accepts_recorded_client_order_id(monkeypatch):
 
 
 def test_reconcile_rechecks_read_only_until_delayed_close_order_becomes_visible(monkeypatch):
-    symbol, client_id = _seed_pending_close_client_id()
-    exchange = MockExchange(position=_long_position(qty=2.0), entry_order=None)
+    symbol, client_id = _seed_pending_close_client_id(before_qty=10000.0)
+    exchange = MockExchange(position=_long_position(qty=10000.0), entry_order=None)
     monkeypatch.setattr(ggpbot, "ex", exchange)
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
 
@@ -1312,7 +1313,7 @@ def test_reconcile_rechecks_read_only_until_delayed_close_order_becomes_visible(
             self.events.append((name, payload))
 
     sync = ggpbot.ExchangeSyncService(EventBus())
-    snapshot = {"value": _open_snapshot(2.0)}
+    snapshot = {"value": _open_snapshot(10000.0)}
     sync.fetch_live_snapshot = lambda requested_symbol: snapshot["value"]
     sync.last_fetch_status = "OPEN"
 
@@ -1327,9 +1328,9 @@ def test_reconcile_rechecks_read_only_until_delayed_close_order_becomes_visible(
         "average": 101.0, "info": {},
     }
     exchange.entry_order = order
-    exchange.position["contracts"] = 1.0
-    exchange.position["info"]["positionAmt"] = "1.0"
-    snapshot["value"] = _open_snapshot(1.0)
+    exchange.position["contracts"] = 9999.0
+    exchange.position["info"]["positionAmt"] = "9999.0"
+    snapshot["value"] = _open_snapshot(9999.0)
 
     second = sync.reconcile(symbol, ggpbot.STATE, force=True)
     assert second == "OPEN"
@@ -1337,3 +1338,39 @@ def test_reconcile_rechecks_read_only_until_delayed_close_order_becomes_visible(
     assert ggpbot.STATE["execution_unresolved"] is False
     assert ggpbot.STATE["close_reconciliation_required"] is False
     assert ggpbot.STATE["tp1_hit"] is True
+
+
+def test_verified_close_detects_one_contract_fill_on_large_position(tmp_path, monkeypatch):
+    journal, _ = _seed_journal(tmp_path, filled=10000.0)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "open": True, "current_symbol": "BTC/USDT:USDT", "symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 10000.0, "initial_qty": 10000.0,
+        "remaining_qty": 10000.0, "exchange_qty": 10000.0, "trade_id": "T-SCEN",
+        "native_sl_verified": True, "recovery_hold": False,
+    })
+
+    class AcceptedSingleContractThenTimeout(MockExchange):
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            client_id = (params or {}).get("clientOrderId")
+            self.entry_order = {
+                "id": "large-position-close-1", "clientOrderId": client_id,
+                "status": "closed", "filled": amount, "remaining": 0.0,
+                "average": 101.0, "info": {},
+            }
+            self.position["contracts"] -= amount
+            self.position["info"]["positionAmt"] = str(self.position["contracts"])
+            raise TimeoutError("response lost after one-contract fill")
+
+    exchange = AcceptedSingleContractThenTimeout(position=_long_position(qty=10000.0))
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    assert ggpbot._verified_market_reduce_impl(
+        "BTC/USDT:USDT", qty=1.0, close_reason="BOT_STRICT_CLOSE"
+    ) is True
+    assert len(exchange.create_calls) == 1
+    assert ggpbot.STATE["last_close_filled_qty"] == pytest.approx(1.0)
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(9999.0)
+    assert ggpbot.STATE["execution_unresolved"] is False
