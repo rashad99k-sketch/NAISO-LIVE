@@ -1,4 +1,5 @@
 from roro_institutional import _location_event_id, _zone_retest_candidates
+from location_authority import validate_location_zone
 
 
 def _context(**overrides):
@@ -106,3 +107,43 @@ def test_location_first_accepts_side_aligned_unfilled_fvg():
     })
     zones = _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY")
     assert zones == [(99.0, 100.5, "FVG", 1_699_999_100_000)]
+
+
+
+def test_central_location_authority_accepts_fresh_side_aligned_ob():
+    result = validate_location_zone({
+        "kind": "ORDER_BLOCK", "low": 99.0, "high": 100.5,
+        "zone_definition": "BULLISH_LOW_TO_OPEN", "strength": 8.0,
+        "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is True
+    assert result["distance_atr"] == 0.0
+
+
+def test_central_location_authority_rejects_wrong_side_fvg():
+    result = validate_location_zone({
+        "kind": "FVG", "low": 99.0, "high": 100.5,
+        "direction": "BEARISH", "status": "UNFILLED", "size_atr": 0.2,
+        "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is False
+    assert result["reason"] == "fvg_direction_mismatch"
+
+
+def test_central_location_authority_rejects_future_timestamp():
+    result = validate_location_zone({
+        "kind": "ORDER_BLOCK", "low": 99.0, "high": 100.5,
+        "zone_definition": "BULLISH_LOW_TO_OPEN", "strength": 8.0,
+        "available_timestamp": 1_700_000_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is False
+    assert result["reason"] == "future_dated_zone"
+
+
+def test_central_location_authority_accepts_confirmed_aligned_support():
+    result = validate_location_zone({
+        "kind": "SUPPORT", "low": 99.0, "high": 100.5,
+        "status": "CONFIRMED", "strength": 6.0,
+        "available_timestamp": 1_699_999_100_000,
+    }, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
+    assert result["valid"] is True
