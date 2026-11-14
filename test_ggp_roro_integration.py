@@ -132,3 +132,18 @@ def test_watchlist_priority_prefers_actual_golden_zone_and_retest_state(tmp_path
     assert seen == ["BBB/USDT:USDT"]
     assert "BBB" in out
     assert out["BBB"]["decision_state"] in {"ENTRY_READY", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_RETEST", "REJECTED"}
+
+
+def test_decision_serializer_flattens_tuple_evidence():
+    import ggp_institutional_bridge as bridge
+    from roro_institutional import InstitutionalDecision
+
+    decision = InstitutionalDecision(
+        "WAITING_FOR_CONFIRMATION", "TEST", "BUY", "test",
+        evidence=("sweep", ("reclaim", "closed_mss")),
+        rejection_reasons=(("trigger_pending",),),
+    )
+    result = bridge._decision_result(decision)
+    assert result["evidence"] == ["sweep", "reclaim", "closed_mss"]
+    assert result["rejection_reasons"] == ["trigger_pending"]
+    assert all(isinstance(value, str) for value in result["evidence"] + result["rejection_reasons"])
