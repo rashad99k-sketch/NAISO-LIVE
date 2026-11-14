@@ -14,6 +14,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 
+from location_authority import validate_location_zone
+
 
 class DecisionState(str, Enum):
     ENTRY_READY = "ENTRY_READY"
@@ -190,47 +192,33 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
                 except (KeyError, TypeError, ValueError, OverflowError):
                     continue
     if location_first:
-        # Retain only fresh, side-aligned causal zones close enough to execute.
+        # The central authority applies the same side/quality/freshness/no-chase
+        # policy for every entry engine; this module remains execution-free.
+        actionable = []
+        latest_ts = int(context.get("latest_timestamp", 0) or 0)
+        timeframe_ms = int(context.get("timeframe_ms", 900_000) or 900_000)
         reference_price = context.get("reference_price")
         max_distance_atr = float(context.get("max_location_distance_atr", 1.5) or 1.5)
-        actionable = []
         for low, high, name, available_ts in levels:
-            if name not in ("ORDER_BLOCK", "FVG", "SUPPORT", "RESISTANCE"):
-                continue
-            if available_ts is None or int(available_ts) <= 0 or not (0 < low < high):
-                continue
             if name == "ORDER_BLOCK":
-                ob_data = context.get("order_block") or {}
-                try:
-                    if float(ob_data.get("strength", 0) or 0) < 5.0:
-                        continue
-                except (TypeError, ValueError):
-                    continue
-            if name == "FVG":
-                fvg_data = context.get("fvg") or {}
-                try:
-                    if str(fvg_data.get("status", "")).upper() not in ("UNFILLED", "PARTIALLY_FILLED"):
-                        continue
-                    if float(fvg_data.get("size_atr", 0) or 0) < 0.08:
-                        continue
-                except (TypeError, ValueError):
-                    continue
-            timeframe_ms = max(1, int(context.get("timeframe_ms", 900_000)))
-            latest_ts = int(context.get("latest_timestamp", available_ts))
-            # Future-dated evidence is look-ahead, not a fresh zone.
-            if int(available_ts) > latest_ts:
-                continue
-            if (latest_ts - int(available_ts)) / timeframe_ms > 48:
-                continue
-            if reference_price is not None:
-                try:
-                    px = float(reference_price)
-                    distance = max(low - px, 0.0, px - high) / float(atr)
-                    if not math.isfinite(distance) or distance > max_distance_atr:
-                        continue
-                except (TypeError, ValueError, ZeroDivisionError):
-                    continue
-            actionable.append((low, high, name, available_ts))
+                metadata = dict(ob or {})
+            elif name == "FVG":
+                metadata = dict(fvg or {})
+            else:
+                sr_zones = (sr or {}).get("supports" if name == "SUPPORT" else "resistances", [])
+                metadata = next((dict(z) for z in sr_zones if isinstance(z, dict)
+                                and float(z.get("low", 0) or 0) == low
+                                and float(z.get("high", 0) or 0) == high), {})
+            metadata.update({
+                "kind": name, "low": low, "high": high,
+                "available_timestamp": available_ts,
+            })
+            validation = validate_location_zone(
+                metadata, direction, reference_price, atr, latest_ts, timeframe_ms,
+                max_age_bars=48, max_distance_atr=max_distance_atr,
+            )
+            if validation.get("valid"):
+                actionable.append((low, high, name, available_ts))
         return actionable
     return levels
 
