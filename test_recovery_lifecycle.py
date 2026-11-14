@@ -1223,3 +1223,52 @@ def test_restart_without_pending_close_identity_stays_in_recovery_hold():
     assert "close_reconciliation_pending" in missing
     assert "unverified_position_reduction_requires_tp1_fill_evidence" in missing
     assert restored["recovery_hold"] is True
+
+
+
+def test_restart_restores_pending_close_then_live_manager_resumes_after_client_id_proof(tmp_path, monkeypatch):
+    client_id = "naiso-close-restart-verified"
+    pending = {
+        "execution_unresolved": True, "close_reconciliation_required": True,
+        "pending_close_order_id": None, "pending_close_client_order_id": client_id,
+        "pending_close_reason": "TP1", "pending_close_before_qty": 2.0,
+        "pending_close_requested_qty": 1.0, "pending_close_target_remaining_qty": 1.0,
+        "pending_close_started_at": time.time() - 3,
+    }
+    journal, _ = _seed_journal(
+        tmp_path, filled=2.0, snapshot_overrides=pending
+    )
+    order = {
+        "id": "close-restart-exchange-id", "clientOrderId": client_id,
+        "status": "closed", "filled": 1.0, "remaining": 0.0,
+        "average": 101.0, "info": {},
+    }
+    exchange = MockExchange(
+        position=_long_position(qty=1.0),
+        open_orders=[_native_stop(qty=1.0, trigger=95.0)],
+        entry_order=order,
+    )
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    _fresh_state()
+
+    assert ggpbot.startup_trade_recovery() is True
+    assert ggpbot.STATE["execution_unresolved"] is True
+    assert ggpbot.STATE["pending_close_client_order_id"] == client_id
+    assert ggpbot.STATE["recovery_hold"] is False
+    assert ggpbot.STATE["native_sl_verified"] is True
+
+    manager = ggpbot._live_manager
+    manager.last_management_ts = 0.0
+    manager.last_position_sync_ts = 0.0
+    managed = []
+    monkeypatch.setattr(manager, "_apply_management", lambda symbol, now: managed.append(symbol))
+
+    manager.manage_live_trade()
+
+    assert managed == ["BTC/USDT:USDT"]
+    assert ggpbot.STATE["tp1_hit"] is True
+    assert ggpbot.STATE["pending_close_client_order_id"] is None
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(1.0)
