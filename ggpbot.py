@@ -2909,7 +2909,6 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             })
             return _close_failure("close intent could not be durably journaled; MARKET order not sent",
                                   unresolved=False)
-        globals()["RECOVERY_BLOCK_ENTRIES"] = True
         MEMORY["recovery_status"] = "CLOSE_SUBMISSION_PENDING"
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
         # First resolve a lost response by client ID. Only an explicit amount-precision
