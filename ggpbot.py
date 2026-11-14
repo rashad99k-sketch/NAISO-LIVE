@@ -10437,12 +10437,17 @@ def refresh_unified_institutional_watchlist(force=False):
             "closed_candles_only": True,
         })
         _last_unified_watchlist_refresh = now
+        MEMORY["_unified_watchlist_refresh_ok"] = True
         if INSTITUTIONAL_RESOURCE_MANAGER:
             INSTITUTIONAL_RESOURCE_MANAGER.record({"event":"watchlist_refresh", "count":len(result), "ts":time.time()})
         log_execution(f"[INTEGRATION] unified watchlist analyzed={len(result)}", "INFO")
         return result
     except Exception as exc:
-        log_execution(f"[INTEGRATION] watchlist refresh failed: {exc}", "ERROR")
+        MEMORY["_unified_watchlist_refresh_ok"] = False
+        log_execution(
+            f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\\n{traceback.format_exc()}",
+            "ERROR",
+        )
         return MEMORY.setdefault("watchlist", {})
 
 def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, momentum=None, source="ggp"):
@@ -10484,6 +10489,11 @@ def smart_opportunity_selection():
     if daily_loss_cooldown_active():
         return False
     refresh_unified_institutional_watchlist()
+    # Never authorize a new entry from a stale Watchlist after an integration failure.
+    # Existing position management runs in its independent lifecycle and is unaffected.
+    if MEMORY.get("_unified_watchlist_refresh_ok") is False:
+        log_execution("[ENTRY_GUARD] unified Watchlist refresh failed; stale candidates cannot authorize entries", "WARN")
+        return False
     if STATE.get("open") or TRADE_STATE.get("in_position"):
         return False
     if globals().get("RECOVERY_BLOCK_ENTRIES", False) or MEMORY.get("position_status") == "UNKNOWN":
