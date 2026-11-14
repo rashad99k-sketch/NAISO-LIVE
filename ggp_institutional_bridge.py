@@ -287,10 +287,27 @@ def _decision_priority(result: Dict[str, Any]) -> Tuple[int, float, float]:
         zone_score = 0.0
     return priority, score, zone_score
 
+def _normalize_text_items(value: Any) -> List[str]:
+    """Flatten tuple/list evidence and coerce every leaf to text at the API boundary."""
+    normalized: List[str] = []
+    pending = list(value) if isinstance(value, (list, tuple, set)) else ([] if value is None else [value])
+    while pending:
+        item = pending.pop(0)
+        if isinstance(item, (list, tuple, set)):
+            pending[0:0] = list(item)
+        elif item is not None:
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+    return normalized
+
+
 def _decision_result(decision) -> Dict[str, Any]:
     data = decision.to_dict()
-    data["evidence"] = list(data.get("evidence") or [])
-    data["rejection_reasons"] = list(data.get("rejection_reasons") or [])
+    # Evidence originates as immutable tuples in the strategy engines. Flatten nested
+    # containers so downstream dashboard/log/entry consumers only receive strings.
+    data["evidence"] = _normalize_text_items(data.get("evidence"))
+    data["rejection_reasons"] = _normalize_text_items(data.get("rejection_reasons"))
     return data
 
 
