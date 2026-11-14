@@ -2783,7 +2783,8 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         log_execution(f"[CLOSE_VERIFY] PAPER {close_reason}: filled={requested:.8f}, remaining={after:.8f}", "SUCCESS")
         return True
 
-    if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
+    if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
+            or STATE.get("pending_close_order_id")):
         return _close_failure("previous close is unresolved; refusing another MARKET order")
     status, position = fetch_position_tri_state(symbol)
     if status == "UNKNOWN":
@@ -3288,13 +3289,15 @@ class LiveTradeManager:
                 if self._emergency_exit_if_valid(symbol, now):
                     self._log_live_status()
                     return
-        if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
+        if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
+                or STATE.get("pending_close_order_id")):
             if now - self.last_position_sync_ts >= 2:
                 self.exchange_sync.reconcile(symbol, STATE)
                 self.last_position_sync_ts = now
             # A successful reconciliation releases the gate immediately. If it
             # remains unresolved, do not run management or submit another order.
-            if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
+            if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
+                    or STATE.get("pending_close_order_id")):
                 log_execution(f"[EXECUTION_UNRESOLVED] {symbol}: management actions paused until exchange order outcome is reconciled", "ERROR",
                               debounce_key=f"execution_unresolved_{symbol}", debounce_sec=30)
                 return
@@ -11408,7 +11411,7 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
     """Resolve an ambiguous bot close after a fresh OPEN snapshot and terminal order read."""
     order_id = STATE.get("pending_close_order_id")
     if not order_id:
-        return not bool(STATE.get("execution_unresolved"))
+        return not bool(STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"))
     try:
         order = safe_api_call(ex.fetch_order, str(order_id), normalize_symbol(symbol)) if hasattr(ex, "fetch_order") else None
     except Exception as exc:
