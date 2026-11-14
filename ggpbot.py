@@ -2703,12 +2703,36 @@ def _close_rejection_position_state(symbol, before_qty):
     return state, observed
 
 
+def _fetch_close_order_by_identity(symbol, order_id=None, client_order_id=None):
+    """Read a pending close by exchange ID or persisted client ID; never submit."""
+    fetch = getattr(ex, "fetch_order", None)
+    if not callable(fetch):
+        return None
+    identity = str(order_id or client_order_id or "").strip()
+    if not identity:
+        return None
+    params = {"clientOrderId": str(client_order_id)} if client_order_id else {}
+    try:
+        return fetch(identity, normalize_symbol(symbol), params) if params else fetch(identity, normalize_symbol(symbol))
+    except TypeError:
+        try:
+            return fetch(identity, normalize_symbol(symbol))
+        except Exception as exc:
+            log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
+                          debounce_key=f"close_lookup_{identity}", debounce_sec=30)
+    except Exception as exc:
+        log_execution(f"[CLOSE_RECOVERY] order lookup failed for {identity}: {exc}", "WARN",
+                      debounce_key=f"close_lookup_{identity}", debounce_sec=30)
+    return None
+
+
 def _release_confirmed_close_rejection(symbol, reason):
     """Release only a proven no-order/no-fill rejection; leave the live trade intact."""
     STATE.update({
         "execution_unresolved": False,
         "close_reconciliation_required": False,
         "pending_close_order_id": None,
+        "pending_close_client_order_id": None,
         "pending_close_reason": None,
         "pending_close_before_qty": 0.0,
         "pending_close_requested_qty": 0.0,
@@ -2863,56 +2887,100 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             mode_result.mode, close_side.upper(), opening=False, closing=True,
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
+        # Persist a unique client identity before the non-idempotent MARKET write.
+        # A lost HTTP response can then be reconciled without ever replaying the order.
+        client_order_id = f"naiso-close-{uuid.uuid4().hex[:20]}"
+        close_params["clientOrderId"] = client_order_id
+        STATE.update({
+            "pending_close_order_id": None,
+            "pending_close_client_order_id": client_order_id,
+            "pending_close_reason": str(close_reason),
+            "pending_close_before_qty": before,
+            "pending_close_requested_qty": requested,
+            "pending_close_target_remaining_qty": target_remaining_qty,
+            "pending_close_started_at": time.time(),
+            "execution_unresolved": True,
+            "close_reconciliation_required": True,
+        })
+        if not _persist_trade_journal_snapshot(force=True):
+            STATE.update({
+                "pending_close_client_order_id": None, "pending_close_reason": None,
+                "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
+                "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
+                "execution_unresolved": False, "close_reconciliation_required": False,
+            })
+            return _close_failure("close intent could not be durably journaled; MARKET order not sent",
+                                  unresolved=False)
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
-        # The sole exception is CCXT's explicit natural-contract amount rejection. That
-        # validation rejection is not an unknown fill: first prove BingX exposure is
-        # unchanged, then make at most one downward-only integer-contract correction.
+        # First resolve a lost response by client ID. Only an explicit amount-precision
+        # rejection plus unchanged exchange exposure permits one downward-only correction.
         try:
             order = ex.create_order(sym, "market", close_side, requested,
                                     params=close_params)
         except Exception as submit_exc:
-            if not is_contract_amount_precision_error(submit_exc):
-                raise
-            rejection_state, observed_qty = _close_rejection_position_state(symbol, before)
-            if rejection_state == "FLAT":
-                return False
-            if rejection_state != "UNCHANGED":
-                return _close_failure(
-                    f"amount precision rejection but BingX exposure could not be proven unchanged "
-                    f"(state={rejection_state}); no retry sent"
+            order = _fetch_close_order_by_identity(symbol, client_order_id=client_order_id)
+            if not isinstance(order, dict):
+                if not is_contract_amount_precision_error(submit_exc):
+                    raise submit_exc
+                rejection_state, observed_qty = _close_rejection_position_state(symbol, before)
+                if rejection_state == "FLAT":
+                    return False
+                if rejection_state != "UNCHANGED":
+                    return _close_failure(
+                        f"amount precision rejection but BingX exposure could not be proven unchanged "
+                        f"(state={rejection_state}); no retry sent"
+                    )
+                STATE["close_amount_step"] = 1.0
+                STATE["close_amount_step_symbol"] = sym
+                retry_requested = recover_integer_contract_amount(requested, before, observed_qty, "OPEN")
+                if retry_requested is None:
+                    return _close_failure("contract amount correction was not eligible after position check")
+                if retry_requested <= 0:
+                    _release_confirmed_close_rejection(symbol, str(submit_exc))
+                    return False
+                retry_requested = float(ex.amount_to_precision(sym, retry_requested))
+                if retry_requested <= 0:
+                    _release_confirmed_close_rejection(symbol, "integer contract correction rounded to zero")
+                    return False
+                if retry_requested > requested + 1e-10:
+                    return _close_failure("integer contract correction would increase close quantity; retry blocked")
+                client_order_id = f"naiso-close-{uuid.uuid4().hex[:20]}"
+                close_params["clientOrderId"] = client_order_id
+                requested = retry_requested
+                if had_target_remaining:
+                    target_remaining_qty = max(0.0, before-requested)
+                STATE.update({
+                    "pending_close_client_order_id": client_order_id,
+                    "pending_close_requested_qty": requested,
+                    "pending_close_target_remaining_qty": target_remaining_qty,
+                    "pending_close_started_at": time.time(),
+                })
+                if not _persist_trade_journal_snapshot(force=True):
+                    return _close_failure("corrected close intent could not be journaled; retry blocked")
+                try:
+                    order = ex.create_order(sym, "market", close_side, requested,
+                                            params=close_params)
+                except Exception as retry_exc:
+                    order = _fetch_close_order_by_identity(symbol, client_order_id=client_order_id)
+                    if not isinstance(order, dict):
+                        raise retry_exc
+                log_execution(
+                    f"[CLOSE_RECOVERY] {symbol}: corrected rejected fractional contract amount "
+                    f"to {requested:g}; one verified retry submitted",
+                    "WARN",
                 )
-            STATE["close_amount_step"] = 1.0
-            STATE["close_amount_step_symbol"] = sym
-            retry_requested = recover_integer_contract_amount(requested, before, observed_qty, "OPEN")
-            if retry_requested is None:
-                return _close_failure("contract amount correction was not eligible after position check")
-            if retry_requested <= 0:
-                _release_confirmed_close_rejection(symbol, str(submit_exc))
-                return False
-            retry_requested = float(ex.amount_to_precision(sym, retry_requested))
-            if retry_requested <= 0:
-                _release_confirmed_close_rejection(symbol, "integer contract correction rounded to zero")
-                return False
-            # A correction may only reduce the requested close; never round up.
-            if retry_requested > requested + 1e-10:
-                return _close_failure("integer contract correction would increase close quantity; retry blocked")
-            order = ex.create_order(sym, "market", close_side, retry_requested,
-                                    params=close_params)
-            requested = retry_requested
-            if had_target_remaining:
-                target_remaining_qty = max(0.0, before-requested)
-            log_execution(
-                f"[CLOSE_RECOVERY] {symbol}: corrected rejected fractional contract amount "
-                f"to {requested:g}; one verified retry submitted",
-                "WARN",
-            )
         if not isinstance(order, dict):
             return _close_failure("BingX returned no structured close-order response")
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
         if not order_id:
-            return _close_failure("close response has no order ID; submission outcome is ambiguous")
+            order = _fetch_close_order_by_identity(symbol, client_order_id=client_order_id)
+            order_id = (order.get("id") or (order.get("info") or {}).get("orderId")) if isinstance(order, dict) else None
+        if not order_id:
+            return _close_failure("close response has no exchange order ID; client ID retained for reconciliation")
         order_id = str(order_id)
-        STATE.update({"pending_close_order_id": order_id, "pending_close_reason": str(close_reason),
+        STATE.update({"pending_close_order_id": order_id,
+                      "pending_close_client_order_id": client_order_id,
+                      "pending_close_reason": str(close_reason),
                       "pending_close_before_qty": before, "pending_close_requested_qty": requested,
                       "pending_close_target_remaining_qty": target_remaining_qty,
                       "pending_close_started_at": time.time(), "execution_unresolved": True,
@@ -5362,9 +5430,10 @@ STATE = {
     "last_close_reason": None, "last_close_fill_price": None, "last_close_filled_qty": 0.0,
     "last_close_realized_pnl": 0.0, "last_close_pnl_source": None, "last_close_pnl_complete": True,
     "bot_close_order_ids": [],
-    "pending_close_order_id": None, "pending_close_reason": None,
-    "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
-    "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
+    "pending_close_order_id": None, "pending_close_client_order_id": None,
+    "pending_close_reason": None, "pending_close_before_qty": 0.0,
+    "pending_close_requested_qty": 0.0, "pending_close_target_remaining_qty": None,
+    "pending_close_started_at": 0.0,
     "structural_invalidation": False, "thesis_failure_reasons": [],
     "emergency_exit": False, "emergency_reason": None,
     "emergency_source": None, "emergency_ts": 0.0,
