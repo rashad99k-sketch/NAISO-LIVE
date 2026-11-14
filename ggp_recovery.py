@@ -206,8 +206,6 @@ def build_restored_management_state(
     partial_close_reconciled = False
     tp1_reconciled = False
     recorded_tp1_hit = bool(saved.get("tp1_hit")) or bool(row.get("tp1_hit"))
-    pending_close_identity = bool(saved.get("pending_close_order_id") or
-                                   saved.get("pending_close_client_order_id"))
     if not symbol:
         missing.append("symbol")
     if side not in {"BUY", "SELL"}:
@@ -260,19 +258,13 @@ def build_restored_management_state(
                 # the journal already recorded tp1_hit before the crash. Otherwise
                 # Hold for an explicit reduction reconciliation: a manual or
                 # external close must never be silently relabelled as TP1.
-                if pending_close_identity:
-                    # A durable pending close identity is not proof of TP1. Keep the
-                    # original management stage unchanged and let the live close
-                    # resolver query that exact order before normal management resumes.
-                    pass
+                partial_close_reconciled = True
+                if recorded_tp1_hit:
+                    tp1_reconciled = True
+                elif tp1_fill_verified:
+                    tp1_reconciled = True
                 else:
-                    partial_close_reconciled = True
-                    if recorded_tp1_hit:
-                        tp1_reconciled = True
-                    elif tp1_fill_verified:
-                        tp1_reconciled = True
-                    else:
-                        missing.append("unverified_position_reduction_requires_tp1_fill_evidence")
+                    missing.append("unverified_position_reduction_requires_tp1_fill_evidence")
 
     entry_state = str(saved.get("entry_execution_state") or row.get("status") or "").upper()
     if entry_state in {"ENTRY_PENDING", "EXECUTION_UNCERTAIN", "ENTRY_PRICE_UNKNOWN", "PARTIAL_FILL"}:
@@ -282,7 +274,7 @@ def build_restored_management_state(
         # reconciled and must not keep the trade in Recovery Hold forever.
         if executed_qty is None or entry is None:
             missing.append(f"entry_execution_not_fully_reconciled:{entry_state}")
-    if (bool(saved.get("close_reconciliation_required")) or bool(saved.get("external_close_detected"))) and not pending_close_identity:
+    if bool(saved.get("close_reconciliation_required")) or bool(saved.get("external_close_detected")):
         missing.append("close_reconciliation_pending")
 
     if current_qty is not None and executed_qty is not None:
