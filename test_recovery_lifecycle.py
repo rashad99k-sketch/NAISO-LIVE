@@ -1388,7 +1388,7 @@ def test_explicit_contract_precision_rejection_gets_one_downward_retry(tmp_path,
 
     class RejectFractionThenAcceptInteger(MockExchange):
         def create_order(self, symbol, kind, side, amount, price=None, params=None):
-            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            self.create_calls.append((symbol, kind, side, amount, dict(params or {})))
             if len(self.create_calls) == 1:
                 raise ValueError(
                     "bingx amount of BTC/USDT:USDT must be greater than minimum amount precision of 1"
