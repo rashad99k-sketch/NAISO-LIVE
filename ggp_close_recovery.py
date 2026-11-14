@@ -97,7 +97,9 @@ def recover_integer_contract_amount(requested: Any, before_qty: Any, observed_qt
         return None
     if not all(x.is_finite() for x in (before, observed, amount)) or before <= 0 or amount <= 0:
         return None
-    tolerance = max(before * Decimal("0.001"), Decimal("1e-10"))
+    # Exposure equality is an absolute check. A relative tolerance can hide
+    # a one-contract partial fill on large positions and permit a duplicate close.
+    tolerance = Decimal("1e-8")
     if abs(observed - before) > tolerance:
         return None
     retry = floor_amount_to_step(amount, 1)
