@@ -10495,23 +10495,41 @@ def smart_opportunity_selection():
              if isinstance(item, dict) and item.get("decision_state") == "ENTRY_READY"]
     def _location_first_rank(pair):
         _, candidate = pair
+        side_value = str(candidate.get("side") or "").upper()
         atr_value = candidate.get("atr")
         price_value = candidate.get("price")
-        distances = []
+        latest_ts = int(candidate.get("latest_timestamp", 0) or 0)
+        timeframe_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000)
+        zones = []
         ob = candidate.get("order_block")
-        if isinstance(ob, dict) and ob.get("valid", True):
-            try:
-                distances.append(float(ob.get("distance_atr")))
-            except (TypeError, ValueError):
-                pass
+        if isinstance(ob, dict):
+            zone = dict(ob)
+            zone.update({"kind": "ORDER_BLOCK",
+                         "available_timestamp": zone.get("impulse_timestamp", zone.get("timestamp"))})
+            zones.append(zone)
         fvg = candidate.get("fvg")
-        if isinstance(fvg, dict) and fvg.get("status") in ("UNFILLED", "PARTIALLY_FILLED"):
-            try:
-                low, high = float(fvg.get("lower")), float(fvg.get("upper"))
-                if atr_value and float(atr_value) > 0 and price_value and low > 0 and high >= low:
-                    distances.append(max(low - float(price_value), 0.0, float(price_value) - high) / float(atr_value))
-            except (TypeError, ValueError):
-                pass
+        if isinstance(fvg, dict):
+            zone = dict(fvg)
+            zone.update({"kind": "FVG", "low": zone.get("lower"), "high": zone.get("upper"),
+                         "available_timestamp": zone.get("timestamp")})
+            zones.append(zone)
+        sr = candidate.get("support_resistance")
+        if isinstance(sr, dict):
+            key = "supports" if side_value == "BUY" else "resistances"
+            for row in sr.get(key, []):
+                if isinstance(row, dict):
+                    zone = dict(row)
+                    zone.update({"kind": "SUPPORT" if side_value == "BUY" else "RESISTANCE",
+                                 "available_timestamp": zone.get("confirmed_at_timestamp")})
+                    zones.append(zone)
+        distances = []
+        for zone in zones:
+            checked = validate_location_zone(
+                zone, side_value, price_value, atr_value, latest_ts, timeframe_ms,
+                max_age_bars=48, max_distance_atr=1.5,
+            )
+            if checked.get("valid"):
+                distances.append(float(checked["distance_atr"]))
         golden = candidate.get("golden_zone") if isinstance(candidate.get("golden_zone"), dict) else {}
         location_distance = min(distances) if distances else 999.0
         location_quality = float(golden.get("score", 0) or 0)
