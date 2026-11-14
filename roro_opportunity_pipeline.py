@@ -260,9 +260,18 @@ def _pipeline_institutional_context(frame: pd.DataFrame, side: str, atr: float) 
     vol_base = float(frame.volume.iloc[-21:-1].mean()) if len(frame) >= 21 else 0.0
     vol_ratio = float(frame.volume.iloc[-1]) / vol_base if vol_base > 0 else 0.0
     zone = classify_golden_zone(frame, atr)
-    return {"liquidity": liquidity, "order_block": ob, "fvg": fvg,
-            "volume_ratio": vol_ratio, "volume_confirmed": vol_ratio >= 1.1,
-            "value_zone": zone.name}
+    return {
+        "liquidity": liquidity, "order_block": ob, "fvg": fvg,
+        "volume_ratio": vol_ratio, "volume_confirmed": vol_ratio >= 1.1,
+        "value_zone": zone.name,
+        # Enforce zone-first execution for both reversal and continuation.
+        # This is internal evidence only; the public/API payload shape is unchanged.
+        "location_first_required": True,
+        "reference_price": price,
+        "latest_timestamp": int(frame.timestamp.iloc[-1]),
+        "timeframe_ms": 900_000,
+        "max_location_distance_atr": 1.5,
+    }
 
 
 def pre_cross_metrics(df: pd.DataFrame, atr: Optional[float] = None) -> Dict[str, Any]:

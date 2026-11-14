@@ -423,7 +423,7 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     sr_candidates = sr.get("supports" if side == "BUY" else "resistances", [])
     sr_aligned_zone = next((z for z in sr_candidates
                             if isinstance(z, dict) and z.get("status") == "CONFIRMED"
-                            and float(z.get("distance_atr", 999) or 999) <= 1.5
+                            and float(z.get("distance_atr", 999) if z.get("distance_atr") is not None else 999) <= 1.5
                             and float(z.get("strength", 0) or 0) >= 5.0), None)
     sr_aligned = sr_aligned_zone is not None
     liq_event, liq_direction, liq_level = getattr(liquidity, "event", "UNKNOWN"), getattr(liquidity, "direction", "UNKNOWN"), getattr(liquidity, "level", None)
@@ -457,6 +457,13 @@ def _build_context(df: pd.DataFrame, side: str) -> Dict[str, Any]:
         "volume_ratio": volume_ratio,
         "volume_confirmed": bool(volume_ratio is not None and volume_ratio >= 1.1),
         "golden_zone": golden,
+        # Strict entry policy: engines must retest a fresh, nearby institutional zone.
+        # This metadata stays internal and does not alter Telegram/dashboard/API schemas.
+        "location_first_required": True,
+        "reference_price": price,
+        "latest_timestamp": int(df.timestamp.iloc[-1]),
+        "timeframe_ms": int(TIMEFRAME_SECONDS * 1000),
+        "max_location_distance_atr": 1.5,
     }
 
 
