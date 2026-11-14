@@ -99,7 +99,7 @@ def recover_integer_contract_amount(requested: Any, before_qty: Any, observed_qt
         return None
     # Exposure equality is an absolute check. A relative tolerance can hide
     # a one-contract partial fill on large positions and permit a duplicate close.
-    tolerance = Decimal("1e-8")
+    tolerance = Decimal("1e-10")
     if abs(observed - before) > tolerance:
         return None
     retry = floor_amount_to_step(amount, 1)
