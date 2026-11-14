@@ -2104,14 +2104,6 @@ class ExchangeSyncService:
                     STATE["open"] = True
                     STATE["current_symbol"] = symbol
                     STATE["entry_time"] = time.time()
-            if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required") or STATE.get("pending_close_order_id"):
-                if not _resolve_pending_close_from_snapshot(symbol, snap):
-                    log_execution(
-                        f"[RECONCILIATION] {symbol}: position is OPEN but pending close outcome is not terminal/verified; "
-                        "management remains safely paused",
-                        "WARN", debounce_key=f"close_reconcile_pending_{symbol}", debounce_sec=30,
-                    )
-                    return "OPEN_UNRESOLVED"
             log_execution(f"[RECONCILIATION] Completed: ROE={snap.roe_pct:.2f}%, Qty={snap.qty}", "SUCCESS")
             self.event_bus.emit("reconciled", snap)
             return "OPEN"
@@ -12360,8 +12352,18 @@ def _exchange_reconcile(self, symbol, local_state, *, force=False):
                 RECOVERY_BLOCK_ENTRIES = True
             return "UNKNOWN"
 
-        if STATE.get("pending_close_order_id"):
-            _resolve_pending_close_from_snapshot(symbol, snap)
+        if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
+                or STATE.get("pending_close_order_id") or STATE.get("pending_close_client_order_id")):
+            if not _resolve_pending_close_from_snapshot(symbol, snap):
+                _apply_open_snapshot(symbol, snap)
+                self._last_snapshot = snap
+                log_execution(
+                    f"[RECONCILIATION] {symbol}: OPEN position confirmed, but close order identity/status "
+                    "is not yet verified; manager remains safely paused",
+                    "WARN", debounce_key=f"close_reconcile_pending_{symbol}", debounce_sec=30,
+                )
+                self.event_bus.emit("reconciled_unresolved", snap)
+                return "OPEN_UNRESOLVED"
         _apply_open_snapshot(symbol, snap)
         self._last_snapshot = snap
         self.event_bus.emit("reconciled", snap)
@@ -12398,7 +12400,8 @@ def sync_position_state(symbol=None):
     if snap is None:
         MEMORY["position_status"] = "UNKNOWN"
         return None, None, None, None
-    if STATE.get("pending_close_order_id"):
+    if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
+            or STATE.get("pending_close_order_id") or STATE.get("pending_close_client_order_id")):
         _resolve_pending_close_from_snapshot(symbol, snap)
     _apply_open_snapshot(symbol, snap)
     if STATE.get("recovery_hold") or not STATE.get("trade_id"):
