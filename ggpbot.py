@@ -33,6 +33,7 @@ from ggp_close_recovery import (
     amount_step_from_market,
     floor_amount_to_step,
     is_contract_amount_precision_error,
+    recover_integer_contract_amount,
 )
 
 # Load project-local configuration safely. PAPER mode remains the default.
@@ -2670,14 +2671,17 @@ def _close_failure(message, *, unresolved=True):
 
 def _close_amount_step(symbol):
     """Read a contract amount step without guessing when CCXT metadata is ambiguous."""
+    normalized = normalize_symbol(symbol)
+    cached_symbol = str(STATE.get("close_amount_step_symbol") or "")
     cached = safe_float(STATE.get("close_amount_step"), 0.0)
-    if cached > 0:
+    if cached_symbol == normalized and cached > 0:
         return cached
     try:
-        market = ex.market(normalize_symbol(symbol))
+        market = ex.market(normalized)
         step = amount_step_from_market(market, getattr(ex, "precisionMode", None))
         if step and step > 0:
             STATE["close_amount_step"] = float(step)
+            STATE["close_amount_step_symbol"] = normalized
             return float(step)
     except Exception as exc:
         log_execution(f"[CLOSE_RECOVERY] amount-step metadata unavailable for {symbol}: {exc}",
@@ -2818,6 +2822,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
     amount_step = amount_step_from_market(market_meta, getattr(ex, "precisionMode", None))
     if amount_step and amount_step > 0:
         STATE["close_amount_step"] = float(amount_step)
+        STATE["close_amount_step_symbol"] = sym
         requested = floor_amount_to_step(requested, amount_step)
         if had_target_remaining:
             target_remaining_qty = max(0.0, before-requested)
@@ -2873,8 +2878,11 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                     f"(state={rejection_state}); no retry sent"
                 )
             STATE["close_amount_step"] = 1.0
-            retry_requested = floor_amount_to_step(requested, 1.0)
-            if retry_requested <= 0 or retry_requested >= requested - 1e-10:
+            STATE["close_amount_step_symbol"] = sym
+            retry_requested = recover_integer_contract_amount(requested, before, before, "OPEN")
+            if retry_requested is None:
+                return _close_failure("contract amount correction was not eligible after position check")
+            if retry_requested <= 0:
                 _release_confirmed_close_rejection(symbol, str(submit_exc))
                 return False
             retry_requested = float(ex.amount_to_precision(sym, retry_requested))
