@@ -2691,7 +2691,9 @@ def _close_rejection_position_state(symbol, before_qty):
     if status != "OPEN":
         return "UNKNOWN", None
     observed = _position_contracts(position)
-    tolerance = max(abs(float(before_qty)) * 0.001, 1e-10)
+    # Use an absolute quantity tolerance. A relative tolerance can hide a
+    # one-contract partial fill on large positions and cause a duplicate close.
+    tolerance = 1e-8
     state = "UNCHANGED" if abs(observed - float(before_qty)) <= tolerance else "CHANGED"
     return state, observed
 
