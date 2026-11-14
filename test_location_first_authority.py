@@ -10,7 +10,7 @@ def _context(**overrides):
         "max_location_distance_atr": 1.5,
         "order_block": {
             "low": 99.0, "high": 100.5, "timestamp": 1_699_999_000_000,
-            "impulse_timestamp": 1_699_999_100_000, "strength": 8.0, "zone_definition": "BULLISH_LOW_TO_OPEN",
+            "impulse_timestamp": 1_699_999_100_000, "strength": 8.0,
             "distance_atr": 0.0, "zone_definition": "BULLISH_LOW_TO_OPEN",
         },
     }
@@ -29,6 +29,7 @@ def test_location_first_rejects_zone_far_from_current_price():
     context = _context(order_block={
         "low": 104.0, "high": 105.0, "timestamp": 1_699_999_000_000,
         "impulse_timestamp": 1_699_999_100_000, "strength": 8.0,
+        "zone_definition": "BULLISH_LOW_TO_OPEN",
     })
     assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
 
@@ -42,6 +43,7 @@ def test_location_first_rejects_stale_zone():
     context = _context(order_block={
         "low": 99.0, "high": 100.5, "timestamp": 1_699_000_000_000,
         "impulse_timestamp": 1_699_000_000_000, "strength": 8.0,
+        "zone_definition": "BULLISH_LOW_TO_OPEN",
     })
     assert _zone_retest_candidates(context, fallback_level=101.0, atr=1.0, side="BUY") == []
 
