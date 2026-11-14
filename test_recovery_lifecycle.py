@@ -1296,3 +1296,44 @@ def test_tp1_fill_evidence_accepts_recorded_client_order_id(monkeypatch):
         position_side="LONG", position_mode="HEDGE",
         close_order_ids=[client_id], trade_entry_ts=time.time() - 60,
     ) is True
+
+
+
+def test_reconcile_rechecks_read_only_until_delayed_close_order_becomes_visible(monkeypatch):
+    symbol, client_id = _seed_pending_close_client_id()
+    exchange = MockExchange(position=_long_position(qty=2.0), entry_order=None)
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+
+    class EventBus:
+        def __init__(self):
+            self.events = []
+        def emit(self, name, payload):
+            self.events.append((name, payload))
+
+    sync = ggpbot.ExchangeSyncService(EventBus())
+    snapshot = {"value": _open_snapshot(2.0)}
+    sync.fetch_live_snapshot = lambda requested_symbol: snapshot["value"]
+    sync.last_fetch_status = "OPEN"
+
+    first = sync.reconcile(symbol, ggpbot.STATE, force=True)
+    assert first == "OPEN_UNRESOLVED"
+    assert ggpbot.STATE["pending_close_client_order_id"] == client_id
+    assert ggpbot.STATE["execution_unresolved"] is True
+
+    order = {
+        "id": "delayed-close-order", "clientOrderId": client_id,
+        "status": "closed", "filled": 1.0, "remaining": 0.0,
+        "average": 101.0, "info": {},
+    }
+    exchange.entry_order = order
+    exchange.position["contracts"] = 1.0
+    exchange.position["info"]["positionAmt"] = "1.0"
+    snapshot["value"] = _open_snapshot(1.0)
+
+    second = sync.reconcile(symbol, ggpbot.STATE, force=True)
+    assert second == "OPEN"
+    assert ggpbot.STATE["pending_close_client_order_id"] is None
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+    assert ggpbot.STATE["tp1_hit"] is True
