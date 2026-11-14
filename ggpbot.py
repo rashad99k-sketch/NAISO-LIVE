@@ -2806,7 +2806,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         return True
 
     if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
-            or STATE.get("pending_close_order_id")):
+            or STATE.get("pending_close_order_id") or STATE.get("pending_close_client_order_id")):
         return _close_failure("previous close is unresolved; refusing another MARKET order")
     status, position = fetch_position_tri_state(symbol)
     if status == "UNKNOWN":
@@ -3358,14 +3358,14 @@ class LiveTradeManager:
                     self._log_live_status()
                     return
         if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
-                or STATE.get("pending_close_order_id")):
+                or STATE.get("pending_close_order_id") or STATE.get("pending_close_client_order_id")):
             if now - self.last_position_sync_ts >= 2:
                 self.exchange_sync.reconcile(symbol, STATE)
                 self.last_position_sync_ts = now
             # A successful reconciliation releases the gate immediately. If it
             # remains unresolved, do not run management or submit another order.
             if (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
-                    or STATE.get("pending_close_order_id")):
+                    or STATE.get("pending_close_order_id") or STATE.get("pending_close_client_order_id")):
                 log_execution(f"[EXECUTION_UNRESOLVED] {symbol}: management actions paused until exchange order outcome is reconciled", "ERROR",
                               debounce_key=f"execution_unresolved_{symbol}", debounce_sec=30)
                 return
