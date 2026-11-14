@@ -2714,7 +2714,6 @@ def _release_confirmed_close_rejection(symbol, reason):
         "pending_close_target_remaining_qty": None,
         "pending_close_started_at": 0.0,
     })
-    globals()["RECOVERY_BLOCK_ENTRIES"] = False
     MEMORY["recovery_status"] = "CLOSE_REJECTED_NO_FILL_RECOVERED"
     _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
     log_execution(
@@ -2820,6 +2819,8 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
     except Exception:
         market_meta = {}
     amount_step = amount_step_from_market(market_meta, getattr(ex, "precisionMode", None))
+    if not amount_step and str(STATE.get("close_amount_step_symbol") or "") == sym:
+        amount_step = safe_float(STATE.get("close_amount_step"), 0.0)
     if amount_step and amount_step > 0:
         STATE["close_amount_step"] = float(amount_step)
         STATE["close_amount_step_symbol"] = sym
