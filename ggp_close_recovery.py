@@ -104,3 +104,20 @@ def recover_integer_contract_amount(requested: Any, before_qty: Any, observed_qt
     if retry <= 0 or retry >= float(amount) - 1e-10:
         return 0.0
     return retry
+
+
+
+def fetch_order_by_client_id(fetch_order: Any, symbol: str, client_order_id: str) -> Any:
+    """Query CCXT by the exact persisted client ID, with its two-argument fallback."""
+    if not callable(fetch_order) or not str(client_order_id or "").strip():
+        return None
+    identity = str(client_order_id)
+    try:
+        return fetch_order(identity, symbol, {"clientOrderId": identity})
+    except TypeError:
+        try:
+            return fetch_order(identity, symbol)
+        except Exception:
+            return None
+    except Exception:
+        return None
