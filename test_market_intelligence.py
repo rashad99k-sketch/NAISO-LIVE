@@ -1261,3 +1261,25 @@ def test_legacy_scanner_support_resistance_wrapper_uses_confirmed_zone_engine():
     assert "build_support_resistance_zones(" in wrapper
     assert 'z.get("status") == "CONFIRMED"' in wrapper
     assert "return supports, resistances" in wrapper
+
+
+
+def test_impulse_trading_mode_returns_singleton_reason_tuple():
+    mode, confidence, reasons = classify_trading_mode(
+        regime="TRANSITION", displacement_atr=1.3,
+        continuation_probability=0.70, data_quality="VALID_CLOSED_CANDLES",
+    )
+    assert mode == TradingMode.TREND.value
+    assert confidence == pytest.approx(0.68)
+    assert reasons == ("impulse_and_continuation",)
+    assert isinstance(reasons, tuple)
+
+
+def test_build_intelligence_decision_handles_impulse_mode_reason():
+    decision = build_intelligence_decision(
+        regime="TRANSITION", displacement_atr=1.3,
+        continuation_probability=0.70, data_quality="VALID_CLOSED_CANDLES",
+    )
+    assert decision.mode == TradingMode.TREND.value
+    assert "impulse_and_continuation" in decision.reason_codes
+    assert isinstance(decision.reason_codes, tuple)
