@@ -99,7 +99,7 @@ def classify_trading_mode(*, regime: str = "UNKNOWN", adx: Any = None,
         return TradingMode.SCALP.value, 0.72, ("range_regime", "weak_trend_strength", "liquidity_adequate")
 
     if disp is not None and disp >= 1.2 and cont is not None and cont >= 0.65:
-        return TradingMode.TREND.value, 0.68, ("impulse_and_continuation")
+        return TradingMode.TREND.value, 0.68, ("impulse_and_continuation",)
 
     return TradingMode.UNCLASSIFIED.value, 0.0, ("mode_not_proven",)
 
