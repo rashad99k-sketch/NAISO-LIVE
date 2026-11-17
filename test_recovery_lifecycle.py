@@ -509,6 +509,7 @@ def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monke
     ex = MinAmountExchange(position=position, open_orders=[])
     monkeypatch.setattr(ggpbot, "ex", ex)
     _fresh_state()
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
     ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "ZEC/USDT:USDT",
                          "entry": 900.0, "qty": 0.018, "initial_qty": 0.018,
                          "remaining_qty": 0.018, "trade_id": trade_id})
