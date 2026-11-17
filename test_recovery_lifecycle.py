@@ -447,6 +447,107 @@ def test_tp1_close_failure_then_retry_is_idempotent(tmp_path, monkeypatch):
     assert ggpbot.safe_close_position("BTC/USDT:USDT", close_reason="TP1") is False
 
 
+
+
+def test_emergency_strict_close_reconciles_terminal_rejection_then_closes(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    class RejectedPendingThenFullClose(MockExchange):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.prior_order = {"id": "prior-tp1", "status": "rejected", "filled": 0.0}
+            self.market_calls = 0
+
+        def fetch_order(self, order_id, symbol=None, params=None):
+            if str(order_id) == "prior-tp1":
+                return self.prior_order
+            return None
+
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            if kind == "market":
+                self.market_calls += 1
+                # Simulate the exchange applying the full reduce-only close.
+                self.position = None
+                return {"id": "emergency-close", "status": "closed", "filled": amount,
+                        "remaining": 0.0, "average": 101.0}
+            return super().create_order(symbol, kind, side, amount, price, params)
+
+    ex = RejectedPendingThenFullClose(position=_long_position(), open_orders=[_native_stop()])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
+                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
+                         "trade_id": trade_id, "execution_unresolved": True,
+                         "close_reconciliation_required": True,
+                         "pending_close_order_id": "prior-tp1", "pending_close_reason": "TP1",
+                         "pending_close_before_qty": 2.0, "pending_close_requested_qty": 1.0,
+                         "pending_close_target_remaining_qty": 1.0,
+                         "pending_close_started_at": time.time() - 30,
+                         "native_sl_verified": True})
+    assert ggpbot._emergency_strict_close_recovery("BTC/USDT:USDT") is True
+    assert ex.market_calls == 1
+    assert ggpbot.STATE["open"] is False
+    assert ggpbot.MEMORY["position_status"] == "FLAT"
+
+
+def test_emergency_strict_close_never_duplicates_unreadable_prior_order(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    class UnreadablePriorOrder(MockExchange):
+        def fetch_order(self, order_id, symbol=None, params=None):
+            raise TimeoutError("prior order status unavailable")
+
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            return {"id": "unexpected", "status": "closed", "filled": amount}
+
+    ex = UnreadablePriorOrder(position=_long_position(), open_orders=[_native_stop()])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
+                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
+                         "trade_id": trade_id, "execution_unresolved": True,
+                         "close_reconciliation_required": True,
+                         "pending_close_order_id": "prior-tp1", "pending_close_reason": "TP1",
+                         "pending_close_before_qty": 2.0, "pending_close_requested_qty": 1.0,
+                         "pending_close_target_remaining_qty": 1.0,
+                         "pending_close_started_at": time.time() - 30,
+                         "native_sl_verified": True})
+    assert ggpbot._emergency_strict_close_recovery("BTC/USDT:USDT") is False
+    assert not [c for c in ex.create_calls if c[1] == "market"]
+    assert ggpbot.STATE["execution_unresolved"] is True
+
+
+def test_emergency_strict_close_waits_when_position_unknown(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    class UnknownPosition(MockExchange):
+        def fetch_positions(self, symbols=None):
+            raise TimeoutError("position endpoint unavailable")
+
+        def fetch_order(self, order_id, symbol=None, params=None):
+            return {"id": str(order_id), "status": "rejected", "filled": 0.0}
+
+    ex = UnknownPosition(position=_long_position(), open_orders=[_native_stop()])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
+                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
+                         "trade_id": trade_id, "execution_unresolved": True,
+                         "close_reconciliation_required": True,
+                         "pending_close_order_id": "prior-tp1", "pending_close_reason": "TP1",
+                         "pending_close_before_qty": 2.0, "pending_close_requested_qty": 1.0,
+                         "pending_close_target_remaining_qty": 1.0,
+                         "pending_close_started_at": time.time() - 30,
+                         "native_sl_verified": True})
+    assert ggpbot._emergency_strict_close_recovery("BTC/USDT:USDT") is False
+    assert not [c for c in ex.create_calls if c[1] == "market"]
+    assert ggpbot.STATE["execution_unresolved"] is True
+
 def test_tp2_runs_only_after_tp1_is_verified(tmp_path, monkeypatch):
     journal, trade_id = _seed_journal(tmp_path, snapshot_overrides={"tp1_hit": True,
                                                                    "remaining_qty": 1.0})
