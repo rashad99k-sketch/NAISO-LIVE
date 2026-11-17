@@ -2908,6 +2908,12 @@ def _verified_market_reduce(symbol, qty=None, *, ratio=None, target_remaining_qt
         _CLOSE_ORDER_LOCK.release()
 
 
+# Emergency recovery is allowed to use the same verified close gateway only
+# after its previous order has been reconciled. Skip the routine TP1 lockout,
+# never the live-position, side, account-mode, quantity, reduceOnly or fill gates.
+
+
+
 def safe_close_position(symbol, qty=None, *, close_reason="BOT_STRICT_CLOSE"):
     """Compatibility wrapper; success requires a verified exchange position delta."""
     return _verified_market_reduce(symbol, qty, close_reason=close_reason)
