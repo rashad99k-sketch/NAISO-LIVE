@@ -3133,13 +3133,26 @@ class LiveTradeManager:
                 if self._emergency_exit_if_valid(symbol, now):
                     self._log_live_status()
                     return
-        if STATE.get("execution_unresolved"):
+        if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
             if now - self.last_position_sync_ts >= 2:
                 self.exchange_sync.reconcile(symbol, STATE)
                 self.last_position_sync_ts = now
-            log_execution(f"[EXECUTION_UNRESOLVED] {symbol}: management actions paused until exchange order outcome is reconciled", "ERROR",
-                          debounce_key=f"execution_unresolved_{symbol}", debounce_sec=30)
-            return
+            # If the pending order is conclusively reconciled, normal management
+            # may resume. Otherwise, after a bounded grace period, invoke the
+            # emergency strict close recovery path (never a blind duplicate).
+            if not (STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")):
+                pass
+            else:
+                pending_since = safe_float(STATE.get("pending_close_started_at"), now)
+                grace = max(3.0, safe_float(os.getenv("EXECUTION_UNRESOLVED_GRACE_SEC"), 8.0))
+                if now - pending_since >= grace:
+                    if _emergency_strict_close_recovery(symbol, trigger="EXECUTION_UNRESOLVED"):
+                        self._log_live_status()
+                        return
+                log_execution(f"[EXECUTION_UNRESOLVED] {symbol}: strict recovery pending; "
+                              "no duplicate close sent until prior order is reconciled", "ERROR",
+                              debounce_key=f"execution_unresolved_{symbol}", debounce_sec=30)
+                return
         if not PAPER_MODE and (STATE.get("recovery_hold") or not STATE.get("native_sl_verified")):
             log_execution(f"[MANAGEMENT_BLOCKED] {symbol}: Recovery Hold / Native SL verification is not complete; no TP or synthetic close actions", "CRITICAL",
                           debounce_key=f"management_protection_gate_{symbol}", debounce_sec=30)
