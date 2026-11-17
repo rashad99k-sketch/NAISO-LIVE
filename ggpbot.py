@@ -2775,7 +2775,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         STATE.update({"pending_close_order_id": order_id, "pending_close_reason": str(close_reason),
                       "pending_close_before_qty": before, "pending_close_requested_qty": requested,
                       "pending_close_target_remaining_qty": target_remaining_qty,
-                      "pending_close_started_at": time.time(), "execution_unresolved": True,
+                      "pending_close_started_at": time.time(), "execution_unresolved": True, "close_blocked_reason": None,
                       "close_reconciliation_required": True})
         bot_ids = STATE.setdefault("bot_close_order_ids", [])
         if order_id not in bot_ids:
