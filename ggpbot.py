@@ -2804,9 +2804,18 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                 if rejected_qty > 0 and str(close_reason).upper() == "TP1":
                     log_execution(f"[TP1_FALLBACK] {symbol}: partial amount rejected; "
                                   f"attempting one strict full close of verified qty={rejected_qty:.10f}", "WARN")
-                    return _verified_market_reduce_impl(
+                    fallback_ok = _verified_market_reduce_impl(
                         symbol, qty=rejected_qty,
                         close_reason="TP1_MIN_AMOUNT_FULL_CLOSE")
+                    if fallback_ok and STATE.get("close_verified") and safe_float(STATE.get("remaining_qty")) <= max(rejected_qty * 0.002, 1e-10):
+                        finalize = globals().get("finalize_trade_with_reality")
+                        if callable(finalize):
+                            finalize(symbol, close_reason="TP1_MIN_AMOUNT_FULL_CLOSE")
+                        log_execution(f"[TP1_FALLBACK] {symbol}: full remaining exposure closed and finalized", "SUCCESS")
+                        return True
+                    log_execution(f"[TP1_FALLBACK] {symbol}: full-close attempt did not verify FLAT; "
+                                  "position remains active under exchange protection", "ERROR")
+                    return False
             # Position unavailable or a non-TP1 action: leave the real position
             # and its exchange-native protection intact, but do not mislabel a
             # definitive validation rejection as an unresolved order outcome.
