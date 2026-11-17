@@ -2643,6 +2643,15 @@ class TradeManagementBoard:
         return decision(TradeDecisionType.HOLD, "no_profit_management_trigger")
 
 # ========== REAL EXCHANGE ORDERS (SAFE) ==========
+def _is_definitive_close_rejection(exc):
+    """True only for exchange-side validation rejection before order acceptance.
+
+    Transport/timeouts and generic exchange errors remain ambiguous and must
+    continue through the strict reconciliation gate.
+    """
+    return any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
+
+
 def _close_failure(message, *, unresolved=True):
     """Fail closed after an ambiguous exchange operation; never fabricate a fill."""
     STATE["execution_unresolved"] = bool(unresolved)
@@ -2775,6 +2784,35 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                 del bot_ids[:-50]
         _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
     except Exception as exc:
+        if _is_definitive_close_rejection(exc):
+            # BingX rejected the request at validation time; this is not an
+            # accepted-but-unknown MARKET order. Re-read the live exposure and,
+            # for TP1 only, fall back once to closing the entire verified
+            # remainder rather than leaving a profitable position unmanaged.
+            STATE.update({"execution_unresolved": False,
+                          "close_reconciliation_required": False,
+                          "close_blocked_reason": f"EXCHANGE_INVALID_ORDER: {exc}",
+                          "close_blocked_at": time.time()})
+            log_execution(f"[CLOSE_REJECTED] {symbol} {close_reason}: "
+                          f"{type(exc).__name__}: {exc}; no order accepted", "WARN")
+            rejected_status, rejected_position = fetch_position_tri_state(symbol)
+            if rejected_status == "FLAT":
+                _clear_confirmed_flat(symbol, reason="CLOSE_REJECTED_BUT_EXCHANGE_FLAT")
+                return True
+            if rejected_status == "OPEN":
+                rejected_qty = _position_contracts(rejected_position)
+                if rejected_qty > 0 and str(close_reason).upper() == "TP1":
+                    log_execution(f"[TP1_FALLBACK] {symbol}: partial amount rejected; "
+                                  f"attempting one strict full close of verified qty={rejected_qty:.10f}", "WARN")
+                    return _verified_market_reduce_impl(
+                        symbol, qty=rejected_qty,
+                        close_reason="TP1_MIN_AMOUNT_FULL_CLOSE")
+            # Position unavailable or a non-TP1 action: leave the real position
+            # and its exchange-native protection intact, but do not mislabel a
+            # definitive validation rejection as an unresolved order outcome.
+            log_execution(f"[CLOSE_REJECTED] {symbol}: no safe fallback; "
+                          "position remains under normal exchange synchronization", "ERROR")
+            return False
         return _close_failure(f"market close submission ambiguous: {type(exc).__name__}: {exc}")
 
     post_status, post_position, order_state = "UNKNOWN", None, order
