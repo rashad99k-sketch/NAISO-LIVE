@@ -751,11 +751,11 @@ if LEVERAGE != 20:
     print(f"[CONFIG] Requested LEVERAGE={LEVERAGE} rejected; GGP policy is fixed at 20x")
     LEVERAGE = 20  # Fixed policy: all LIVE entries require verified 20x on BingX.
 try:
-    MAX_TRADE_RISK_PCT = float(os.getenv("MAX_TRADE_RISK_PCT", "10.0"))
+    MAX_TRADE_RISK_PCT = float(os.getenv("MAX_TRADE_RISK_PCT", "1.5"))
 except (TypeError, ValueError):
-    MAX_TRADE_RISK_PCT = 10.0
+    MAX_TRADE_RISK_PCT = 1.5
 if not math.isfinite(MAX_TRADE_RISK_PCT) or not (0.1 <= MAX_TRADE_RISK_PCT <= 25.0):
-    print("[RISK] Invalid MAX_TRADE_RISK_PCT; safe default 10.0% of target margin applied")
+    print("[RISK] Invalid MAX_TRADE_RISK_PCT; safe default 1.5% of available balance applied")
     MAX_TRADE_RISK_PCT = 10.0
 try:
     STOP_EXECUTION_BUFFER_PCT = float(os.getenv("STOP_EXECUTION_BUFFER_PCT", "0.05"))
@@ -5879,7 +5879,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         # checked separately as an exchange feasibility gate. Other strategies
         # keep their existing free-margin sizing path unchanged.
         if institutional_entry_ctx.get("sniper_v2") is True:
-            if institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
+            if institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
                 raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
             wallet_snapshot = None if PAPER_MODE else safe_api_call(ex.fetch_balance)
             wallet_balance, free_balance, balance_source = _sniper_v2_wallet_balances(
@@ -5888,7 +5888,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 paper_mode=PAPER_MODE,
             )
             balance_ts = time.time()
-            target_margin = wallet_balance * 0.20
+            target_margin = free_balance * 0.30
             if wallet_balance <= 0 or target_margin <= 0:
                 raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
             if free_balance <= 0:
@@ -5896,10 +5896,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                     f"SNIPER_FREE_MARGIN_UNAVAILABLE: wallet_total={wallet_balance:.4f} "
                     f"free={free_balance:.4f}"
                 )
-            balance = wallet_balance
+            balance = free_balance
             log_execution(
                 f"[SNIPER_SIZING_BASIS] wallet_total={wallet_balance:.4f} "
-                f"target_margin_20pct={target_margin:.4f} free_margin={free_balance:.4f}",
+                f"target_margin_30pct={target_margin:.4f} free_margin={free_balance:.4f}",
                 "INFO",
             )
         else:
@@ -5920,14 +5920,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             contract_size = 1.0  # PAPER fallback only; LIVE must use exchange market metadata.
 
         # A caller-supplied label such as SNIPER is not proof of setup quality.
-        # Only the unified institutional Watchlist may authorize the strong 30% tier.
+        # Only the unified institutional Watchlist may authorize the strong 40% tier.
         if institutional_entry_ctx.get("sniper_v2") is True:
-            if classification != "SNIPER_V2" or institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
+            if classification != "SNIPER_V2" or institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
                 raise ValueError("SNIPER_V2_SIZING_POLICY_CONTEXT_INVALID")
             strong_tier_authorized = False
         else:
             strong_tier_authorized = bool(
-                institutional_entry_ctx.get("capital_allocation_tier") == "STRONG_30_PERCENT"
+                institutional_entry_ctx.get("capital_allocation_tier") == "STRONG_40_PERCENT"
                 and institutional_entry_ctx.get("sizing_eligible_strong") is True
             )
         sizing_classification = effective_sizing_classification(
@@ -5983,7 +5983,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
         margin_percent = sizing.allocation_pct
         notional = actual_notional
-        trade_type_label = "STRONG" if margin_percent >= 0.30 else "STANDARD"
+        trade_type_label = "STRONG" if margin_percent >= 0.40 else "STANDARD"
         # Structured, auditable proof that the allocation reached the order:
         # target (from the real available balance) vs the actual exchange quantity.
         min_notional = float(min_cost) if min_cost is not None else 0.0
@@ -9891,8 +9891,8 @@ def sniper_engine_v2():
                     "zone_side": side,
                 },
                 "exchange_symbol": symbol, "sniper_v2": True,
-                "capital_allocation_tier": "STANDARD_20_PERCENT",
-                "sizing_eligible_strong": False, "sizing_balance_basis": "WALLET_TOTAL",
+                "capital_allocation_tier": "STANDARD_30_PERCENT",
+                "sizing_eligible_strong": False, "sizing_balance_basis": "AVAILABLE_FREE",
                 "candle_timeframe": str(INTERVAL),
                 "closed_candle_frame": closed.copy(),
                 "closed_candle_source": "SNIPER_V2_CONFIRMED_FRAME",
