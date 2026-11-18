@@ -523,6 +523,7 @@ def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monke
     assert ggpbot.STATE["close_reconciliation_required"] is False
     assert ggpbot.STATE["open"] is False
     assert ggpbot.MEMORY["position_status"] == "FLAT"
+    assert ggpbot.STATE["bot_close_order_ids"] == ["zec-full-close"]
 
 
 def test_tp1_invalid_order_with_full_position_below_minimum_is_not_unresolved(tmp_path, monkeypatch):
