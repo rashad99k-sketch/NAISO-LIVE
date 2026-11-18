@@ -2651,6 +2651,28 @@ def _is_definitive_close_rejection(exc):
     """
     return any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
 
+def _is_min_amount_close_rejection(exc):
+    """Recognize only explicit venue minimum-size rejections, not every InvalidOrder.
+
+    BingX documents dedicated minimum-size errors (including 101202, 101485,
+    and 110422). Message matching is kept narrow for CCXT versions that wrap
+    venue codes differently. Precision, side, mode, and other InvalidOrder
+    failures must never trigger an automatic full-position exit.
+    """
+    message = str(exc or "").lower()
+    explicit_codes = ("101202", "101485", "110422")
+    if any(code in message for code in explicit_codes):
+        return True
+    minimum_terms = ("minimum order amount", "amount below exchange minimum",
+                     "below minimum amount", "minimum quantity",
+                     "closing order size is below the minimum",
+                     "order size is below the minimum", "minimum nominal value",
+                     "minsizecoin", "minsizeusd")
+    return (any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
+            and any(term in message for term in minimum_terms))
+
+
+
 
 def _close_failure(message, *, unresolved=True):
     """Fail closed after an ambiguous exchange operation; never fabricate a fill."""
@@ -2808,8 +2830,9 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                 return True
             if rejected_status == "OPEN":
                 rejected_qty = _position_contracts(rejected_position)
-                if rejected_qty > 0 and str(close_reason).upper() == "TP1":
-                    log_execution(f"[TP1_FALLBACK] {symbol}: partial amount rejected; "
+                if (rejected_qty > 0 and str(close_reason).upper() == "TP1"
+                        and _is_min_amount_close_rejection(exc)):
+                    log_execution(f"[TP1_FALLBACK] {symbol}: venue minimum-size rejection; "
                                   f"attempting one strict full close of verified qty={rejected_qty:.10f}", "WARN")
                     fallback_ok = _verified_market_reduce_impl(
                         symbol, qty=rejected_qty,
