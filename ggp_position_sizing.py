@@ -2,7 +2,7 @@
 
 Capital allocation policy (margin target, not loss-at-stop):
 
-    TRADE_ALLOCATION_PCT = 0.20   # medium trades: 20% of available balance
+    TRADE_ALLOCATION_PCT = 0.30   # medium trades: 20% of available balance
     LEVERAGE             = 20     # fixed
 
     target_margin   = available_balance * allocation_pct
@@ -25,7 +25,7 @@ from typing import Any
 # Medium trades target 20% of the real available wallet balance as margin.
 TRADE_ALLOCATION_PCT = 0.20
 # Strong (institutionally authorized) trades target 30%.
-STRONG_TRADE_ALLOCATION_PCT = 0.30
+STRONG_TRADE_ALLOCATION_PCT = 0.40
 # Fixed policy leverage.
 POLICY_LEVERAGE = 20
 
@@ -48,11 +48,11 @@ def _finite_positive(value: Any, name: str) -> float:
 
 
 def allocation_for_classification(classification: str) -> tuple[float, str]:
-    """Return target margin allocation: 30% strong, 20% otherwise."""
+    """Return target margin allocation: 40% strong, 30% otherwise."""
     label = str(classification or "").strip().upper()
     if label in STRONG_CLASSIFICATIONS:
-        return STRONG_TRADE_ALLOCATION_PCT, "STRONG_30_PERCENT_MARGIN"
-    return TRADE_ALLOCATION_PCT, "STANDARD_20_PERCENT_MARGIN"
+        return STRONG_TRADE_ALLOCATION_PCT, "STRONG_40_PERCENT_MARGIN"
+    return TRADE_ALLOCATION_PCT, "STANDARD_30_PERCENT_MARGIN"
 
 
 
@@ -119,7 +119,7 @@ def calculate_position_size(
 ) -> PositionSize:
     """Calculate a linear USDT-contract position from margin ceiling and SL risk.
 
-    `max_trade_risk_pct` is a percentage of the allocated target margin.
+    `max_trade_risk_pct` is a percentage of the available wallet balance.
     `stop_execution_buffer_pct` is an extra adverse price-move percentage,
     expressed in percentage points (0.05 means 0.05%).
     """
@@ -150,7 +150,7 @@ def calculate_position_size(
 
     stop_distance = abs(entry - stop)
     execution_buffer = entry * (buffer_pct / 100.0)
-    risk_budget = target_margin * (risk_pct / 100.0)
+    risk_budget = balance * (risk_pct / 100.0)
     effective_stop_distance = stop_distance + execution_buffer
     risk_limited_notional = risk_budget * entry / effective_stop_distance
     # Allocation is a ceiling. Risk budget is authoritative: size down to the
@@ -199,7 +199,7 @@ def calculate_position_size(
 
 
 def is_strong_candidate(item: Any) -> bool:
-    """Require independent structure, volume and causal-zone evidence for strong 30% allocation."""
+    """Require independent structure, volume and causal-zone evidence for strong 40% allocation."""
     if not isinstance(item, dict):
         return False
     try:
