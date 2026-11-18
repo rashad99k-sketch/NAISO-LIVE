@@ -513,6 +513,8 @@ def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monke
     ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "ZEC/USDT:USDT",
                          "entry": 900.0, "qty": 0.018, "initial_qty": 0.018,
                          "remaining_qty": 0.018, "trade_id": trade_id})
+    ggpbot.MEMORY["position_status"] = "OPEN"
+    ggpbot.MEMORY["current_position"] = {"symbol": "ZEC/USDT:USDT", "qty": 0.018}
 
     assert ggpbot.safe_close_partial("ZEC/USDT:USDT", 0.05, close_reason="TP1") is True
     market_orders = [call for call in ex.create_calls if call[1] == "market"]
@@ -523,6 +525,7 @@ def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monke
     assert ggpbot.STATE["close_reconciliation_required"] is False
     assert ggpbot.STATE["open"] is False
     assert ggpbot.MEMORY["position_status"] == "FLAT"
+    assert ggpbot.MEMORY["current_position"] is None
     assert ggpbot.STATE["bot_close_order_ids"] == ["zec-full-close"]
 
 
