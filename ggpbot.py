@@ -5992,7 +5992,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "[POSITION_SIZING_AUDIT]\n"
             f"  Symbol: {sym}\n"
             f"  Direction: {side}\n"
-            f"  Sizing Balance Basis: {'WALLET_TOTAL' if institutional_entry_ctx.get('sniper_v2') is True else 'AVAILABLE_FREE'}\n"
+            f"  Sizing Balance Basis: AVAILABLE_FREE\n"
             f"  Sizing Balance: {balance:.4f} USDT\n"
             f"  Balance Source: {balance_source}\n"
             f"  Balance Timestamp: {balance_ts:.3f}\n"
