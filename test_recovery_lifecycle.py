@@ -483,6 +483,16 @@ def test_runtime_recovery_is_idempotent_on_repeat_call(tmp_path, monkeypatch):
 def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monkeypatch):
     journal, trade_id = _seed_journal(tmp_path, filled=0.018)
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    persisted_close_ids = []
+    persist_snapshot = ggpbot._persist_trade_journal_snapshot
+
+    def capture_close_order_snapshot(*args, **kwargs):
+        ids = ggpbot.STATE.get("bot_close_order_ids")
+        if isinstance(ids, list) and ids:
+            persisted_close_ids.append(list(ids))
+        return persist_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(ggpbot, "_persist_trade_journal_snapshot", capture_close_order_snapshot)
 
     class MinAmountExchange(MockExchange):
         def __init__(self, **kw):
@@ -526,7 +536,8 @@ def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monke
     assert ggpbot.STATE["open"] is False
     assert ggpbot.MEMORY["position_status"] == "FLAT"
     assert ggpbot.MEMORY["current_position"] is None
-    assert ggpbot.STATE["bot_close_order_ids"] == ["zec-full-close"]
+    assert any(ids.count("zec-full-close") == 1 for ids in persisted_close_ids)
+    # Finalization intentionally clears the transient close-order ID buffer.
 
 
 def test_tp1_non_minimum_invalid_order_does_not_force_full_close(tmp_path, monkeypatch):
