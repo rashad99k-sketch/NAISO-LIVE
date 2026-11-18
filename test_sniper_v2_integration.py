@@ -169,14 +169,14 @@ def test_sniper_v2_structural_stop_stays_beyond_the_pivot_zone():
     assert ggpbot._sniper_v2_structural_stop("BUY", bottom, 2.0, 98.5) == pytest.approx(98.2)
 
 
-def test_sniper_v2_sizing_uses_total_wallet_and_only_uses_free_as_feasibility():
+def test_sniper_v2_sizing_basis_uses_free_wallet_balance():
     total, free, source = ggpbot._sniper_v2_wallet_balances(
         wallet_snapshot={"total": {"USDT": 100.0}, "free": {"USDT": 7.0}},
         paper_mode=False,
     )
     assert total == pytest.approx(100.0)
     assert free == pytest.approx(7.0)
-    assert source == "BINGX_WALLET_TOTAL_USDT"
+    assert source == "BINGX_FUTURES_FREE_USDT"
 
 
 def test_sniper_v2_paper_wallet_balance_is_used_as_total():
