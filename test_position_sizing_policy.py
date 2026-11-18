@@ -42,14 +42,14 @@ def test_balance_100_target_margin_30():
 
 
 # 2) 20x -> Target Notional = 600
-def test_leverage_20_target_notional_400():
+def test_leverage_20_target_notional_600():
     r = _size(100.0, 0.06, 0.05, risk_pct=1.0)
     assert POLICY_LEVERAGE == 20
     assert r.target_notional == pytest.approx(600.0)
 
 
 # 3) DOGE @ 0.06 -> raw quantity 10000 (allocation binding, not risk)
-def test_doge_raw_quantity_6666_666666():
+def test_doge_raw_quantity_10000():
     # This tight stop allows the 600 USDT allocation under the wallet-risk cap.
     r = _size(100.0, 0.06, 0.05, risk_pct=2.1)
     # raw quantity from the allocation target (before risk gate would reduce it)
@@ -169,14 +169,14 @@ def test_quantity_matches_notional_definition():
 
 
 # Mandatory DOGE examples, allocation-binding (tight stop) case
-def test_doge_example_100_buy_allocation_binding():
+def test_doge_example_100_buy_allocation_binding_30pct():
     r = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=2.1)
     assert r.target_margin == pytest.approx(30.0)
     assert r.target_notional == pytest.approx(600.0)
     assert r.quantity == pytest.approx(10000.0, rel=1e-6)
 
 
-def test_doge_example_33_35_sell_allocation_binding():
+def test_doge_example_33_35_sell_allocation_binding_30pct():
     r = _size(33.35, 0.06, 0.05, side="SELL", risk_pct=2.1)
     assert r.target_margin == pytest.approx(10.005, abs=1e-9)
     assert r.target_notional == pytest.approx(200.10, abs=1e-9)
@@ -185,7 +185,7 @@ def test_doge_example_33_35_sell_allocation_binding():
 
 # --------------------------------------------------------------------------- #
 # Integration: the REAL execute_entry sizing path emits [POSITION_SIZING_AUDIT]
-# proving the 20% allocation reached the order, and BUY/SELL use the same size.
+# proving the 30% allocation reached the order, and BUY/SELL use the same size.
 # --------------------------------------------------------------------------- #
 def _run_execute_entry(monkeypatch, *, side, balance, price=0.06, stop_pct=0.05):
     """Drive ggpbot.execute_entry in PAPER mode and return captured logs + STATE."""
