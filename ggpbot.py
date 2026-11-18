@@ -5879,7 +5879,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         # checked separately as an exchange feasibility gate. Other strategies
         # keep their existing free-margin sizing path unchanged.
         if institutional_entry_ctx.get("sniper_v2") is True:
-            if institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
+            if institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
                 raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
             wallet_snapshot = None if PAPER_MODE else safe_api_call(ex.fetch_balance)
             wallet_balance, free_balance, balance_source = _sniper_v2_wallet_balances(
@@ -5888,7 +5888,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 paper_mode=PAPER_MODE,
             )
             balance_ts = time.time()
-            target_margin = wallet_balance * 0.20
+            target_margin = free_balance * 0.20
             if wallet_balance <= 0 or target_margin <= 0:
                 raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
             if free_balance <= 0:
@@ -5896,7 +5896,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                     f"SNIPER_FREE_MARGIN_UNAVAILABLE: wallet_total={wallet_balance:.4f} "
                     f"free={free_balance:.4f}"
                 )
-            balance = wallet_balance
+            balance = free_balance
             log_execution(
                 f"[SNIPER_SIZING_BASIS] wallet_total={wallet_balance:.4f} "
                 f"target_margin_20pct={target_margin:.4f} free_margin={free_balance:.4f}",
@@ -5922,7 +5922,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         # A caller-supplied label such as SNIPER is not proof of setup quality.
         # Only the unified institutional Watchlist may authorize the strong 30% tier.
         if institutional_entry_ctx.get("sniper_v2") is True:
-            if classification != "SNIPER_V2" or institutional_entry_ctx.get("sizing_balance_basis") != "WALLET_TOTAL":
+            if classification != "SNIPER_V2" or institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
                 raise ValueError("SNIPER_V2_SIZING_POLICY_CONTEXT_INVALID")
             strong_tier_authorized = False
         else:
@@ -5992,7 +5992,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "[POSITION_SIZING_AUDIT]\n"
             f"  Symbol: {sym}\n"
             f"  Direction: {side}\n"
-            f"  Sizing Balance Basis: {'WALLET_TOTAL' if institutional_entry_ctx.get('sniper_v2') is True else 'AVAILABLE_FREE'}\n"
+            f"  Sizing Balance Basis: AVAILABLE_FREE\n"
             f"  Sizing Balance: {balance:.4f} USDT\n"
             f"  Balance Source: {balance_source}\n"
             f"  Balance Timestamp: {balance_ts:.3f}\n"
@@ -9419,7 +9419,7 @@ def _sniper_v2_wallet_balances(*, wallet_snapshot=None, paper_wallet_balance=0.0
             raise ValueError("SNIPER_WALLET_BALANCE_UNAVAILABLE")
         total = safe_float((wallet_snapshot.get("total") or {}).get("USDT"), 0.0)
         free = safe_float((wallet_snapshot.get("free") or {}).get("USDT"), 0.0)
-        source = "BINGX_WALLET_TOTAL_USDT"
+        source = "BINGX_FUTURES_FREE_USDT"
     if not math.isfinite(total) or total <= 0:
         raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
     if not math.isfinite(free) or free < 0:

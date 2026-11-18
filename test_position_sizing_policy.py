@@ -266,3 +266,12 @@ def test_execute_entry_risk_gate_logged_not_silent(monkeypatch):
     assert any("SIZING_RISK_GATE" in m for m in logs), "a risk-gate reduction must be logged"
     audit = [m for m in logs if "POSITION_SIZING_AUDIT" in m]
     assert audit and "Binding Constraint: RISK_GATE" in audit[-1]
+
+ 
+def test_compounding_recalculates_margin_and_risk_from_fresh_available_balance():
+    first = _size(50.0, 0.06, 0.05, risk_pct=10.0)
+    after_realized_profit = _size(60.0, 0.06, 0.05, risk_pct=10.0)
+    assert first.target_margin == pytest.approx(10.0)
+    assert after_realized_profit.target_margin == pytest.approx(12.0)
+    assert first.max_risk_usdt == pytest.approx(1.0)
+    assert after_realized_profit.max_risk_usdt == pytest.approx(1.2)
