@@ -35,41 +35,41 @@ def _size(balance, entry, stop_pct, side="BUY", classification="TREND",
 
 
 # 1) Available Balance = 100 -> Target Margin = 30
-def test_balance_100_target_margin_20():
+def test_balance_100_target_margin_30():
     r = _size(100.0, 0.06, 0.05, risk_pct=1.0)  # tiny stop so allocation binds
     assert r.allocation_pct == pytest.approx(TRADE_ALLOCATION_PCT)
     assert r.target_margin == pytest.approx(30.0)
 
 
-# 2) 20x -> Target Notional = 400
+# 2) 20x -> Target Notional = 600
 def test_leverage_20_target_notional_400():
     r = _size(100.0, 0.06, 0.05, risk_pct=1.0)
     assert POLICY_LEVERAGE == 20
     assert r.target_notional == pytest.approx(600.0)
 
 
-# 3) DOGE @ 0.06 -> raw quantity 6666.666666 (allocation binding, not risk)
+# 3) DOGE @ 0.06 -> raw quantity 10000 (allocation binding, not risk)
 def test_doge_raw_quantity_6666_666666():
-    # This tight stop needs >2% of target margin to allow the 400 USDT allocation.
+    # This tight stop allows the 600 USDT allocation under the wallet-risk cap.
     r = _size(100.0, 0.06, 0.05, risk_pct=2.1)
     # raw quantity from the allocation target (before risk gate would reduce it)
     raw = r.target_notional / 0.06
-    assert raw == pytest.approx(6666.666666, rel=1e-9)
+    assert raw == pytest.approx(10000.0, rel=1e-9)
     assert r.binding_constraint == "ALLOCATION"
-    assert r.quantity == pytest.approx(6666.666666, rel=1e-6)
+    assert r.quantity == pytest.approx(10000.0, rel=1e-6)
 
 
-# 4) Available Balance = 33.35 -> Target Margin = 6.67
-def test_balance_33_35_target_margin_6_67():
+# 4) Available Balance = 33.35 -> Target Margin = 10.005
+def test_balance_33_35_target_margin_10_005():
     r = _size(33.35, 0.06, 0.05, risk_pct=1.0)
-    assert r.target_margin == pytest.approx(6.67, abs=1e-9)
+    assert r.target_margin == pytest.approx(10.005, abs=1e-9)
 
 
-# 5) DOGE @ 0.06 with 33.35 -> raw quantity 2223.333333
-def test_doge_33_35_raw_quantity_2223_333333():
+# 5) DOGE @ 0.06 with 33.35 -> raw quantity 3335
+def test_doge_33_35_raw_quantity_3335():
     r = _size(33.35, 0.06, 0.05, risk_pct=1.0)
     raw = r.target_notional / 0.06
-    assert raw == pytest.approx(2223.333333, rel=1e-9)
+    assert raw == pytest.approx(3335.0, rel=1e-9)
 
 
 # 6 & 7) BUY and SELL use the same size equation
@@ -91,14 +91,14 @@ def test_no_double_leverage():
 
 
 # 9) No competing allocation percentage
-def test_only_20_and_30_allocation_exist():
+def test_standard_30_and_strong_40_allocation():
     assert allocation_for_classification("TREND")[0] == pytest.approx(0.30)
-    assert allocation_for_classification("LOW")[0] == pytest.approx(0.20)
-    assert allocation_for_classification("SNIPER")[0] == pytest.approx(0.30)
-    # A bare SNIPER label without authorization is downgraded to 20%.
+    assert allocation_for_classification("LOW")[0] == pytest.approx(0.30)
+    assert allocation_for_classification("SNIPER")[0] == pytest.approx(0.40)
+    # A bare SNIPER label without authorization is downgraded to 30%.
     assert effective_sizing_classification("SNIPER", strong_tier_authorized=False) == "TREND"
     assert allocation_for_classification(
-        effective_sizing_classification("SNIPER", strong_tier_authorized=False))[0] == pytest.approx(0.20)
+        effective_sizing_classification("SNIPER", strong_tier_authorized=False))[0] == pytest.approx(0.30)
 
 
 # 10) Reduction below the allocation target is explicit, not silent
@@ -172,15 +172,15 @@ def test_quantity_matches_notional_definition():
 def test_doge_example_100_buy_allocation_binding():
     r = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=2.1)
     assert r.target_margin == pytest.approx(30.0)
-    assert r.target_notional == pytest.approx(400.0)
-    assert r.quantity == pytest.approx(6666.666666, rel=1e-6)
+    assert r.target_notional == pytest.approx(600.0)
+    assert r.quantity == pytest.approx(10000.0, rel=1e-6)
 
 
 def test_doge_example_33_35_sell_allocation_binding():
     r = _size(33.35, 0.06, 0.05, side="SELL", risk_pct=2.1)
-    assert r.target_margin == pytest.approx(6.67, abs=1e-9)
-    assert r.target_notional == pytest.approx(133.40, abs=1e-9)
-    assert r.quantity == pytest.approx(2223.333333, rel=1e-6)
+    assert r.target_margin == pytest.approx(10.005, abs=1e-9)
+    assert r.target_notional == pytest.approx(200.10, abs=1e-9)
+    assert r.quantity == pytest.approx(3335.0, rel=1e-6)
 
 
 # --------------------------------------------------------------------------- #
@@ -266,3 +266,12 @@ def test_execute_entry_risk_gate_logged_not_silent(monkeypatch):
     assert any("SIZING_RISK_GATE" in m for m in logs), "a risk-gate reduction must be logged"
     audit = [m for m in logs if "POSITION_SIZING_AUDIT" in m]
     assert audit and "Binding Constraint: RISK_GATE" in audit[-1]
+
+
+def test_compounding_recalculates_from_growth_in_available_balance():
+    first = _size(50.0, 0.06, 0.05, risk_pct=1.5)
+    after_profit = _size(60.0, 0.06, 0.05, risk_pct=1.5)
+    assert first.target_margin == pytest.approx(15.0)
+    assert after_profit.target_margin == pytest.approx(18.0)
+    assert after_profit.max_risk_usdt == pytest.approx(0.90)
+    assert first.max_risk_usdt == pytest.approx(0.75)
