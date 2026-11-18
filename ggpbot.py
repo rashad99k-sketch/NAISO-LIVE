@@ -2643,6 +2643,37 @@ class TradeManagementBoard:
         return decision(TradeDecisionType.HOLD, "no_profit_management_trigger")
 
 # ========== REAL EXCHANGE ORDERS (SAFE) ==========
+def _is_definitive_close_rejection(exc):
+    """True only for exchange-side validation rejection before order acceptance.
+
+    Transport/timeouts and generic exchange errors remain ambiguous and must
+    continue through the strict reconciliation gate.
+    """
+    return any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
+
+def _is_min_amount_close_rejection(exc):
+    """Recognize only explicit venue minimum-size rejections, not every InvalidOrder.
+
+    BingX documents dedicated minimum-size errors (including 101202, 101485,
+    and 110422). Message matching is kept narrow for CCXT versions that wrap
+    venue codes differently. Precision, side, mode, and other InvalidOrder
+    failures must never trigger an automatic full-position exit.
+    """
+    message = str(exc or "").lower()
+    explicit_codes = ("101202", "101485", "110422")
+    if any(code in message for code in explicit_codes):
+        return True
+    minimum_terms = ("minimum order amount", "amount below exchange minimum",
+                     "below minimum amount", "minimum quantity",
+                     "closing order size is below the minimum",
+                     "order size is below the minimum", "minimum nominal value",
+                     "minsizecoin", "minsizeusd")
+    return (any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
+            and any(term in message for term in minimum_terms))
+
+
+
+
 def _close_failure(message, *, unresolved=True):
     """Fail closed after an ambiguous exchange operation; never fabricate a fill."""
     STATE["execution_unresolved"] = bool(unresolved)
@@ -2766,15 +2797,61 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         STATE.update({"pending_close_order_id": order_id, "pending_close_reason": str(close_reason),
                       "pending_close_before_qty": before, "pending_close_requested_qty": requested,
                       "pending_close_target_remaining_qty": target_remaining_qty,
-                      "pending_close_started_at": time.time(), "execution_unresolved": True,
+                      "pending_close_started_at": time.time(), "execution_unresolved": True, "close_blocked_reason": None,
                       "close_reconciliation_required": True})
-        bot_ids = STATE.setdefault("bot_close_order_ids", [])
+        bot_ids = STATE.get("bot_close_order_ids")
+        if not isinstance(bot_ids, list):
+            # A recovered/partially initialized STATE may contain None here.
+            # Normalize the journal field before membership checks; never let
+            # local metadata shape prevent an already-submitted close from
+            # being reconciled against the exchange.
+            bot_ids = []
+            STATE["bot_close_order_ids"] = bot_ids
         if order_id not in bot_ids:
             bot_ids.append(order_id)
             if len(bot_ids) > 50:
                 del bot_ids[:-50]
         _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
     except Exception as exc:
+        if _is_definitive_close_rejection(exc):
+            # BingX rejected the request at validation time; this is not an
+            # accepted-but-unknown MARKET order. Re-read the live exposure and,
+            # for TP1 only, fall back once to closing the entire verified
+            # remainder rather than leaving a profitable position unmanaged.
+            STATE.update({"execution_unresolved": False,
+                          "close_reconciliation_required": False,
+                          "close_blocked_reason": f"EXCHANGE_INVALID_ORDER: {exc}",
+                          "close_blocked_at": time.time()})
+            log_execution(f"[CLOSE_REJECTED] {symbol} {close_reason}: "
+                          f"{type(exc).__name__}: {exc}; no order accepted", "WARN")
+            rejected_status, rejected_position = fetch_position_tri_state(symbol)
+            if rejected_status == "FLAT":
+                _clear_confirmed_flat(symbol, reason="CLOSE_REJECTED_BUT_EXCHANGE_FLAT")
+                return True
+            if rejected_status == "OPEN":
+                rejected_qty = _position_contracts(rejected_position)
+                if (rejected_qty > 0 and str(close_reason).upper() == "TP1"
+                        and _is_min_amount_close_rejection(exc)):
+                    log_execution(f"[TP1_FALLBACK] {symbol}: venue minimum-size rejection; "
+                                  f"attempting one strict full close of verified qty={rejected_qty:.10f}", "WARN")
+                    fallback_ok = _verified_market_reduce_impl(
+                        symbol, qty=rejected_qty,
+                        close_reason="TP1_MIN_AMOUNT_FULL_CLOSE")
+                    if fallback_ok and STATE.get("close_verified") and safe_float(STATE.get("remaining_qty")) <= max(rejected_qty * 0.002, 1e-10):
+                        finalize = globals().get("finalize_trade_with_reality")
+                        if callable(finalize):
+                            finalize(symbol, close_reason="TP1_MIN_AMOUNT_FULL_CLOSE")
+                        log_execution(f"[TP1_FALLBACK] {symbol}: full remaining exposure closed and finalized", "SUCCESS")
+                        return True
+                    log_execution(f"[TP1_FALLBACK] {symbol}: full-close attempt did not verify FLAT; "
+                                  "position remains active under exchange protection", "ERROR")
+                    return False
+            # Position unavailable or a non-TP1 action: leave the real position
+            # and its exchange-native protection intact, but do not mislabel a
+            # definitive validation rejection as an unresolved order outcome.
+            log_execution(f"[CLOSE_REJECTED] {symbol}: no safe fallback; "
+                          "position remains under normal exchange synchronization", "ERROR")
+            return False
         return _close_failure(f"market close submission ambiguous: {type(exc).__name__}: {exc}")
 
     post_status, post_position, order_state = "UNKNOWN", None, order
@@ -7831,6 +7908,10 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                   "last_close_filled_qty": 0.0, "last_close_realized_pnl": 0.0,
                   "last_close_pnl_complete": True, "bot_close_order_ids": []})
     STATE.update(preserved)
+    # This finalizer is gated by close_verified=True: publish the verified flat
+    # exposure to the runtime memory consumed by dashboard/synchronization.
+    MEMORY["position_status"] = "FLAT"
+    MEMORY["current_position"] = None
     TRADE_STATE.update({"in_position": False, "symbol": None, "side": None, "entry": 0.0,
                         "qty": 0.0, "tp1_hit": False, "tp2_hit": False,
                         "trail_on": False, "zone": None, "location": None, "reason": []})
