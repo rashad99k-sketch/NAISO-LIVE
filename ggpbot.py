@@ -756,7 +756,7 @@ except (TypeError, ValueError):
     MAX_TRADE_RISK_PCT = 1.5
 if not math.isfinite(MAX_TRADE_RISK_PCT) or not (0.1 <= MAX_TRADE_RISK_PCT <= 25.0):
     print("[RISK] Invalid MAX_TRADE_RISK_PCT; safe default 1.5% of available balance applied")
-    MAX_TRADE_RISK_PCT = 10.0
+    MAX_TRADE_RISK_PCT = 1.5
 try:
     STOP_EXECUTION_BUFFER_PCT = float(os.getenv("STOP_EXECUTION_BUFFER_PCT", "0.05"))
 except (TypeError, ValueError):
