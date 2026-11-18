@@ -529,6 +529,36 @@ def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monke
     assert ggpbot.STATE["bot_close_order_ids"] == ["zec-full-close"]
 
 
+def test_tp1_non_minimum_invalid_order_does_not_force_full_close(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path, filled=0.018)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    class WrongParameterExchange(MockExchange):
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            if kind == "market":
+                class InvalidOrder(Exception):
+                    pass
+                raise InvalidOrder("invalid position side parameter")
+            return super().create_order(symbol, kind, side, amount, price, params)
+
+    position = _long_position(qty=0.018, entry=900.0, mark=920.0)
+    position["symbol"] = "ZEC/USDT:USDT"
+    ex = WrongParameterExchange(position=position, open_orders=[])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "ZEC/USDT:USDT",
+                         "entry": 900.0, "qty": 0.018, "initial_qty": 0.018,
+                         "remaining_qty": 0.018, "trade_id": trade_id})
+
+    assert ggpbot.safe_close_partial("ZEC/USDT:USDT", 0.05, close_reason="TP1") is False
+    assert len([call for call in ex.create_calls if call[1] == "market"]) == 1
+    assert ggpbot.STATE["open"] is True
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+
+
 def test_tp1_invalid_order_with_full_position_below_minimum_is_not_unresolved(tmp_path, monkeypatch):
     journal, trade_id = _seed_journal(tmp_path, filled=0.0008)
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
