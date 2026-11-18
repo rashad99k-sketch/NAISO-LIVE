@@ -7885,6 +7885,10 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                   "last_close_filled_qty": 0.0, "last_close_realized_pnl": 0.0,
                   "last_close_pnl_complete": True, "bot_close_order_ids": []})
     STATE.update(preserved)
+    # This finalizer is gated by close_verified=True: publish the verified flat
+    # exposure to the runtime memory consumed by dashboard/synchronization.
+    MEMORY["position_status"] = "FLAT"
+    MEMORY["current_position"] = None
     TRADE_STATE.update({"in_position": False, "symbol": None, "side": None, "entry": 0.0,
                         "qty": 0.0, "tp1_hit": False, "tp2_hit": False,
                         "trail_on": False, "zone": None, "location": None, "reason": []})
