@@ -9419,7 +9419,7 @@ def _sniper_v2_wallet_balances(*, wallet_snapshot=None, paper_wallet_balance=0.0
             raise ValueError("SNIPER_WALLET_BALANCE_UNAVAILABLE")
         total = safe_float((wallet_snapshot.get("total") or {}).get("USDT"), 0.0)
         free = safe_float((wallet_snapshot.get("free") or {}).get("USDT"), 0.0)
-        source = "BINGX_WALLET_TOTAL_USDT"
+        source = "BINGX_FUTURES_FREE_USDT"
     if not math.isfinite(total) or total <= 0:
         raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
     if not math.isfinite(free) or free < 0:
