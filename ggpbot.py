@@ -5890,7 +5890,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             balance_ts = time.time()
             target_margin = free_balance * 0.30
             if wallet_balance <= 0 or target_margin <= 0:
-                raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
+                raise ValueError("SNIPER_WALLET_OR_FREE_BALANCE_INVALID")
             if free_balance <= 0:
                 raise ValueError(
                     f"SNIPER_FREE_MARGIN_UNAVAILABLE: wallet_total={wallet_balance:.4f} "
@@ -9920,7 +9920,7 @@ def sniper_engine_v2():
                 RORO_ENTRY_AUTHORITY.consume(event_id)
                 log_execution(
                     f"[SNIPER_V2] EXECUTED {side} {symbol} event={event_id} "
-                    f"margin_target=20% wallet leverage={LEVERAGE}x TP1=0.4% TP2=1.0%",
+                    f"margin_target=30% free leverage={LEVERAGE}x TP1=0.4% TP2=1.0%",
                     "SUCCESS",
                 )
                 return True
@@ -10784,7 +10784,7 @@ def smart_opportunity_selection():
             try:
                 is_strong = is_strong_candidate(item)
                 sizing_class = "SNIPER" if is_strong else "TREND"
-                item["capital_allocation_tier"] = "STRONG_30_PERCENT" if is_strong else "STANDARD_20_PERCENT"
+                item["capital_allocation_tier"] = "STRONG_40_PERCENT" if is_strong else "STANDARD_30_PERCENT"
                 _INSTITUTIONAL_ENTRY_CONTEXT["capital_allocation_tier"] = item["capital_allocation_tier"]
                 _INSTITUTIONAL_ENTRY_CONTEXT["sizing_eligible_strong"] = bool(is_strong)
                 ok = execute_entry(side, exchange_sym, price, float(sl), float(tp1), float(tp2),
