@@ -2652,11 +2652,17 @@ def _is_min_amount_close_rejection(exc):
     explicit_codes = ("101202", "101485", "110422")
     if any(code in message for code in explicit_codes):
         return True
-    minimum_terms = ("minimum order amount", "amount below exchange minimum",
-                     "below minimum amount", "minimum quantity",
-                     "closing order size is below the minimum",
-                     "order size is below the minimum", "minimum nominal value",
-                     "minsizecoin", "minsizeusd")
+    minimum_terms = (
+        "minimum order amount", "amount below exchange minimum",
+        "below minimum amount", "minimum quantity",
+        "closing order size is below the minimum",
+        "order size is below the minimum", "minimum nominal value",
+        "minsizecoin", "minsizeusd",
+        "minimum notional", "min notional", "notional value is too small",
+        "order quantity is less than minimum", "quantity is less than minimum",
+        "amount is less than minimum", "less than the minimum order size",
+        "minimum trade amount", "trade amount is below minimum",
+    )
     return (any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
             and any(term in message for term in minimum_terms))
 
@@ -2768,6 +2774,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             return _close_failure("close quantity rounded to zero", unresolved=False)
         close_side = "sell" if side == "BUY" else "buy"
         mode_result = BingXPositionModeAdapter(ex).read(sym)
+        close_mode_label = getattr(getattr(mode_result, "mode", None), "value", "UNKNOWN")
         if mode_result.mode is PositionMode.UNKNOWN:
             return _close_failure(f"position mode UNKNOWN; close blocked: {mode_result.reason}", unresolved=True)
         close_params = build_position_order_params(
@@ -2811,8 +2818,16 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                           "close_reconciliation_required": False,
                           "close_blocked_reason": f"EXCHANGE_INVALID_ORDER: {exc}",
                           "close_blocked_at": time.time()})
-            log_execution(f"[CLOSE_REJECTED] {symbol} {close_reason}: "
-                          f"{type(exc).__name__}: {exc}; no order accepted", "WARN")
+            log_execution(
+                f"[CLOSE_REJECTED] {symbol} {close_reason}: "
+                f"{type(exc).__name__}: {exc}; no order accepted "
+                f"| requested_qty={safe_float(locals().get('requested'), 0.0):.12g} "
+                f"| exchange_before_qty={safe_float(locals().get('before'), 0.0):.12g} "
+                f"| live_rejected_qty={safe_float(_position_contracts(rejected_position), 0.0) if locals().get('rejected_position') is not None else 0.0:.12g} "
+                f"| position_mode={locals().get('close_mode_label', 'UNKNOWN')} "
+                f"| normalized_symbol={locals().get('sym', normalize_symbol(symbol))}",
+                "WARN",
+            )
             rejected_status, rejected_position = fetch_position_tri_state(symbol)
             if rejected_status == "FLAT":
                 _clear_confirmed_flat(symbol, reason="CLOSE_REJECTED_BUT_EXCHANGE_FLAT")
