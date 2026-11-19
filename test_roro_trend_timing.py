@@ -29,8 +29,6 @@ def make_starting_trend(side="BUY", start_index=109, start_timestamp=0, late_imp
 
     frame = pd.DataFrame(rows)
     if side == "SELL":
-        frame[["open", "high", "low", "close"]] = 200.0 - frame[["open", "low", "high", "close"]].to_numpy()
-        # Reorder transformed high/low after mirroring.
         mirrored_open = 200.0 - pd.DataFrame(rows)["open"]
         mirrored_high = 200.0 - pd.DataFrame(rows)["low"]
         mirrored_low = 200.0 - pd.DataFrame(rows)["high"]
