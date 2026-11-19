@@ -2408,7 +2408,7 @@ class InstitutionalTradeBrain:
 # ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
 from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
-                              select_range_target_pct, tp2_reassessment, thesis_failure_action,
+                              tp2_reassessment, thesis_failure_action,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE)
 
