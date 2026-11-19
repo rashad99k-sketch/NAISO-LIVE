@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Tuple
 import pandas as pd
 
 from location_authority import validate_location_zone
+from roro_trend_timing import evaluate_early_trend_timing
 
 
 class DecisionState(str, Enum):
@@ -375,6 +376,8 @@ class ReversalEngine:
             )
         retest_idx = None; retest_zone = ""; retest_zone_ts = None
         for r in range(bos_idx + 1, len(x) - 1):
+            if r - bos_idx > 8:
+                break
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
             for zlow, zhigh, zname, available_ts in zones:
@@ -470,6 +473,17 @@ class ContinuationEngine:
             return InstitutionalDecision(DecisionState.WAITING_FOR_CONFIRMATION.value, "TREND_CONTINUATION_RETEST", side,
                                          "waiting_for_closed_bos_and_displacement", rejection_reasons=("closed_bos_pending",))
         bos_idx, broken_level, bos_name = bos_event
+        # A valid BOS is not an evergreen entry event. On M15, expire its
+        # continuation retest window after eight closed candles.
+        bos_age_bars = (len(x) - 1) - bos_idx
+        if bos_age_bars > 8:
+            return InstitutionalDecision(
+                DecisionState.WAITING_FOR_RETEST.value, "TREND_CONTINUATION_RETEST", side,
+                "bos_event_stale_wait_for_new_structure", (bos_name,),
+                ("bos_retest_window_expired",),
+                _event_id(symbol, side, "TREND_CONTINUATION_RETEST", int(x.timestamp.iloc[bos_idx])),
+                int(x.timestamp.iloc[bos_idx]), broken_level, None, 40.0,
+            )
         volume_base = float(x.volume.iloc[max(0, bos_idx - 20):bos_idx].mean())
         volume_ratio = float(x.volume.iloc[bos_idx]) / volume_base if volume_base > 0 else 0.0
         if volume_ratio < 0.85:
@@ -507,6 +521,13 @@ class ContinuationEngine:
                     break
             if retest_idx is not None:
                 break
+        # A retest that happened too long before the trigger is stale. Do
+        # not reuse it to authorize a late continuation entry.
+        if retest_idx is not None and (len(x) - 1 - retest_idx) > 3:
+            retest_idx = None
+            pullback_type = None
+            retest_zone = None
+            retest_zone_ts = None
         if retest_idx is None and not context.get("location_first_required"):
             # Legacy micro-pullback fallback remains available only outside strict location-first mode.
             begin = max(bos_idx + 1, len(x) - 4)
@@ -556,8 +577,33 @@ class ContinuationEngine:
         if stop is None:
             return InstitutionalDecision(DecisionState.REJECTED.value, "TREND_CONTINUATION_RETEST", side,
                                          stop_reason, rejection_reasons=(stop_reason,))
-        evidence = (bos_name, "displacement", f"{pullback_type}:{retest_zone}", "post_retest_trigger", "trend_ema20_ema50_alignment", f"bos_volume_ratio:{volume_ratio:.2f}")
+        timing = evaluate_early_trend_timing(x, side)
         ts = int(x.timestamp.iloc[bos_idx])
+        if not timing.get("valid"):
+            timing_state = (
+                DecisionState.NO_CHASE.value
+                if timing.get("status") == "NO_CHASE"
+                else DecisionState.WAITING_FOR_CONFIRMATION.value
+            )
+            timing_reason = str(timing.get("reason") or "trend_timing_not_confirmed")
+            timing_evidence = (
+                bos_name, "displacement", f"{pullback_type}:{retest_zone}",
+                "post_retest_trigger", "trend_ema20_ema50_alignment",
+            )
+            return InstitutionalDecision(
+                timing_state, "TREND_CONTINUATION_RETEST", side, timing_reason,
+                timing_evidence, (timing_reason,),
+                _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts),
+                ts, broken_level, None, 55.0,
+            )
+        evidence = (
+            bos_name, "displacement", f"{pullback_type}:{retest_zone}",
+            "post_retest_trigger", "trend_ema20_ema50_alignment",
+            f"timing_phase:{timing.get('phase')}",
+            f"adx_rising:{timing.get('adx')}",
+            f"ema9_extension_atr:{timing.get('ema9_extension_atr')}",
+            f"vwap_extension_atr:{timing.get('vwap_extension_atr')}",
+        )
         score = 70.0 + (10.0 if context.get("volume_confirmed") else 0.0) + (5.0 if context.get("order_block") else 0.0)
         location_event_id = (
             _location_event_id(symbol, side, retest_zone, retest_zone_ts, ts)
