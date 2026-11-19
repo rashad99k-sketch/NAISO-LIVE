@@ -63,7 +63,8 @@ def test_fresh_m15_trend_start_is_confirmed_without_waiting_for_ema50_cross():
     result = evaluate_early_trend_timing(make_starting_trend("BUY"), "BUY")
     assert result["valid"] is True
     assert result["status"] == "CONFIRMED"
-    assert result["phase"] in {"EARLY_EXPANSION", "HEALTHY_CONTINUATION"}
+    assert result["phase"] == "EARLY_EXPANSION"
+    assert result["ema20"] < result["ema50"]  # EMA20/EMA50 has not crossed yet.
     assert result["adx"] >= 18.0
     assert result["adx_slope_3"] > 0
     assert result["di_spread"] >= 2.0
