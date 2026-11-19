@@ -2818,17 +2818,17 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
                           "close_reconciliation_required": False,
                           "close_blocked_reason": f"EXCHANGE_INVALID_ORDER: {exc}",
                           "close_blocked_at": time.time()})
+            rejected_status, rejected_position = fetch_position_tri_state(symbol)
             log_execution(
                 f"[CLOSE_REJECTED] {symbol} {close_reason}: "
                 f"{type(exc).__name__}: {exc}; no order accepted "
                 f"| requested_qty={safe_float(locals().get('requested'), 0.0):.12g} "
                 f"| exchange_before_qty={safe_float(locals().get('before'), 0.0):.12g} "
-                f"| live_rejected_qty={safe_float(_position_contracts(rejected_position), 0.0) if locals().get('rejected_position') is not None else 0.0:.12g} "
+                f"| live_rejected_qty={safe_float(_position_contracts(rejected_position), 0.0) if rejected_position is not None else 0.0:.12g} "
                 f"| position_mode={locals().get('close_mode_label', 'UNKNOWN')} "
                 f"| normalized_symbol={locals().get('sym', normalize_symbol(symbol))}",
                 "WARN",
             )
-            rejected_status, rejected_position = fetch_position_tri_state(symbol)
             if rejected_status == "FLAT":
                 _clear_confirmed_flat(symbol, reason="CLOSE_REJECTED_BUT_EXCHANGE_FLAT")
                 return True
