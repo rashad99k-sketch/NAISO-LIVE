@@ -159,9 +159,6 @@ def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
     directional = 1.0 if buy else -1.0
     ema_gap = float(e9.iloc[-1] - e20.iloc[-1])
     previous_ema_gap = float(e9.iloc[-2] - e20.iloc[-2])
-    fresh_ema_cross = (
-        (previous_ema_gap <= 0 < ema_gap) if buy else (previous_ema_gap >= 0 > ema_gap)
-    )
     fresh_ema_cross_recent = False
     for idx in range(max(1, len(x) - 6), len(x)):
         prior_gap = float(e9.iloc[idx - 1] - e20.iloc[idx - 1])
