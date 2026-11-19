@@ -230,15 +230,21 @@ def leverage_params(mode: PositionMode, position_side: str) -> Dict[str, str]:
 class TradeExecutionService:
     """Single order gateway with no blind MARKET retries and fail-closed verification."""
 
-    def __init__(self, exchange: Any, journal: Any = None, logger: Optional[Callable[[str], None]] = None):
+    def __init__(self, exchange: Any, journal: Any = None, logger: Optional[Callable[[str], None]] = None,
+                 require_journal: bool = False):
         self.exchange = exchange
         self.journal = journal
         self.logger = logger or (lambda _message: None)
+        self.require_journal = bool(require_journal)
         self.mode_adapter = BingXPositionModeAdapter(exchange, logger=self.logger)
 
     def _persist_pending(self, **fields: Any) -> None:
-        if self.journal is not None and hasattr(self.journal, "persist_entry_pending"):
-            self.journal.persist_entry_pending(**fields)
+        writer = getattr(self.journal, "persist_entry_pending", None) if self.journal is not None else None
+        if not callable(writer):
+            if self.require_journal:
+                raise RuntimeError("required trade journal is unavailable; refusing LIVE entry")
+            return
+        writer(**fields)
 
     def _find_order(self, symbol: str, order_id: Optional[str], client_order_id: str) -> Any:
         fetch = getattr(self.exchange, "fetch_order", None)
@@ -356,11 +362,19 @@ class TradeExecutionService:
                                    requested_qty=requested, position_mode=mode_result.mode.value,
                                    position_side=params["positionSide"], reason=f"leverage validation failed: {exc}")
         params["clientOrderId"] = client_order_id
-        self._persist_pending(trade_id=trade_id, client_order_id=client_order_id, symbol=symbol,
-                              side=side, position_mode=mode_result.mode.value,
-                              position_side=params["positionSide"], leverage=leverage,
-                              requested_qty=requested, entry_ts=time.time(), status="ENTRY_PENDING",
-                              structural_stop=structural_stop, management_state=management_state)
+        try:
+            # Durable intent must be committed before the exchange can create exposure.
+            # In LIVE mode a missing journal or failed SQLite write blocks the order.
+            self._persist_pending(trade_id=trade_id, client_order_id=client_order_id, symbol=symbol,
+                                  side=side, position_mode=mode_result.mode.value,
+                                  position_side=params["positionSide"], leverage=leverage,
+                                  requested_qty=requested, entry_ts=time.time(), status="ENTRY_PENDING",
+                                  structural_stop=structural_stop, management_state=management_state)
+        except Exception as exc:
+            return ExecutionResult(ExecutionState.REJECTED, trade_id, client_order_id,
+                                   requested_qty=requested, position_mode=mode_result.mode.value,
+                                   position_side=params["positionSide"],
+                                   reason=f"trade journal pre-entry persistence failed: {type(exc).__name__}: {exc}")
         try:
             order = self.exchange.create_order(symbol, "market", side.lower(), requested, None, params)
         except Exception as exc:
