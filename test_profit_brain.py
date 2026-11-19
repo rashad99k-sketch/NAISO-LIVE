@@ -47,7 +47,7 @@ def test_range_target_is_conservative_when_thin_or_weak():
         "side": "BUY", "adx": 14, "continuation_probability": 0.30,
         "volume_ratio": 0.50, "thin_liquidity": True,
     })
-    assert target == 0.5
+    assert target == 0.25
 
 
 def test_range_target_price_and_hit_are_directional():
@@ -136,3 +136,42 @@ def test_opposing_liquidity_scalp_plan_has_two_ordered_50_50_targets():
     assert 100.0 < buy["tp1_target_price"] < buy["target_price"] < 100.90
     assert 99.10 < sell["target_price"] < sell["tp1_target_price"] < 100.0
     assert build_scalp_target("BUY", 100.0, 100.20)["status"] == "NO_TARGET"
+
+
+
+def test_range_targets_use_price_move_tiers_025_050_100():
+    weak, _ = select_range_target_pct({
+        "side": "BUY", "adx": 14, "continuation_probability": 0.30,
+        "volume_ratio": 0.50, "thin_liquidity": True,
+    })
+    moderate, _ = select_range_target_pct({
+        "side": "BUY", "adx": 19, "continuation_probability": 0.60,
+        "volume_ratio": 0.95, "di_plus": 28, "di_minus": 14,
+        "aligned_closed_candles": 2,
+    })
+    strong, _ = select_range_target_pct({
+        "side": "SELL", "adx": 25, "continuation_probability": 0.78,
+        "volume_ratio": 1.30, "di_plus": 12, "di_minus": 31,
+        "aligned_closed_candles": 2,
+    })
+    assert (weak, moderate, strong) == (0.25, 0.50, 1.00)
+
+
+def test_scalp_board_uses_one_full_close_not_partial_tp1():
+    import ast
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    board = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.ClassDef) and node.name == "TradeManagementBoard")
+    evaluate = next(node for node in board.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "evaluate")
+    source_lines = source.splitlines()
+    block_start = next(i for i, line in enumerate(source_lines)
+                       if 'if profit_mode == "RANGE_SCALP":' in line)
+    block_end = next(i for i in range(block_start + 1, len(source_lines))
+                     if source_lines[i].startswith("        # Canonical TP1:"))
+    scalp_block = "\n".join(source_lines[block_start:block_end])
+    assert "TradeDecisionType.FULL_CLOSE" in scalp_block
+    assert "TradeDecisionType.PARTIAL_CLOSE" not in scalp_block
+    assert "range_scalp_waiting_for_single_target" in scalp_block
