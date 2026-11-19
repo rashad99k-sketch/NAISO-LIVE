@@ -21,11 +21,18 @@ def _wilder_rma(values: pd.Series, period: int) -> pd.Series:
     if period < 2 or len(source) < period:
         return out
     array = source.to_numpy(dtype=float)
-    if not np.isfinite(array[:period]).all():
+    finite_starts = np.flatnonzero(np.isfinite(array))
+    seed_start = None
+    for candidate in finite_starts:
+        candidate = int(candidate)
+        if candidate + period <= len(array) and np.isfinite(array[candidate:candidate + period]).all():
+            seed_start = candidate
+            break
+    if seed_start is None:
         return out
-    seed_index = period - 1
-    out.iloc[seed_index] = float(np.mean(array[:period]))
-    for i in range(period, len(array)):
+    seed_index = seed_start + period - 1
+    out.iloc[seed_index] = float(np.mean(array[seed_start:seed_index + 1]))
+    for i in range(seed_index + 1, len(array)):
         if not np.isfinite(array[i]):
             return out
         out.iloc[i] = (float(out.iloc[i - 1]) * (period - 1) + array[i]) / period
@@ -101,7 +108,7 @@ def _indicator_frame(frame: pd.DataFrame, period: int = 14) -> Dict[str, Any]:
 
 def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
                                max_ema9_extension_atr: float = 1.35,
-                               max_vwap_extension_atr: float = 2.0) -> Dict[str, Any]:
+                               max_vwap_extension_atr: float = 2.5) -> Dict[str, Any]:
     """Classify a continuation trigger as early/healthy, waiting, or too extended.
 
     Inputs must already be closed candles. ADX is used as directional-strength
