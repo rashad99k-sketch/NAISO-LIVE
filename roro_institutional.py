@@ -448,7 +448,20 @@ class ContinuationEngine:
         e20 = x.close.ewm(span=20, adjust=False).mean()
         e50 = x.close.ewm(span=50, adjust=False).mean()
         bullish = side == "BUY"
-        aligned = (float(e20.iloc[-1]) > float(e50.iloc[-1]) and float(e20.iloc[-1]) > float(e20.iloc[-4]) and float(last.close) >= float(e20.iloc[-1])) if bullish else (float(e20.iloc[-1]) < float(e50.iloc[-1]) and float(e20.iloc[-1]) < float(e20.iloc[-4]) and float(last.close) <= float(e20.iloc[-1]))
+        legacy_aligned = (
+            float(e20.iloc[-1]) > float(e50.iloc[-1])
+            and float(e20.iloc[-1]) > float(e20.iloc[-4])
+            and float(last.close) >= float(e20.iloc[-1])
+        ) if bullish else (
+            float(e20.iloc[-1]) < float(e50.iloc[-1])
+            and float(e20.iloc[-1]) < float(e20.iloc[-4])
+            and float(last.close) <= float(e20.iloc[-1])
+        )
+        # Permit a genuinely early trend before EMA20/EMA50 cross only when
+        # the faster EMA9/EMA20, session VWAP, Wilder ADX and directional DI
+        # already confirm the move on closed candles.
+        early_timing = evaluate_early_trend_timing(x, side)
+        aligned = bool(legacy_aligned or early_timing.get("valid"))
         if not aligned:
             return InstitutionalDecision(DecisionState.REJECTED.value, "TREND_CONTINUATION_RETEST", side,
                                          "trend_regime_not_aligned", rejection_reasons=("trend_regime_not_aligned",))
@@ -577,7 +590,7 @@ class ContinuationEngine:
         if stop is None:
             return InstitutionalDecision(DecisionState.REJECTED.value, "TREND_CONTINUATION_RETEST", side,
                                          stop_reason, rejection_reasons=(stop_reason,))
-        timing = evaluate_early_trend_timing(x, side)
+        timing = early_timing
         ts = int(x.timestamp.iloc[bos_idx])
         if not timing.get("valid"):
             timing_state = (
@@ -598,7 +611,8 @@ class ContinuationEngine:
             )
         evidence = (
             bos_name, "displacement", f"{pullback_type}:{retest_zone}",
-            "post_retest_trigger", "trend_ema20_ema50_alignment",
+            "post_retest_trigger",
+            ("trend_ema20_ema50_alignment" if legacy_aligned else "ema9_ema20_early_alignment"),
             f"timing_phase:{timing.get('phase')}",
             f"adx_rising:{timing.get('adx')}",
             f"ema9_extension_atr:{timing.get('ema9_extension_atr')}",
