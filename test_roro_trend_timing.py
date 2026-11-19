@@ -5,8 +5,8 @@ import pytest
 from roro_trend_timing import _wilder_rma, evaluate_early_trend_timing
 
 
-def make_starting_trend(side="BUY", start_index=109, start_timestamp=0, late_impulse=False):
-    count = 120
+def make_starting_trend(side="BUY", start_index=109, start_timestamp=0, late_impulse=False, count=120):
+    volume_start = max(0, count - 24)
     closes = []
     for i in range(count):
         if i < start_index:
@@ -20,7 +20,7 @@ def make_starting_trend(side="BUY", start_index=109, start_timestamp=0, late_imp
         open_price = closes[i - 1] if i else close
         high = max(open_price, close) + 0.12
         low = min(open_price, close) - 0.12
-        volume = 100.0 if i < 96 else 250.0 + (i - 96) * 30.0
+        volume = 100.0 if i < volume_start else 250.0 + (i - volume_start) * 30.0
         rows.append({
             "timestamp": int(start_timestamp + i * 900_000),
             "open": open_price, "high": high, "low": low,
@@ -91,11 +91,25 @@ def test_missing_start_of_utc_session_fails_closed_for_vwap():
     # 06:00 UTC start means the frame omits the session's first M15 candle.
     start = 6 * 60 * 60 * 1000
     result = evaluate_early_trend_timing(
-        make_starting_trend("BUY", start_timestamp=start), "BUY"
+        make_starting_trend("BUY", start_index=49, start_timestamp=start, count=60), "BUY"
     )
     assert result["valid"] is False
     assert result["status"] == "WAITING_FOR_CONFIRMATION"
     assert result["reason"] == "complete_utc_session_vwap_unavailable"
+
+
+
+def test_continuation_engine_uses_early_alignment_and_expires_old_retests():
+    from pathlib import Path
+
+    source = Path("roro_institutional.py").read_text(encoding="utf-8")
+    start = source.index("class ContinuationEngine:")
+    end = source.index("class UnifiedEntryAuthority:", start)
+    continuation = source[start:end]
+    assert "legacy_aligned or early_timing.get(\"valid\")" in continuation
+    assert "if r - bos_idx > 8:" in continuation
+    assert "(len(x) - 1 - retest_idx) > 3" in continuation
+    assert "evaluate_early_trend_timing(x, side)" in continuation
 
 
 def test_invalid_side_fails_closed():
