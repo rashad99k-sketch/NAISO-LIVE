@@ -5,14 +5,16 @@ import pytest
 from roro_trend_timing import _wilder_rma, evaluate_early_trend_timing
 
 
-def make_starting_trend(side="BUY", start_index=109, start_timestamp=0, late_impulse=False, count=120):
+def make_starting_trend(side="BUY", start_index=116, start_timestamp=0, late_impulse=False, count=120):
     volume_start = max(0, count - 24)
     closes = []
     for i in range(count):
-        if i < start_index:
-            close = 100.0 + 0.08 * np.sin(i * 0.7) + 0.03 * np.sin(i * 1.9)
+        if i < 60:
+            close = 100.0 - 0.05 * i + 0.04 * np.sin(i * 0.8)
+        elif i < start_index:
+            close = 100.0 - 0.05 * 60 + 0.05 * np.sin(i * 0.7)
         else:
-            close = 100.0 + 0.07 * (i - start_index + 1) + 0.04 * np.sin(i * 0.8)
+            close = 100.0 - 0.05 * 60 + 0.15 * (i - start_index + 1) + 0.02 * np.sin(i * 0.8)
         closes.append(close)
 
     rows = []
