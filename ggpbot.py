@@ -3597,24 +3597,23 @@ class LiveTradeManager:
                         swing_levels = []
                     adaptive_target, target_reason = adaptive_range_target_price(
                         side, entry, atr, swing_levels)
-                    # The percentage objective is a PRICE move (0.25/0.50/1.00%),
-                    # not ROE. Cap the liquidity target at that objective so a
-                    # range scalp cannot silently become a distant trend runner.
+                    # Percentage objective is a PRICE move (0.25/0.50/1.00%), not ROE.
+                    # Use the last three completed candles as follow-through evidence.
+                    _aligned_closed = 0
+                    for _candle_idx in range(max(0, len(df_live) - 4), len(df_live) - 1):
+                        _candle = df_live.iloc[_candle_idx]
+                        _candle_aligned = (
+                            safe_float(_candle.get("close"), 0.0) > safe_float(_candle.get("open"), 0.0)
+                            if side == "BUY" else
+                            safe_float(_candle.get("close"), 0.0) < safe_float(_candle.get("open"), 0.0)
+                        )
+                        _aligned_closed += int(bool(_candle_aligned))
                     _target_pct, _target_pct_reason = select_range_target_pct({
                         **mode_context, "side": side,
-                        "aligned_closed_candles": int(STATE.get("aligned_closed_candles", 0) or 0),
+                        "aligned_closed_candles": _aligned_closed,
                         "adverse_rejection": bool(STATE.get("adverse_rejection", False)),
                     })
                     _percent_target = range_target_price(side, entry, _target_pct)
-                    if _percent_target > 0 and adaptive_target > 0:
-                        if side == "BUY":
-                            adaptive_target = min(adaptive_target, _percent_target)
-                        else:
-                            adaptive_target = max(adaptive_target, _percent_target)
-                        target_reason = f"{target_reason}|{_target_pct_reason}"
-                    elif _percent_target > 0:
-                        adaptive_target = _percent_target
-                        target_reason = _target_pct_reason
                     _pool_level = safe_float(STATE.get("opposing_liquidity_level"), 0.0)
                     _scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
                     if _pool_level > 0 and str(STATE.get("scalp_target_status") or "").upper() == "VALID" and _scalp_target > 0:
@@ -3627,6 +3626,13 @@ class LiveTradeManager:
                             target_reason = "opposing_pool_geometry_rejected_atr_fallback"
                     elif _pool_level > 0:
                         target_reason = str(STATE.get("scalp_target_selection_reason") or "no_valid_scalp_target") + "_atr_fallback"
+                    # Apply the percentage cap AFTER liquidity-pool geometry so no
+                    # later pool adjustment can turn a scalp into a distant target.
+                    if _percent_target > 0:
+                        if side == "BUY":
+                            adaptive_target = min(adaptive_target, _percent_target) if adaptive_target > 0 else _percent_target
+                        else:
+                            adaptive_target = max(adaptive_target, _percent_target) if adaptive_target > 0 else _percent_target
                     STATE["range_target_price"] = adaptive_target
                     STATE["range_target_move_pct"] = (abs(adaptive_target-entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
                     STATE["range_target_reason"] = target_reason
