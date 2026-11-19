@@ -2407,7 +2407,7 @@ class InstitutionalTradeBrain:
 
 # ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
 from enum import Enum as PyEnum
-from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached,
+from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
                               select_range_target_pct, tp2_reassessment, thesis_failure_action,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE)
@@ -2531,44 +2531,33 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP is enabled only by the multi-evidence policy. It still
-        # follows the canonical two-stage 50/50 model: TP1 is a verified partial
-        # close; TP2 strictly closes the verified remaining runner.
+        # RANGE_SCALP is a SINGLE-TARGET mode: no partial TP1 and no runner.
+        # On target, close the full verified remaining exposure through the
+        # existing strict FULL_CLOSE execution/reconciliation path.
         if profit_mode == "RANGE_SCALP":
             scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
             scalp_target = safe_float(ctx.get("scalp_target_price"), 0.0)
             range_target = (
-                scalp_target if scalp_target_status == "VALID" and scalp_target > 0
-                else safe_float(ctx.get("range_target_price"), 0.0)
+                safe_float(ctx.get("range_target_price"), 0.0)
+                or (scalp_target if scalp_target_status == "VALID" else 0.0)
             )
-            target_source = ("opposing_liquidity_scalp_target"
-                             if scalp_target_status == "VALID" and scalp_target > 0
-                             else "adaptive_range_fallback")
-            tp1_hit = bool(ctx.get("tp1_hit"))
-            tp2_hit = bool(ctx.get("tp2_hit"))
-            if range_target > 0 and entry > 0:
-                tp1_target = safe_float(ctx.get("scalp_target_tp1_price"), 0.0)
-                if tp1_target <= 0:
-                    tp1_target = entry + (range_target - entry) * 0.5
-                if not tp1_hit and remaining > 0 and initial > 0 and target_reached(side, current, tp1_target):
-                    target_remaining = initial * 0.5
-                    tolerance = max(initial * 0.002, 1e-10)
-                    qty_to_close = max(0.0, remaining - target_remaining)
-                    if qty_to_close <= tolerance:
-                        return decision(TradeDecisionType.HOLD, "range_scalp_tp1_quantity_wait_for_reconciliation")
-                    ratio = min(1.0, qty_to_close / remaining)
-                    return decision(TradeDecisionType.PARTIAL_CLOSE,
-                                    f"range_scalp_{target_source}_tp1_50pct",
-                                    ratio=ratio, target_remaining_qty=target_remaining,
-                                    close_reason="TP1", target_price=tp1_target,
-                                    tp2_target_price=range_target)
-                if tp1_hit and not tp2_hit and target_reached(side, current, range_target):
-                    return decision(TradeDecisionType.FULL_CLOSE,
-                                    f"range_scalp_{target_source}_tp2_runner_exit",
-                                    close_reason="TP2", target_price=range_target,
-                                    opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0))
-            return decision(TradeDecisionType.HOLD, "range_scalp_waiting_for_two_stage_targets",
-                            target_price=range_target, target_source=target_source)
+            target_source = ("adaptive_price_target"
+                             if safe_float(ctx.get("range_target_price"), 0.0) > 0
+                             else "opposing_liquidity_fallback")
+            if range_target > 0 and entry > 0 and remaining > 0:
+                if target_reached(side, current, range_target):
+                    return decision(
+                        TradeDecisionType.FULL_CLOSE,
+                        f"range_scalp_{target_source}_single_target_full_exit",
+                        close_reason="SCALP_TARGET", target_price=range_target,
+                        target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+                        opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0),
+                    )
+            return decision(
+                TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target",
+                target_price=range_target, target_source=target_source,
+                target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+            )
 
         # Canonical TP1: reduce the original filled quantity to exactly 50%.
         # This compensates for any previously confirmed partial fill and never
@@ -3608,6 +3597,24 @@ class LiveTradeManager:
                         swing_levels = []
                     adaptive_target, target_reason = adaptive_range_target_price(
                         side, entry, atr, swing_levels)
+                    # The percentage objective is a PRICE move (0.25/0.50/1.00%),
+                    # not ROE. Cap the liquidity target at that objective so a
+                    # range scalp cannot silently become a distant trend runner.
+                    _target_pct, _target_pct_reason = select_range_target_pct({
+                        **mode_context, "side": side,
+                        "aligned_closed_candles": int(STATE.get("aligned_closed_candles", 0) or 0),
+                        "adverse_rejection": bool(STATE.get("adverse_rejection", False)),
+                    })
+                    _percent_target = range_target_price(side, entry, _target_pct)
+                    if _percent_target > 0 and adaptive_target > 0:
+                        if side == "BUY":
+                            adaptive_target = min(adaptive_target, _percent_target)
+                        else:
+                            adaptive_target = max(adaptive_target, _percent_target)
+                        target_reason = f"{target_reason}|{_target_pct_reason}"
+                    elif _percent_target > 0:
+                        adaptive_target = _percent_target
+                        target_reason = _target_pct_reason
                     _pool_level = safe_float(STATE.get("opposing_liquidity_level"), 0.0)
                     _scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
                     if _pool_level > 0 and str(STATE.get("scalp_target_status") or "").upper() == "VALID" and _scalp_target > 0:
