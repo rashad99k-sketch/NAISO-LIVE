@@ -158,7 +158,6 @@ def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
     buy = direction == "BUY"
     directional = 1.0 if buy else -1.0
     ema_gap = float(e9.iloc[-1] - e20.iloc[-1])
-    previous_ema_gap = float(e9.iloc[-2] - e20.iloc[-2])
     fresh_ema_cross_recent = False
     for idx in range(max(1, len(x) - 6), len(x)):
         prior_gap = float(e9.iloc[idx - 1] - e20.iloc[idx - 1])
@@ -181,7 +180,7 @@ def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
     price_holds_ema9 = close > ema9_now if buy else close < ema9_now
     vwap_not_opposing = vwap_slope * directional >= -0.05 * atr
     di_spread = (plus_di - minus_di) * directional
-    adx_strengthening = adx_now >= 18.0 and adx_slope > 0.0
+    adx_confirmed = adx_now >= 18.0 and (adx_slope > 0.0 or (adx_now >= 25.0 and adx_slope >= -0.5))
     ema9_extension = abs(close - ema9_now) / atr
     vwap_extension = abs(close - vwap_now) / atr
     impulse_extension = candle_range / atr
@@ -215,21 +214,22 @@ def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
     if di_spread < 2.0:
         return {**diagnostics, "valid": False, "status": "WAITING_FOR_CONFIRMATION",
                 "reason": "directional_di_spread_not_confirmed"}
-    if not adx_strengthening:
+    # High ADX is not exhaustion by itself. Only a high, falling ADX combined
+    # with price extension is treated as a late-stage continuation warning.
+    if adx_now >= 45.0 and adx_slope < -1.0 and (ema9_extension > 0.8 or vwap_extension > 1.4):
+        return {**diagnostics, "valid": False, "status": "NO_CHASE",
+                "reason": "high_adx_fading_with_price_extension"}
+    # Preserve healthy mature trends: a stable ADX >= 25 remains acceptable;
+    # new/early trends must show ADX >= 18 and a positive slope.
+    if not adx_confirmed:
         return {**diagnostics, "valid": False, "status": "WAITING_FOR_CONFIRMATION",
-                "reason": "adx_below_18_or_not_rising"}
+                "reason": "adx_below_18_or_weakening"}
     if ema9_extension > float(max_ema9_extension_atr) or vwap_extension > float(max_vwap_extension_atr):
         return {**diagnostics, "valid": False, "status": "NO_CHASE",
                 "reason": "price_overextended_from_ema9_or_session_vwap"}
     if impulse_extension > 1.8:
         return {**diagnostics, "valid": False, "status": "NO_CHASE",
                 "reason": "trigger_candle_already_overextended"}
-
-    # High ADX is not exhaustion by itself. Only a high, falling ADX combined
-    # with price extension is treated as a late-stage continuation warning.
-    if adx_now >= 45.0 and adx_slope < -1.0 and (ema9_extension > 0.8 or vwap_extension > 1.4):
-        return {**diagnostics, "valid": False, "status": "NO_CHASE",
-                "reason": "high_adx_fading_with_price_extension"}
 
     phase = "EARLY_EXPANSION" if fresh_ema_cross_recent or adx_cross_recent else "HEALTHY_CONTINUATION"
     return {**diagnostics, "valid": True, "status": "CONFIRMED",
