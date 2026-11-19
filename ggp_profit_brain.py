@@ -11,7 +11,7 @@ from math import isfinite
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
-RANGE_PROFIT_TARGETS_PCT = (0.5, 1.0, 2.0)
+RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
 RANGE_MODE = "RANGE_SCALP"
 TREND_MODE = "TREND_RIDE"
 STANDARD_MODE = "TWO_STAGE_50_50"
@@ -210,10 +210,11 @@ def target_reached(side: str, current_price: float, target_price: float) -> bool
 
 
 def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
-    """Select a conservative 0.5/1/2% price-move target for proven range mode.
+    """Select a 0.25/0.50/1.00% PRICE move for a proven range/scalp trade.
 
-    Thin/weak conditions always select 0.5%. 1% and 2% require completed-candle
-    follow-through and independent volume/ADX/DI support, even inside a range.
+    0.25% is the defensive default for weak or thin conditions. 0.50% requires
+    confirmed directional response. 1.00% requires strong multi-candle,
+    volume, ADX and DI agreement. These are price moves, not leveraged ROE.
     """
     ctx = context if isinstance(context, dict) else {}
     adx = _number(ctx.get("adx"), 0.0) or 0.0
@@ -224,15 +225,15 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     side = str(ctx.get("side") or "").upper()
     low_liquidity = bool(ctx.get("thin_liquidity", False)) or volume_ratio <= 0.75
     if low_liquidity or adx < 18.0 or continuation < 0.45:
-        return RANGE_PROFIT_TARGETS_PCT[0], "weak_or_thin_market_conservative_0.5pct"
+        return RANGE_PROFIT_TARGETS_PCT[0], "weak_or_thin_market_conservative_0.25pct"
     di_aligned = (plus > minus) if side == "BUY" and plus is not None and minus is not None else (minus > plus) if side == "SELL" and plus is not None and minus is not None else False
     aligned_count = _number(ctx.get("aligned_closed_candles"), 0.0) or 0.0
     adverse_rejection = bool(ctx.get("adverse_rejection", False))
     if aligned_count >= 2 and continuation >= 0.72 and adx >= 22 and volume_ratio >= 1.20 and di_aligned and not adverse_rejection:
-        return RANGE_PROFIT_TARGETS_PCT[2], "strong_closed_candle_follow_through_2pct"
+        return RANGE_PROFIT_TARGETS_PCT[2], "strong_closed_candle_follow_through_1.00pct"
     if aligned_count >= 2 and continuation >= 0.55 and adx >= 18 and volume_ratio >= 0.85 and di_aligned and not adverse_rejection:
-        return RANGE_PROFIT_TARGETS_PCT[1], "moderate_follow_through_1pct"
-    return RANGE_PROFIT_TARGETS_PCT[0], "weak_follow_through_conservative_0.5pct"
+        return RANGE_PROFIT_TARGETS_PCT[1], "moderate_follow_through_0.50pct"
+    return RANGE_PROFIT_TARGETS_PCT[0], "weak_follow_through_conservative_0.25pct"
 
 
 def tp2_reassessment(side: str, current_price: float, tp2_price: float, atr: float,

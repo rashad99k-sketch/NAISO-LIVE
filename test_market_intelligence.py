@@ -908,11 +908,15 @@ def test_trade_management_board_uses_validated_scalp_target_and_strict_close_pat
     board_end = source.index("# ========== REAL EXCHANGE ORDERS (SAFE) ==========", board_start)
     board = source[board_start:board_end]
     assert 'scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()' in board
-    assert 'scalp_target if scalp_target_status == "VALID" and scalp_target > 0' in board
-    assert 'range_scalp_{target_source}_tp1_50pct' in board
-    assert 'range_scalp_{target_source}_tp2_runner_exit' in board
-    assert 'TradeDecisionType.PARTIAL_CLOSE' in board
-    assert 'target_reached(side, current, range_target)' in board
+    assert 'or (scalp_target if scalp_target_status == "VALID" else 0.0)' in board
+    assert 'range_scalp_{target_source}_single_target_full_exit' in board
+    assert 'range_scalp_waiting_for_single_target' in board
+    scalp_start = board.index('if profit_mode == "RANGE_SCALP":')
+    scalp_end = board.index("# Canonical TP1:", scalp_start)
+    scalp_policy = board[scalp_start:scalp_end]
+    assert 'TradeDecisionType.FULL_CLOSE' in scalp_policy
+    assert 'TradeDecisionType.PARTIAL_CLOSE' not in scalp_policy
+    assert 'target_reached(side, current, range_target)' in scalp_policy
 
     execute_start = source.index("    def _execute_decision(self, decision: TradeDecision, symbol: str):")
     execute_end = source.index("class ExchangeReconciliationSupervisor:", execute_start)
