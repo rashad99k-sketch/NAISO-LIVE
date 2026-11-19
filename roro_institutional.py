@@ -376,8 +376,6 @@ class ReversalEngine:
             )
         retest_idx = None; retest_zone = ""; retest_zone_ts = None
         for r in range(bos_idx + 1, len(x) - 1):
-            if r - bos_idx > 8:
-                break
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
             for zlow, zhigh, zname, available_ts in zones:
@@ -508,6 +506,8 @@ class ContinuationEngine:
             zones.insert(0, (float(causal_level), float(causal_level), "CAUSAL_LEVEL", int(x.timestamp.iloc[bos_idx])))
         retest_idx = None; pullback_type = None; retest_zone = None; retest_zone_ts = None
         for r in range(bos_idx + 1, len(x) - 1):
+            if r - bos_idx > 8:
+                break
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
             for zlow, zhigh, zname, available_ts in zones:
