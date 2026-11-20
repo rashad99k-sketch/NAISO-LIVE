@@ -158,13 +158,26 @@ def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
     buy = direction == "BUY"
     directional = 1.0 if buy else -1.0
     ema_gap = float(e9.iloc[-1] - e20.iloc[-1])
+    # Cross events are measured on completed candles only. Either EMA9/VWAP
+    # (early trigger) or EMA50/VWAP (slower confirmation) may start evaluation.
+    # A cross starts evaluation; it is never an order authorization by itself.
     fresh_ema_cross_recent = False
+    fresh_ema9_vwap_cross = False
+    fresh_ema50_vwap_cross = False
     for idx in range(max(1, len(x) - 6), len(x)):
-        prior_gap = float(e9.iloc[idx - 1] - e20.iloc[idx - 1])
-        current_gap = float(e9.iloc[idx] - e20.iloc[idx])
+        prior_gap = float(e9.iloc[idx - 1] - vwap.iloc[idx - 1])
+        current_gap = float(e9.iloc[idx] - vwap.iloc[idx])
         if (prior_gap <= 0 < current_gap) if buy else (prior_gap >= 0 > current_gap):
+            fresh_ema9_vwap_cross = True
+        prior_slow_gap = float(e50.iloc[idx - 1] - vwap.iloc[idx - 1])
+        current_slow_gap = float(e50.iloc[idx] - vwap.iloc[idx])
+        if (prior_slow_gap <= 0 < current_slow_gap) if buy else (prior_slow_gap >= 0 > current_slow_gap):
+            fresh_ema50_vwap_cross = True
+        prior_ema_gap = float(e9.iloc[idx - 1] - e20.iloc[idx - 1])
+        current_ema_gap = float(e9.iloc[idx] - e20.iloc[idx])
+        if (prior_ema_gap <= 0 < current_ema_gap) if buy else (prior_ema_gap >= 0 > current_ema_gap):
             fresh_ema_cross_recent = True
-            break
+    fresh_vwap_cross = fresh_ema9_vwap_cross or fresh_ema50_vwap_cross
 
     adx_cross_recent = False
     for idx in range(max(1, len(x) - 6), len(x)):
@@ -194,7 +207,7 @@ def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
         "atr14_wilder": atr, "ema9_extension_atr": round(ema9_extension, 4),
         "vwap_extension_atr": round(vwap_extension, 4),
         "trigger_candle_range_atr": round(impulse_extension, 4),
-        "fresh_ema9_ema20_cross": bool(fresh_ema_cross_recent),
+        "fresh_ema9_ema20_cross": bool(fresh_ema_cross_recent),\n        "fresh_ema9_vwap_cross": bool(fresh_ema9_vwap_cross),\n        "fresh_ema50_vwap_cross": bool(fresh_ema50_vwap_cross),\n        "cross_trigger": ("EMA9_VWAP" if fresh_ema9_vwap_cross else "EMA50_VWAP" if fresh_ema50_vwap_cross else "EMA9_EMA20" if fresh_ema_cross_recent else "NONE"),
         "fresh_adx_18_cross": bool(adx_cross_recent),
         "candle_timestamp": int(x.timestamp.iloc[-1]),
     }
@@ -231,6 +244,6 @@ def evaluate_early_trend_timing(frame: pd.DataFrame, side: str,
         return {**diagnostics, "valid": False, "status": "NO_CHASE",
                 "reason": "trigger_candle_already_overextended"}
 
-    phase = "EARLY_EXPANSION" if fresh_ema_cross_recent or adx_cross_recent else "HEALTHY_CONTINUATION"
+    phase = "EARLY_EXPANSION" if fresh_vwap_cross or fresh_ema_cross_recent or adx_cross_recent else "HEALTHY_CONTINUATION"
     return {**diagnostics, "valid": True, "status": "CONFIRMED",
-            "phase": phase, "reason": "ema_vwap_adx_di_early_timing_confirmed"}
+            "phase": phase, "reason": "ema9_or_ema50_vwap_cross_with_adx_di_confirmation" if fresh_vwap_cross else "ema_vwap_adx_di_early_timing_confirmed"}
