@@ -755,7 +755,8 @@ def tg_close(symbol, pnl_pct, duration_min, side, close_reason=None, pnl_usdt=No
     parts.extend([f"⏱ Duration: {safe_float(duration_min):.0f} min", f"Reason: {html_escape(reason)}"])
     if pnl_source: parts.append(f"🧾 Source: {html_escape(str(pnl_source))}")
     if trade_id: parts.append(f"🔖 Trade ID: {html_escape(str(trade_id))}")
-    send_once("\n".join(parts), f"close_{trade_id or f'{symbol}_{reason}'}", 1)
+    close_key = str(trade_id or (str(symbol) + "_" + reason))
+    send_once("\n".join(parts), f"close_{close_key}", 1)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{html_escape(str(error_type))}]\n{html_escape(str(err_msg)[:200])}", f"err_{error_type}_{str(err_msg)[:50]}", 60)
