@@ -282,3 +282,25 @@ def test_opposing_sr_rejection_adds_independent_risk_evidence():
     })
     assert result["action"] == "LOCK_PROFIT"
     assert "SUPPORT_RESISTANCE" in result["groups"]
+
+
+def test_distribution_pressure_is_not_exit_risk_for_aligned_short_trade():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": 2.0,
+        "smart_money": {"distribution_risk": 82, "institutional_bias": "SELL"},
+    })
+    assert result["action"] == "HOLD"
+
+
+def test_fresh_opposite_dual_vwap_cross_adds_risk_for_profitable_position():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 2.0,
+        "fresh_ema9_vwap_cross": True, "fresh_ema50_vwap_cross": True,
+        "vwap_cross_direction": "BEARISH",
+        "vwap_cross_age_seconds": 60, "vwap_cross_max_age_seconds": 1800,
+        "momentum": {"momentum_decay": True},
+    })
+    assert result["action"] == "LOCK_PROFIT"
+    assert "CROSS_STRUCTURE" in result["groups"]
