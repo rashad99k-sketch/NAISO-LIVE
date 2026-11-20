@@ -2510,8 +2510,8 @@ class TradeManagementBoard:
                 "scalp_target_status": str(ctx.get("scalp_target_status") or "UNKNOWN"),
                 "scalp_target_price": safe_float(ctx.get("scalp_target_price"), 0.0),
                 "scalp_target_tp1_price": safe_float(ctx.get("scalp_target_tp1_price"), 0.0),
-                "risk_score": safe_float((ctx.get("exit_risk_snapshot") or {}).get("score"), 0.0),
-                "risk_groups": list((ctx.get("exit_risk_snapshot") or {}).get("groups") or []),
+                "risk_score": safe_float(params.get("risk_score"), 0.0),
+                "risk_groups": list(params.get("risk_groups") or []),
                 "scalp_target_selected_pct": safe_float(ctx.get("scalp_target_selected_pct"), 0.0),
             }
             self._decision_history.append(meta)
@@ -2538,6 +2538,13 @@ class TradeManagementBoard:
         # order-block/FVG and support/resistance engines.
         exit_risk = evaluate_exit_risk(ctx)
         STATE["exit_risk_snapshot"] = dict(exit_risk)
+        record_trade_management_event(
+            "PROFIT_RISK_ASSESSMENT", exit_risk.get("action", "HOLD"),
+            dedupe_key=f"profit_risk:{ctx.get('symbol')}:{ctx.get('side')}:{exit_risk.get('action')}:{exit_risk.get('score')}",
+            dedupe_seconds=10, symbol=ctx.get("symbol"), side=side,
+            risk_score=exit_risk.get("score"), risk_groups=list(exit_risk.get("groups") or []),
+            reasons=list(exit_risk.get("reasons") or ()), roe_pct=roe,
+        )
         if exit_risk.get("action") == "HARD_EXIT":
             return decision(
                 TradeDecisionType.THESIS_FAILURE_EXIT,
@@ -3979,6 +3986,7 @@ class LiveTradeManager:
             "remaining_qty": safe_float(STATE.get("remaining_qty"), STATE.get("qty", 0.0)),
             "initial_qty": safe_float(STATE.get("initial_qty"), STATE.get("qty", 0.0)),
             "smart_money": smart_money, "momentum": momentum,
+            "exit_risk_snapshot": dict(STATE.get("exit_risk_snapshot") or {}),
             "entry_order_block": dict(STATE.get("entry_order_block") or {}),
             "entry_fvg": dict(STATE.get("entry_fvg") or {}),
             "entry_liquidity": dict(STATE.get("entry_liquidity") or {}),
