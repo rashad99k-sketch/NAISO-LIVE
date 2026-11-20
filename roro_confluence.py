@@ -177,14 +177,17 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
         else "BEARISH" if ema50_prev_gap is not None and ema50_gap is not None and ema50_prev_gap >= 0 > ema50_gap
         else None
     )
-    any_cross = crossed or crossed50
+    cross_conflict = bool(crossed and crossed50 and crossed != crossed50)
+    any_cross = None if cross_conflict else (crossed or crossed50)
     gap_pct = abs(gap) / vwap_now * 100.0
     gap_atr = abs(gap) / atr_proxy
     closeness = max(0.0, min(55.0, 55.0 * (1.0 - min(gap_atr, 2.0) / 2.0)))
     convergence = 25.0 if abs(gap) < abs(prev_gap) else 0.0
     cross_bonus = 20.0 if any_cross else 0.0
     score = max(0.0, min(100.0, closeness + convergence + cross_bonus))
-    if any_cross:
+    if cross_conflict:
+        state = "CROSS_CONFLICT"
+    elif any_cross:
         state = "CROSS_CONFIRMED"
     elif direction == "NEUTRAL":
         state = "AT_VWAP"
@@ -201,7 +204,8 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
         "cross_ema9": crossed,
         "cross_ema50": crossed50,
         "cross_any": any_cross,
-        "cross_trigger": "EMA9_VWAP" if crossed else "EMA50_VWAP" if crossed50 else "NONE",
+        "cross_conflict": cross_conflict,
+        "cross_trigger": "CONFLICT" if cross_conflict else "EMA9_VWAP" if crossed else "EMA50_VWAP" if crossed50 else "NONE",
         "ema50_direction": "BUY" if ema50_gap is not None and ema50_gap > 0 else "SELL" if ema50_gap is not None and ema50_gap < 0 else "NEUTRAL",
         "state": state,
         "score": round(score, 2),
