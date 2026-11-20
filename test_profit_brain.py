@@ -157,6 +157,11 @@ def test_range_targets_use_price_move_tiers_025_050_100():
     assert (weak, moderate, strong) == (0.25, 0.50, 1.00)
 
 
+def test_range_profit_targets_remain_capped_at_one_percent():
+    from ggp_profit_brain import RANGE_PROFIT_TARGETS_PCT
+    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50, 1.00)
+
+
 def test_scalp_board_uses_one_full_close_not_partial_tp1():
     import ast
     from pathlib import Path
