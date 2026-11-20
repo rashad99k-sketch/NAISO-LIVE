@@ -65,3 +65,20 @@ def test_ema50_warmup_does_not_break_legacy_ema9_proximity():
     assert result["ema50"] is None
     assert result["cross_ema50"] is None
     assert result["cross"] == result["cross_ema9"]
+
+
+def test_live_profit_manager_consumes_cross_diagnostics_without_gating_position_protection():
+    from pathlib import Path
+
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert '_roro_ema9_vwap_proximity(' in source
+    assert 'STATE["fresh_ema9_vwap_cross"]' in source
+    assert 'STATE["fresh_ema50_vwap_cross"]' in source
+    assert '"vwap_cross_trigger": str(STATE.get("vwap_cross_trigger")' in source
+    # A new cross is diagnostic/classification context; the open-position
+    # manager must not require a cross to remain active.
+    manager_start = source.index("    def manage_live_trade(self):")
+    apply_start = source.index("    def _apply_management(self, symbol, now):", manager_start)
+    manage_body = source[manager_start:apply_start]
+    assert 'if not (STATE.get("open") and STATE.get("current_symbol"))' in manage_body
+    assert "vwap_cross" not in manage_body.lower()
