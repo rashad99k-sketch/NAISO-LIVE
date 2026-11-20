@@ -162,7 +162,18 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     # evidence. It must not be mislabeled as a range scalp and fully closed at
     # the first small target. It does not, by itself, prove a TREND_RIDE.
     cross_direction = str(ctx.get("vwap_cross_direction") or "").upper()
-    fresh_vwap_cross = bool(ctx.get("fresh_ema9_vwap_cross") or ctx.get("fresh_ema50_vwap_cross"))
+    # A cross is eligible only when its originating closed candle is recent.
+    # Missing timestamps/age fail closed: they must not disable RANGE_SCALP.
+    cross_age = _number(ctx.get("vwap_cross_age_seconds"))
+    cross_max_age = _number(ctx.get("vwap_cross_max_age_seconds"), 2 * 900.0)
+    cross_time_valid = (
+        cross_age is not None and cross_age >= 0.0
+        and cross_max_age is not None and cross_max_age > 0.0
+        and cross_age <= cross_max_age
+    )
+    fresh_vwap_cross = cross_time_valid and bool(
+        ctx.get("fresh_ema9_vwap_cross") or ctx.get("fresh_ema50_vwap_cross")
+    )
     directional_vwap_cross = fresh_vwap_cross and (
         (side == "BUY" and cross_direction == "BULLISH")
         or (side == "SELL" and cross_direction == "BEARISH")
