@@ -3612,7 +3612,7 @@ class LiveTradeManager:
                         swing_levels = []
                     adaptive_target, target_reason = adaptive_range_target_price(
                         side, entry, atr, swing_levels)
-                    # Percentage objective is a PRICE move (0.25/0.50/1.00%), not ROE.
+                    # Percentage objective is a PRICE move (0.25/0.50/1.00/2.00%), not leveraged ROE.
                     # Use the last three completed candles as follow-through evidence.
                     _aligned_closed = 0
                     for _candle_idx in range(max(0, len(df_live) - 4), len(df_live) - 1):
