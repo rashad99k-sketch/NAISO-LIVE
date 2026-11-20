@@ -674,12 +674,27 @@ def tg_start(balance, mode):
     balance_text = f"{balance:.2f} USDT" if isinstance(balance, (int, float)) and math.isfinite(balance) else "UNAVAILABLE"
     send_once(f"🚀 <b>GGP Institutional</b>\n💼 Balance: {balance_text}\n⚙️ Mode: {html_escape(str(mode))}\n⚖️ Leverage policy: 20x\n🧠 Trade manager: Unified", "startup", 86400)
 
-def tg_entry(side, symbol, entry, sl, tp, score, reason, entry_type):
-    side_emoji = "🟢" if side == "BUY" else "🔴"
+def tg_entry(side, symbol, entry, sl, tp1, score, reason, entry_type,
+             tp2=None, qty=None, leverage=None, trade_id=None):
+    side_text = str(side).upper()
+    side_emoji = "🟢" if side_text == "BUY" else "🔴" if side_text == "SELL" else "⚪"
     safe_symbol = html_escape(str(symbol))
     safe_type = html_escape(str(entry_type))
-    safe_reason = html_escape(str(reason)[:100])
-    send_once(f"{side_emoji} <b>{html_escape(str(side))} {safe_type}</b>\n📊 {safe_symbol}\n💰 Entry: {entry:.8f}\n🛑 Structural SL: {sl:.8f}\n🎯 TP1: {tp:.8f}\n🧠 Score: {score}\n📌 {safe_reason}", f"entry_{symbol}", 60)
+    safe_reason = html_escape(str(reason)[:160])
+    parts = [
+        f"{side_emoji} <b>POSITION OPENED · {html_escape(side_text)} {safe_type}</b>",
+        f"📊 {safe_symbol}",
+        f"💰 Planned entry: {safe_float(entry):.8f}",
+        f"🛑 Structural SL: {safe_float(sl):.8f}",
+        f"🥇 TP1: {safe_float(tp1):.8f}",
+        f"🥈 TP2: {safe_float(tp2):.8f}" if tp2 is not None and safe_float(tp2) > 0 else "🥈 TP2: NOT SET",
+    ]
+    if qty is not None: parts.append(f"📦 Position quantity: {safe_float(qty):.8f}")
+    if leverage is not None: parts.append(f"⚖️ Leverage: {safe_float(leverage):.2f}x")
+    if score is not None: parts.append(f"🧠 Setup score: {html_escape(str(score))}")
+    if trade_id: parts.append(f"🔖 Trade ID: {html_escape(str(trade_id))}")
+    parts.append(f"📌 Setup: {safe_reason}")
+    send_once("\n".join(parts), f"entry_{trade_id or symbol}", 5)
 
 def tg_tp_hit(symbol, tp_level, pnl_pct=None, qty=None, fill_price=None, order_id=None,
               realized_pnl_usdt=None, pnl_source=None, side=None, entry_price=None):
@@ -712,23 +727,35 @@ def tg_sl_hit(symbol, pnl_pct=None, pnl_usdt=None, fill_price=None, order_id=Non
     send_once("\n".join(parts), f"sl_{symbol}_{order_id or 'verified'}", 30)
 
 def tg_close(symbol, pnl_pct, duration_min, side, close_reason=None, pnl_usdt=None,
-             entry_price=None, exit_price=None, pnl_source=None):
+              entry_price=None, exit_price=None, pnl_source=None,
+              total_qty=None, trade_id=None):
     reason = str(close_reason or "CLOSE").upper()
     if reason == "TP2": icon, title = "🥈", "TP2 VERIFIED · POSITION CLOSED"
     elif reason.startswith("RANGE_SCALP"): icon, title = "⚡", "RANGE SCALP · POSITION CLOSED"
     elif "STOP" in reason: icon, title = "🛑", "STOP / PROTECTIVE EXIT · POSITION CLOSED"
     elif "STRICT" in reason or "THESIS" in reason or "EMERGENCY" in reason: icon, title = "⛔", "STRICT EXIT VERIFIED · POSITION CLOSED"
-    else: icon, title = (("✅" if pnl_usdt is not None and pnl_usdt >= 0 else "❌") if pnl_usdt is not None else "⚪"), "POSITION CLOSED"
-    parts = [f"{icon} <b>{title}</b>", f"📊 {html_escape(str(symbol))} ({html_escape(str(side))})"]
+    else: icon, title = "📋", "POSITION CLOSED"
+    if pnl_usdt is None:
+        outcome = "RESULT: PNL UNAVAILABLE — NOT CLASSIFIED"
+    elif pnl_usdt > 0:
+        outcome = "RESULT: PROFIT"
+    elif pnl_usdt < 0:
+        outcome = "RESULT: LOSS"
+    else:
+        outcome = "RESULT: BREAKEVEN"
+    parts = [f"{icon} <b>{title}</b>", f"📊 {html_escape(str(symbol))} ({html_escape(str(side))})",
+             f"<b>{outcome}</b>"]
     if pnl_usdt is not None:
         parts.append(f"💵 Total realized PnL: {safe_float(pnl_usdt):+.4f} USDT")
         if pnl_pct is not None: parts.append(f"📈 Total realized ROE: {safe_float(pnl_pct):+.2f}%")
     else: parts.append("💵 Total realized PnL: UNAVAILABLE — exchange data incomplete")
     if entry_price and safe_float(entry_price) > 0: parts.append(f"Entry: {safe_float(entry_price):.8f}")
     if exit_price and safe_float(exit_price) > 0: parts.append(f"Final exit fill: {safe_float(exit_price):.8f}")
+    if total_qty is not None: parts.append(f"📦 Original position quantity: {safe_float(total_qty):.8f}")
     parts.extend([f"⏱ Duration: {safe_float(duration_min):.0f} min", f"Reason: {html_escape(reason)}"])
     if pnl_source: parts.append(f"🧾 Source: {html_escape(str(pnl_source))}")
-    send_once("\n".join(parts), f"close_{symbol}_{reason}", 10)
+    if trade_id: parts.append(f"🔖 Trade ID: {html_escape(str(trade_id))}")
+    send_once("\n".join(parts), f"close_{trade_id or f'{symbol}_{reason}'}", 1)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{html_escape(str(error_type))}]\n{html_escape(str(err_msg)[:200])}", f"err_{error_type}_{str(err_msg)[:50]}", 60)
@@ -6338,7 +6365,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
         return True
 
     sym = normalize_symbol(symbol)
@@ -6497,7 +6524,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _persist_trade_journal_snapshot(force=True)
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
         time.sleep(1)
         sync_position_state(symbol)
         return True
@@ -7974,7 +8001,8 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                      (time.time()-safe_float(STATE.get("entry_time"), time.time()))/60.0,
                      STATE.get("side"), close_reason=reason,
                      pnl_usdt=pnl_usdt if pnl_known else None,
-                     entry_price=entry, exit_price=close_price, pnl_source=pnl_source)
+                     entry_price=entry, exit_price=close_price, pnl_source=pnl_source,
+                      total_qty=initial_qty, trade_id=trade_id)
         except Exception:
             pass
 
@@ -9314,7 +9342,7 @@ def health():
         "proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}).get("state", "UNKNOWN"),
         "trade_management_authority": "TradeManagementBoard / LiveTradeManager",
         "trade_management_events": len(TRADE_MANAGEMENT_LOG),
-        "telegram": {"configured": TELEGRAM_NOTIFIER.configured},
+        "telegram": TELEGRAM_NOTIFIER.status(),
     })
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
