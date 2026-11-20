@@ -2468,6 +2468,10 @@ class TradeManagementBoard:
                 "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
                 "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
+                "fresh_ema9_vwap_cross": bool(ctx.get("fresh_ema9_vwap_cross", False)),
+                "fresh_ema50_vwap_cross": bool(ctx.get("fresh_ema50_vwap_cross", False)),
+                "vwap_cross_direction": str(ctx.get("vwap_cross_direction") or ""),
+                "vwap_cross_trigger": str(ctx.get("vwap_cross_trigger") or "NONE"),
                 "market_regime": str(ctx.get("regime") or "UNKNOWN"),
                 "tp1_hit": bool(ctx.get("tp1_hit")),
                 "tp2_hit": bool(ctx.get("tp2_hit")),
@@ -3269,6 +3273,7 @@ class LiveTradeManager:
             f"BE={bool(STATE.get('be_done'))} Trail(local)={bool(STATE.get('trail_activated'))} | "
             f"ADX={safe_float(STATE.get('adx_live')):.1f} DI+={safe_float(STATE.get('di_plus_live')):.1f} "
             f"DI-={safe_float(STATE.get('di_minus_live')):.1f} Continuation={safe_float(STATE.get('continuation_probability'),0.5):.2f} | "
+            f"VWAPCross={STATE.get('vwap_cross_trigger', 'UNKNOWN')} Direction={STATE.get('vwap_cross_direction', 'UNKNOWN')} | "
             f"State={state_str} RecoveryHold={bool(STATE.get('recovery_hold'))}",
             "INFO", debounce_key=f"profit_brain_status_{symbol}", debounce_sec=15
         )
