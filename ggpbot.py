@@ -2436,7 +2436,7 @@ class InstitutionalTradeBrain:
 # ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
 from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
-                              tp2_reassessment, thesis_failure_action,
+                              tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE)
 
@@ -2530,6 +2530,40 @@ class TradeManagementBoard:
             return decision(TradeDecisionType.HOLD, "exchange_execution_or_recovery_unresolved")
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
+
+        # Unified danger assessment consumes independent evidence from the existing
+        # smart-money, momentum, DI/ADX, continuation, EMA structure, liquidity,
+        # order-block/FVG and support/resistance engines.
+        exit_risk = evaluate_exit_risk(ctx)
+        STATE["exit_risk_snapshot"] = dict(exit_risk)
+        if exit_risk.get("action") == "HARD_EXIT":
+            return decision(
+                TradeDecisionType.THESIS_FAILURE_EXIT,
+                "PROFIT_BRAIN_HARD_RISK:" + ",".join(exit_risk.get("reasons", ())),
+                close_reason="PROFIT_DANGER_HARD_EXIT",
+                risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
+            )
+        if exit_risk.get("action") == "CLOSE_PROFIT":
+            return decision(
+                TradeDecisionType.FULL_CLOSE,
+                "PROFIT_DANGER_LOCK:" + ",".join(exit_risk.get("reasons", ())),
+                close_reason="PROFIT_DANGER_LOCK",
+                risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
+            )
+        if exit_risk.get("action") == "LOCK_PROFIT" and entry > 0 and current > 0 and atr > 0:
+            fee_buffer = max(entry * 0.0010, atr * 0.10)
+            candidate_stop = (
+                max(entry + fee_buffer, current - 0.50 * atr)
+                if side == "BUY" else
+                min(entry - fee_buffer, current + 0.50 * atr)
+            )
+            if (side == "BUY" and candidate_stop < current) or (side == "SELL" and candidate_stop > current):
+                return decision(
+                    TradeDecisionType.LOCK_PROFITS,
+                    "PROFIT_DANGER_TIGHTEN:" + ",".join(exit_risk.get("reasons", ())),
+                    new_sl=candidate_stop, risk_score=exit_risk.get("score"),
+                    risk_groups=exit_risk.get("groups"),
+                )
 
         # A failed breakout is supporting thesis evidence, not an independent
         # exit signal. Require a fresh same-side event and two adjacent closed
@@ -3889,6 +3923,26 @@ class LiveTradeManager:
             "remaining_qty": safe_float(STATE.get("remaining_qty"), STATE.get("qty", 0.0)),
             "initial_qty": safe_float(STATE.get("initial_qty"), STATE.get("qty", 0.0)),
             "smart_money": smart_money, "momentum": momentum,
+            "entry_order_block": dict(STATE.get("entry_order_block") or {}),
+            "entry_fvg": dict(STATE.get("entry_fvg") or {}),
+            "entry_liquidity": dict(STATE.get("entry_liquidity") or {}),
+            "entry_golden_zone": dict(STATE.get("entry_golden_zone") or {}),
+            "distribution_risk": safe_float(smart_money.get("distribution_risk"), 0.0),
+            "exhaustion_risk": safe_float(momentum.get("exhaustion_risk"), 0.0),
+            "climax_risk": safe_float(momentum.get("climax_risk"), 0.0),
+            "momentum_decay": bool(momentum.get("momentum_decay", False)),
+            "flow_bias": str(momentum.get("flow_bias") or "UNKNOWN"),
+            "counter_pressure": safe_float(STATE.get("counter_pressure"), 0.0),
+            "reclaim_risk": safe_float(STATE.get("reclaim_risk"), 0.0),
+            "hold_quality": str(STATE.get("hold_quality") or "UNKNOWN"),
+            "trend_strength": safe_float(STATE.get("trend_strength"), 0.0),
+            "structure_aligned": bool(STATE.get("structure_aligned", False)),
+            "structure_broken": bool(STATE.get("structure_broken", False)),
+            "structural_invalidation": bool(STATE.get("structural_invalidation", False)),
+            "opposing_zone_distance_atr": safe_float(STATE.get("opposing_zone_distance_atr"), None),
+            "opposing_zone_rejection": bool(STATE.get("opposing_zone_rejection", False)),
+            "liquidity": dict(STATE.get("entry_liquidity") or {}),
+            "zone_event": str((STATE.get("market_intelligence") or {}).get("zone_event") or "UNKNOWN"),
             "adx": adx_now, "adx_slope": safe_float(STATE.get("adx_slope")),
             "di_plus": plus_di, "di_minus": minus_di,
             "regime": STATE.get("market_regime", "UNKNOWN"),
@@ -4210,7 +4264,7 @@ class LiveTradeManager:
                                                    remaining_qty=0.0, fill_price=fill_price, order_id=order_id,
                                                    realized_pnl_usdt=tp2_realized,
                                                    pnl_source=STATE.get("last_close_order_pnl_source", STATE.get("last_close_pnl_source")))
-                elif close_reason == "RANGE_SCALP_TARGET":
+                elif close_reason in {"RANGE_SCALP_TARGET", "SCALP_TARGET"}:
                     record_trade_management_event("RANGE_SCALP_VERIFIED", "PAPER_SIMULATED" if PAPER_MODE else "EXCHANGE_VERIFIED",
                                                    log_level="SUCCESS", **common, qty_closed=filled,
                                                    remaining_qty=0.0, range_target=STATE.get("range_target_price"),
@@ -6350,6 +6404,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 "failed_breakout_streak": 0,
                 "failed_breakout_thesis_credit_applied": False,
             },
+            "entry_order_block": dict(institutional_entry_ctx.get("order_block") or {}),
+            "entry_fvg": dict(institutional_entry_ctx.get("fvg") or {}),
+            "entry_liquidity": dict(institutional_entry_ctx.get("liquidity") or {}),
+            "entry_golden_zone": dict(institutional_entry_ctx.get("golden_zone") or {}),
             "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
             "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
             "roe_pct": 0.0, "mark_price": price, "initial_margin": margin,
@@ -6470,6 +6528,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 "failed_breakout_streak": 0,
                 "failed_breakout_thesis_credit_applied": False,
             },
+            "entry_order_block": dict(institutional_entry_ctx.get("order_block") or {}),
+            "entry_fvg": dict(institutional_entry_ctx.get("fvg") or {}),
+            "entry_liquidity": dict(institutional_entry_ctx.get("liquidity") or {}),
+            "entry_golden_zone": dict(institutional_entry_ctx.get("golden_zone") or {}),
             "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
             "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
             "roe_pct": 0.0, "mark_price": price, "initial_margin": margin,
@@ -10945,6 +11007,10 @@ def smart_opportunity_selection():
                 "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
                 "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
                 "support_resistance": dict(item.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
+                "order_block": dict(item.get("order_block") or {}),
+                "fvg": dict(item.get("fvg") or {}),
+                "liquidity": dict(item.get("liquidity") or {}),
+                "golden_zone": dict(item.get("golden_zone") or {}),
                 "entry_behavior_confidence": safe_float(item.get("entry_behavior_confidence", market_intelligence.get("confidence")), 0.0),
                 "entry_behavior_reasons": list(item.get("entry_behavior_reasons") or market_intelligence.get("reason_codes") or []),
                 "market_intelligence": dict(market_intelligence),
