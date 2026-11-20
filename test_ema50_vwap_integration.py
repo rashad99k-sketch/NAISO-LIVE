@@ -32,8 +32,11 @@ def test_ema50_vwap_is_added_without_changing_legacy_ema9_cross_contract():
     assert result is not None
     assert result["cross"] == result["cross_ema9"]
     assert result["cross_ema50"] in (None, "BULLISH", "BEARISH")
-    assert result["cross_any"] == (result["cross_ema9"] or result["cross_ema50"])
-    assert result["cross_trigger"] in ("EMA9_VWAP", "EMA50_VWAP", "NONE")
+    expected_conflict = bool(result["cross_ema9"] and result["cross_ema50"]
+                             and result["cross_ema9"] != result["cross_ema50"])
+    assert result["cross_conflict"] is expected_conflict
+    assert result["cross_any"] == (None if expected_conflict else (result["cross_ema9"] or result["cross_ema50"]))
+    assert result["cross_trigger"] in ("EMA9_VWAP", "EMA50_VWAP", "NONE", "CONFLICT")
     assert result["ema50"] is not None
     assert result["ema50_direction"] in ("BUY", "SELL", "NEUTRAL")
     assert result["candle_timestamp"] == int(frame.timestamp.iloc[-1])
