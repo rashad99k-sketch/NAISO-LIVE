@@ -285,14 +285,18 @@ class MomentumFlowEngine:
         ema_fast = close.ewm(span=9).mean()
         ema_slow = close.ewm(span=21).mean()
         momentum_spread = ((ema_fast - ema_slow) / ema_slow.replace(0, np.nan)) * 100
-        norm_spread = max(-2.5, min(2.5, momentum_spread.iloc[-1])) / 2.5
-        momentum_health = 50 + (norm_spread * 50)
-        continuation_strength = min(100, max(0, abs(momentum_spread.iloc[-1]) * 20))
-        trend_expansion = momentum_spread.iloc[-1] > 0.35
-        momentum_decay = momentum_spread.iloc[-1] < 0.05
-        climax_risk = max(0, rsi.iloc[-1] - 70) * 3
+        # Direction-neutral strength; flow_bias below carries the sign.
+        # Signed spread previously mislabeled strong bearish trends as weak.
+        abs_spread = abs(float(momentum_spread.iloc[-1]))
+        norm_strength = min(2.5, abs_spread) / 2.5
+        momentum_health = 50 + (norm_strength * 50)
+        continuation_strength = min(100, max(0, abs_spread * 20))
+        trend_expansion = abs_spread > 0.35
+        momentum_decay = abs_spread < 0.05
+        rsi_now = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+        climax_risk = max(0.0, rsi_now - 70.0, 30.0 - rsi_now) * 3.0
         exhaustion_risk = max(0, 40 - momentum_health)
-        greed_state = (rsi.iloc[-1] > 75) and trend_expansion
+        greed_state = (rsi_now > 75) and trend_expansion
         if momentum_spread.iloc[-1] > 0:
             flow_bias = "BUY"
         elif momentum_spread.iloc[-1] < 0:
@@ -311,6 +315,7 @@ class MomentumFlowEngine:
             "trend_expansion": bool(trend_expansion),
             "momentum_decay": bool(momentum_decay),
             "climax_risk": safe_float_val(climax_risk),
+            "rsi_value": safe_float_val(rsi_now),
             "exhaustion_risk": safe_float_val(exhaustion_risk),
             "greed_state": bool(greed_state),
             "flow_bias": flow_bias
