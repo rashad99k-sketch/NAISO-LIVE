@@ -379,16 +379,17 @@ class TradeStateMachine:
 
         # PANIC_EXIT
         if (bias_detailed in ("STRONG_SELL", "STRONG_BUY") and
-            dist_risk > 75 and mom_health < 15 and cont_strength < 20):
+            dist_risk > 75 and cont_strength < 20 and decay
+            and (direction not in ("BUY", "SELL") or smart_opposed)):
             new_state = "PANIC_EXIT"
-        # MOMENTUM_COLLAPSE
-        elif mom_health < 15 and cont_strength < 25 and decay:
+        # MOMENTUM_COLLAPSE uses directional strength/decay, not signed health.
+        elif cont_strength < 25 and decay and (direction not in ("BUY", "SELL") or smart_opposed):
             new_state = "MOMENTUM_COLLAPSE"
         # LIQUIDITY_EXHAUSTION
         elif exh_risk > 70 or climax > 75:
             new_state = "LIQUIDITY_EXHAUSTION"
         # PROFIT_DEFENSE
-        elif adverse_smart_flow and dist_risk > 50 and mom_health < 30:
+        elif adverse_smart_flow and dist_risk > 50 and cont_strength < 30:
             new_state = "PROFIT_DEFENSE"
         # Distribution is adverse only when institutional flow opposes this position.
         elif adverse_smart_flow and dist_risk > 60:
