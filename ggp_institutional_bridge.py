@@ -686,6 +686,10 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         liquidity_quality = max(0.0, min(1.0, rank_number(liq.get("confidence")) / 100.0))
         analysis_priority = max(0.0, min(100.0, rank_number(prior.get("analysis_priority_score")))) / 100.0
         proximity = prior.get("ema9_vwap_proximity") if isinstance(prior.get("ema9_vwap_proximity"), dict) else {}
+        proximity = dict(proximity)
+        proximity_observed_at = rank_number(proximity.get("updated_at"), 0.0)
+        proximity_observation_age = max(0.0, time.time() - proximity_observed_at) if proximity_observed_at else float("inf")
+        proximity["observation_age_seconds"] = proximity_observation_age
         cross_direction = str(proximity.get("cross_any") or "").upper()
         selected_side = str(prior.get("side") or "").upper()
         expected_cross = "BULLISH" if selected_side == "BUY" else "BEARISH" if selected_side == "SELL" else ""
