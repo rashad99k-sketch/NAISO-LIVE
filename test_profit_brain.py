@@ -32,6 +32,30 @@ def test_range_scalp_requires_multiple_weak_market_evidence():
     assert "low_relative_volume" in evidence
 
 
+def test_fresh_directional_vwap_cross_blocks_one_shot_scalp_classification():
+    mode, reason, evidence = classify_profit_mode({
+        "side": "BUY", "regime": "CHOPPY", "trade_state": "RANGE_CHOP",
+        "adx": 15, "adx_slope": -1.0, "continuation_probability": 0.38,
+        "di_plus": 18, "di_minus": 17, "volume_ratio": 0.62,
+        "momentum_strength": 20,
+        "fresh_ema9_vwap_cross": True, "vwap_cross_direction": "BULLISH",
+    })
+    assert mode == STANDARD_MODE
+    assert "fresh_directional_vwap_cross" in reason
+    assert "fresh_directional_ema_vwap_cross" in evidence
+
+
+def test_opposite_direction_vwap_cross_does_not_veto_range_classification():
+    mode, _, _ = classify_profit_mode({
+        "side": "BUY", "regime": "CHOPPY", "trade_state": "RANGE_CHOP",
+        "adx": 15, "adx_slope": -1.0, "continuation_probability": 0.38,
+        "di_plus": 18, "di_minus": 17, "volume_ratio": 0.62,
+        "momentum_strength": 20,
+        "fresh_ema50_vwap_cross": True, "vwap_cross_direction": "BEARISH",
+    })
+    assert mode == RANGE_MODE
+
+
 def test_low_volume_alone_does_not_activate_range_scalp():
     mode, _, _ = classify_profit_mode({
         "side": "SELL", "regime": "UNKNOWN", "trade_state": "UNKNOWN",
