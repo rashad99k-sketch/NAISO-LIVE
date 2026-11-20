@@ -424,15 +424,23 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         score += 1
         groups.add("INSTITUTIONAL_FLOW")
         reasons.append("institutional_bias_opposed")
-    if distribution >= 60:
+    # Distribution pressure is adverse to longs; for shorts the side-aligned
+    # institutional SELL bias is continuation evidence, not an exit warning.
+    distribution_adverse = distribution >= 60 and side == "BUY"
+    if distribution_adverse:
         score += 1
         groups.add("INSTITUTIONAL_FLOW")
         reasons.append("distribution_risk_high")
-    if exhaustion >= 60 or climax >= 60 or momentum_decay:
+    rsi_value = _number(momentum.get("rsi_value", ctx.get("rsi_value")))
+    adverse_climax = (
+        (side == "BUY" and ((rsi_value is not None and rsi_value >= 75) or climax >= 60))
+        or (side == "SELL" and ((rsi_value is not None and rsi_value <= 25) or (climax >= 60 and rsi_value is None)))
+    )
+    if exhaustion >= 60 or adverse_climax or momentum_decay:
         score += 1
         groups.add("MOMENTUM")
         if exhaustion >= 60: reasons.append("momentum_exhaustion_high")
-        if climax >= 60: reasons.append("momentum_climax_high")
+        if adverse_climax: reasons.append("directional_momentum_climax")
         if momentum_decay: reasons.append("momentum_decay")
 
     continuation = _number(ctx.get("continuation_probability"))
@@ -444,6 +452,21 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         score += 1
         groups.add("CONTINUATION")
         reasons.append("continuation_or_counter_pressure_deteriorated")
+
+    cross_direction = str(ctx.get("vwap_cross_direction") or "").upper()
+    cross_age = _number(ctx.get("vwap_cross_age_seconds"))
+    cross_max_age = _number(ctx.get("vwap_cross_max_age_seconds"))
+    cross_fresh = (
+        bool(ctx.get("fresh_ema9_vwap_cross") or ctx.get("fresh_ema50_vwap_cross"))
+        and cross_age is not None and cross_age >= 0
+        and cross_max_age is not None and cross_max_age > 0
+        and cross_age <= cross_max_age
+    )
+    expected_cross = "BULLISH" if side == "BUY" else "BEARISH"
+    if cross_fresh and cross_direction and cross_direction != expected_cross:
+        score += 2
+        groups.add("CROSS_STRUCTURE")
+        reasons.append("fresh_opposite_ema_vwap_cross")
 
     ema_state = str(ctx.get("ema_state") or "").upper()
     if ema_state == "EMA50_BREAK_CONFIRMED":
