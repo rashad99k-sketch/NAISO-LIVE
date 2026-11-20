@@ -39,6 +39,7 @@ def test_fresh_directional_vwap_cross_blocks_one_shot_scalp_classification():
         "di_plus": 18, "di_minus": 17, "volume_ratio": 0.62,
         "momentum_strength": 20,
         "fresh_ema9_vwap_cross": True, "vwap_cross_direction": "BULLISH",
+        "vwap_cross_age_seconds": 60, "vwap_cross_max_age_seconds": 1800,
     })
     assert mode == STANDARD_MODE
     assert "fresh_directional_vwap_cross" in reason
