@@ -115,6 +115,23 @@ def test_continuation_engine_uses_early_alignment_and_expires_old_retests():
     assert "evaluate_early_trend_timing(x, side)" in continuation
 
 
+
+def test_vwap_cross_diagnostics_are_exposed_for_both_fast_and_slow_emas():
+    result = evaluate_early_trend_timing(make_starting_trend("BUY"), "BUY")
+    assert "fresh_ema9_vwap_cross" in result
+    assert "fresh_ema50_vwap_cross" in result
+    assert result["cross_trigger"] in {"EMA9_VWAP", "EMA50_VWAP", "EMA9_EMA20", "NONE"}
+    assert isinstance(result["fresh_ema9_vwap_cross"], bool)
+    assert isinstance(result["fresh_ema50_vwap_cross"], bool)
+
+
+def test_invalid_data_does_not_authorize_vwap_cross_entry():
+    frame = make_starting_trend("BUY").copy()
+    frame.loc[frame.index[-1], "volume"] = -1.0
+    result = evaluate_early_trend_timing(frame, "BUY")
+    assert result["valid"] is False
+    assert result["status"] == "WAITING_FOR_CONFIRMATION"
+
 def test_invalid_side_fails_closed():
     result = evaluate_early_trend_timing(make_starting_trend(), "HOLD")
     assert result["valid"] is False
