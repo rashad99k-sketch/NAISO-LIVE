@@ -11,7 +11,7 @@ from math import isfinite
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
-RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
+RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00, 2.00)
 RANGE_MODE = "RANGE_SCALP"
 TREND_MODE = "TREND_RIDE"
 STANDARD_MODE = "TWO_STAGE_50_50"
@@ -210,11 +210,13 @@ def target_reached(side: str, current_price: float, target_price: float) -> bool
 
 
 def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
-    """Select a 0.25/0.50/1.00% PRICE move for a proven range/scalp trade.
+    """Select a 0.25/0.50/1.00/2.00% PRICE move from simple, observable evidence.
 
-    0.25% is the defensive default for weak or thin conditions. 0.50% requires
-    confirmed directional response. 1.00% requires strong multi-candle,
-    volume, ADX and DI agreement. These are price moves, not leveraged ROE.
+    Targets are price movement percentages, not leveraged ROE. Weak/thin
+    conditions stay at 0.25%; moderate follow-through earns 0.50%; strong
+    directional evidence earns 1.00%. The exceptional 2.00% extension is
+    reserved for a confirmed expansion with broad agreement, never a single
+    high score or one oversized candle.
     """
     ctx = context if isinstance(context, dict) else {}
     adx = _number(ctx.get("adx"), 0.0) or 0.0
@@ -226,12 +228,30 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     low_liquidity = bool(ctx.get("thin_liquidity", False)) or volume_ratio <= 0.75
     if low_liquidity or adx < 18.0 or continuation < 0.45:
         return RANGE_PROFIT_TARGETS_PCT[0], "weak_or_thin_market_conservative_0.25pct"
-    di_aligned = (plus > minus) if side == "BUY" and plus is not None and minus is not None else (minus > plus) if side == "SELL" and plus is not None and minus is not None else False
-    aligned_count = _number(ctx.get("aligned_closed_candles"), 0.0) or 0.0
+
+    di_known = plus is not None and minus is not None
+    di_aligned = ((plus > minus) if side == "BUY" else (minus > plus)) if di_known and side in {"BUY", "SELL"} else False
+    aligned_count = int(_number(ctx.get("aligned_closed_candles"), 0.0) or 0)
     adverse_rejection = bool(ctx.get("adverse_rejection", False))
-    if aligned_count >= 2 and continuation >= 0.72 and adx >= 22 and volume_ratio >= 1.20 and di_aligned and not adverse_rejection:
+    momentum = _number(ctx.get("momentum_strength"), 0.0) or 0.0
+    trend_expansion = bool(ctx.get("trend_expansion", False))
+    regime = str(ctx.get("regime") or "").upper()
+    trade_state = str(ctx.get("trade_state") or "").upper()
+    expansion_confirmed = trend_expansion or regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or trade_state in {"TREND_RIDE", "EXPANSION"}
+
+    # 2% is an exceptional extension, not the routine scalp objective.
+    # It requires at least three aligned completed candles and independent
+    # momentum, volume, ADX, DI and regime/expansion confirmation.
+    if (aligned_count >= 3 and continuation >= 0.85 and adx >= 28.0
+            and volume_ratio >= 1.50 and di_aligned and momentum >= 70.0
+            and expansion_confirmed and not adverse_rejection and not low_liquidity):
+        return RANGE_PROFIT_TARGETS_PCT[3], "exceptional_expansion_2.00pct"
+
+    if (aligned_count >= 2 and continuation >= 0.72 and adx >= 22.0
+            and volume_ratio >= 1.20 and di_aligned and not adverse_rejection):
         return RANGE_PROFIT_TARGETS_PCT[2], "strong_closed_candle_follow_through_1.00pct"
-    if aligned_count >= 2 and continuation >= 0.55 and adx >= 18 and volume_ratio >= 0.85 and di_aligned and not adverse_rejection:
+    if (aligned_count >= 2 and continuation >= 0.55 and adx >= 18.0
+            and volume_ratio >= 0.85 and di_aligned and not adverse_rejection):
         return RANGE_PROFIT_TARGETS_PCT[1], "moderate_follow_through_0.50pct"
     return RANGE_PROFIT_TARGETS_PCT[0], "weak_follow_through_conservative_0.25pct"
 
