@@ -40,3 +40,19 @@ def test_final_close_reports_total_realized_pnl_and_native_stop_details():
     assert "pnl_usdt=pnl_usdt if pnl_known else None" in SOURCE
     assert "aggregate_realized = prior_realized + safe_float(realized, 0.0)" in SOURCE
     assert "tg_sl_hit(symbol, roe_pct, pnl_usdt=total_realized" in SOURCE
+
+def test_telegram_entry_report_includes_both_targets_and_both_entry_paths():
+    assert 'f"🥇 TP1: {safe_float(tp1):.8f}"' in SOURCE
+    assert 'f"🥈 TP2: {safe_float(tp2):.8f}"' in SOURCE
+    assert SOURCE.count("tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id") == 2
+
+def test_telegram_final_close_classifies_outcome_and_deduplicates_by_trade():
+    assert 'outcome = "RESULT: PROFIT"' in SOURCE
+    assert 'outcome = "RESULT: LOSS"' in SOURCE
+    assert 'outcome = "RESULT: BREAKEVEN"' in SOURCE
+    assert 'outcome = "RESULT: PNL UNAVAILABLE — NOT CLASSIFIED"' in SOURCE
+    assert "total_qty=initial_qty, trade_id=trade_id" in SOURCE
+    assert 'close_key = str(trade_id or (str(symbol) + "_" + reason))' in SOURCE
+
+def test_telegram_health_exposes_delivery_counters_without_credentials():
+    assert '"telegram": TELEGRAM_NOTIFIER.status()' in SOURCE
