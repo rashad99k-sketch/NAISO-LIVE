@@ -214,9 +214,8 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
 
     Targets are price movement percentages, not leveraged ROE. Weak/thin
     conditions stay at 0.25%; moderate follow-through earns 0.50%; strong
-    directional evidence earns 1.00%. The exceptional 2.00% extension is
-    reserved for a confirmed expansion with broad agreement, never a single
-    high score or one oversized candle.
+    directional evidence earns 1.00%. Larger directional moves belong to the
+    existing trend-mode TP2 path, not the range-scalp target selector.
     """
     ctx = context if isinstance(context, dict) else {}
     adx = _number(ctx.get("adx"), 0.0) or 0.0
@@ -233,12 +232,6 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     di_aligned = ((plus > minus) if side == "BUY" else (minus > plus)) if di_known and side in {"BUY", "SELL"} else False
     aligned_count = int(_number(ctx.get("aligned_closed_candles"), 0.0) or 0)
     adverse_rejection = bool(ctx.get("adverse_rejection", False))
-    momentum = _number(ctx.get("momentum_strength"), 0.0) or 0.0
-    trend_expansion = bool(ctx.get("trend_expansion", False))
-    regime = str(ctx.get("regime") or "").upper()
-    trade_state = str(ctx.get("trade_state") or "").upper()
-    expansion_confirmed = trend_expansion or regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or trade_state in {"TREND_RIDE", "EXPANSION"}
-
     if (aligned_count >= 2 and continuation >= 0.72 and adx >= 22.0
             and volume_ratio >= 1.20 and di_aligned and not adverse_rejection):
         return RANGE_PROFIT_TARGETS_PCT[2], "strong_closed_candle_follow_through_1.00pct"
