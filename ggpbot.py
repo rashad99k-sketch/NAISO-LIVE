@@ -3406,18 +3406,34 @@ class LiveTradeManager:
                     now_ms=int(now * 1000),
                 )
                 if isinstance(_cross_snapshot, dict):
+                    _cross_snapshot = dict(_cross_snapshot)
+                    _cross_ts_ms = safe_float(_cross_snapshot.get("candle_timestamp"), 0.0)
+                    _cross_frame_seconds = float(_timeframe_seconds(INTERVAL))
+                    _cross_age = max(0.0, float(now) - (_cross_ts_ms / 1000.0 + _cross_frame_seconds))
+                    _cross_max_age = 2.0 * _cross_frame_seconds
+                    _cross_event = bool(_cross_snapshot.get("cross_ema9") or _cross_snapshot.get("cross_ema50"))
+                    _cross_snapshot.update({
+                        "cross_age_seconds": _cross_age if _cross_event else None,
+                        "cross_max_age_seconds": _cross_max_age,
+                        "timeframe_seconds": _cross_frame_seconds,
+                        "cross_fresh": bool(_cross_event and _cross_age <= _cross_max_age),
+                    })
                     STATE["vwap_cross_snapshot"] = dict(_cross_snapshot)
-                    STATE["fresh_ema9_vwap_cross"] = bool(_cross_snapshot.get("cross_ema9"))
-                    STATE["fresh_ema50_vwap_cross"] = bool(_cross_snapshot.get("cross_ema50"))
+                    STATE["fresh_ema9_vwap_cross"] = bool(_cross_snapshot.get("cross_ema9") and _cross_snapshot.get("cross_fresh"))
+                    STATE["fresh_ema50_vwap_cross"] = bool(_cross_snapshot.get("cross_ema50") and _cross_snapshot.get("cross_fresh"))
                     STATE["vwap_cross_direction"] = str(_cross_snapshot.get("cross_any") or "")
                     STATE["vwap_cross_trigger"] = str(_cross_snapshot.get("cross_trigger") or "NONE")
                     STATE["vwap_cross_candle_timestamp"] = int(_cross_snapshot.get("candle_timestamp") or 0)
+                    STATE["vwap_cross_age_seconds"] = _cross_snapshot.get("cross_age_seconds")
+                    STATE["vwap_cross_max_age_seconds"] = _cross_max_age
                 else:
                     STATE["vwap_cross_snapshot"] = {}
                     STATE["fresh_ema9_vwap_cross"] = False
                     STATE["fresh_ema50_vwap_cross"] = False
                     STATE["vwap_cross_direction"] = ""
                     STATE["vwap_cross_trigger"] = "UNKNOWN"
+                    STATE["vwap_cross_age_seconds"] = None
+                    STATE["vwap_cross_max_age_seconds"] = 2.0 * float(_timeframe_seconds(INTERVAL))
             except Exception as _cross_error:
                 STATE["vwap_cross_snapshot"] = {}
                 STATE["fresh_ema9_vwap_cross"] = False
@@ -3552,6 +3568,8 @@ class LiveTradeManager:
                 "fresh_ema50_vwap_cross": bool(STATE.get("fresh_ema50_vwap_cross", False)),
                 "vwap_cross_direction": str(STATE.get("vwap_cross_direction") or ""),
                 "vwap_cross_trigger": str(STATE.get("vwap_cross_trigger") or "NONE"),
+                "vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds"),
+                "vwap_cross_max_age_seconds": STATE.get("vwap_cross_max_age_seconds"),
             }
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
             current_mode = str(STATE.get("profit_mode") or STANDARD_MODE)
@@ -3885,6 +3903,8 @@ class LiveTradeManager:
             "vwap_cross_direction": str(STATE.get("vwap_cross_direction") or ""),
             "vwap_cross_trigger": str(STATE.get("vwap_cross_trigger") or "NONE"),
             "vwap_cross_snapshot": dict(STATE.get("vwap_cross_snapshot") or {}),
+            "vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds"),
+            "vwap_cross_max_age_seconds": STATE.get("vwap_cross_max_age_seconds"),
             "entry_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
             "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
             "entry_mode_confidence": safe_float(STATE.get("entry_behavior_confidence"), 0.0),
