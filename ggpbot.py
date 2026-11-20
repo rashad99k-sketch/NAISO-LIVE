@@ -2543,69 +2543,70 @@ class TradeManagementBoard:
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
 
-        # Unified danger assessment consumes independent evidence from the existing
-        # smart-money, momentum, DI/ADX, continuation, EMA structure, liquidity,
-        # order-block/FVG and support/resistance engines.
-        exit_risk = evaluate_exit_risk(ctx)
-        STATE["exit_risk_snapshot"] = dict(exit_risk)
-        record_trade_management_event(
-            "PROFIT_RISK_ASSESSMENT", exit_risk.get("action", "HOLD"),
-            dedupe_key=f"profit_risk:{ctx.get('symbol')}:{ctx.get('side')}:{exit_risk.get('action')}:{exit_risk.get('score')}",
-            dedupe_seconds=10, symbol=ctx.get("symbol"), side=side,
-            risk_score=exit_risk.get("score"), risk_groups=list(exit_risk.get("groups") or []),
-            reasons=list(exit_risk.get("reasons") or ()), roe_pct=roe,
-        )
-        if exit_risk.get("action") == "HARD_EXIT":
-            return decision(
-                TradeDecisionType.THESIS_FAILURE_EXIT,
-                "PROFIT_BRAIN_HARD_RISK:" + ",".join(exit_risk.get("reasons", ())),
-                close_reason="PROFIT_DANGER_HARD_EXIT",
-                risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
+        if ctx.get("indicator_decisions_allowed", True):
+            # Unified danger assessment consumes independent evidence from the existing
+            # smart-money, momentum, DI/ADX, continuation, EMA structure, liquidity,
+            # order-block/FVG and support/resistance engines.
+            exit_risk = evaluate_exit_risk(ctx)
+            STATE["exit_risk_snapshot"] = dict(exit_risk)
+            record_trade_management_event(
+                "PROFIT_RISK_ASSESSMENT", exit_risk.get("action", "HOLD"),
+                dedupe_key=f"profit_risk:{ctx.get('symbol')}:{ctx.get('side')}:{exit_risk.get('action')}:{exit_risk.get('score')}",
+                dedupe_seconds=10, symbol=ctx.get("symbol"), side=side,
+                risk_score=exit_risk.get("score"), risk_groups=list(exit_risk.get("groups") or []),
+                reasons=list(exit_risk.get("reasons") or ()), roe_pct=roe,
             )
-        if exit_risk.get("action") == "CLOSE_PROFIT":
-            return decision(
-                TradeDecisionType.FULL_CLOSE,
-                "PROFIT_DANGER_LOCK:" + ",".join(exit_risk.get("reasons", ())),
-                close_reason="PROFIT_DANGER_LOCK",
-                risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
-            )
-        if exit_risk.get("action") == "LOCK_PROFIT" and entry > 0 and current > 0 and atr > 0:
-            fee_buffer = max(entry * 0.0010, atr * 0.10)
-            candidate_stop = (
-                max(entry + fee_buffer, current - 0.50 * atr)
-                if side == "BUY" else
-                min(entry - fee_buffer, current + 0.50 * atr)
-            )
-            if (side == "BUY" and candidate_stop < current) or (side == "SELL" and candidate_stop > current):
+            if exit_risk.get("action") == "HARD_EXIT":
                 return decision(
-                    TradeDecisionType.LOCK_PROFITS,
-                    "PROFIT_DANGER_TIGHTEN:" + ",".join(exit_risk.get("reasons", ())),
-                    new_sl=candidate_stop, risk_score=exit_risk.get("score"),
-                    risk_groups=exit_risk.get("groups"),
+                    TradeDecisionType.THESIS_FAILURE_EXIT,
+                    "PROFIT_BRAIN_HARD_RISK:" + ",".join(exit_risk.get("reasons", ())),
+                    close_reason="PROFIT_DANGER_HARD_EXIT",
+                    risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
                 )
+            if exit_risk.get("action") == "CLOSE_PROFIT":
+                return decision(
+                    TradeDecisionType.FULL_CLOSE,
+                    "PROFIT_DANGER_LOCK:" + ",".join(exit_risk.get("reasons", ())),
+                    close_reason="PROFIT_DANGER_LOCK",
+                    risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
+                )
+            if exit_risk.get("action") == "LOCK_PROFIT" and entry > 0 and current > 0 and atr > 0:
+                fee_buffer = max(entry * 0.0010, atr * 0.10)
+                candidate_stop = (
+                    max(entry + fee_buffer, current - 0.50 * atr)
+                    if side == "BUY" else
+                    min(entry - fee_buffer, current + 0.50 * atr)
+                )
+                if (side == "BUY" and candidate_stop < current) or (side == "SELL" and candidate_stop > current):
+                    return decision(
+                        TradeDecisionType.LOCK_PROFITS,
+                        "PROFIT_DANGER_TIGHTEN:" + ",".join(exit_risk.get("reasons", ())),
+                        new_sl=candidate_stop, risk_score=exit_risk.get("score"),
+                        risk_groups=exit_risk.get("groups"),
+                    )
 
-        # A failed breakout is supporting thesis evidence, not an independent
-        # exit signal. Require a fresh same-side event and two adjacent closed
-        # candles confirming price remained back inside the causal zone.
-        mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
-        zone_evidence_valid = is_confirmed_failed_breakout_evidence(mi, side)
-        thesis_reasons = list(ctx.get("thesis_failure_reasons") or [])
-        thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
-        if zone_evidence_valid:
-            thesis_score = min(100.0, thesis_score + 18.0)
-            thesis_reasons.append("confirmed_failed_breakout_reentry")
-            STATE["failed_breakout_thesis_credit_applied"] = True
+            # A failed breakout is supporting thesis evidence, not an independent
+            # exit signal. Require a fresh same-side event and two adjacent closed
+            # candles confirming price remained back inside the causal zone.
+            mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
+            zone_evidence_valid = is_confirmed_failed_breakout_evidence(mi, side)
+            thesis_reasons = list(ctx.get("thesis_failure_reasons") or [])
+            thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
+            if zone_evidence_valid:
+                thesis_score = min(100.0, thesis_score + 18.0)
+                thesis_reasons.append("confirmed_failed_breakout_reentry")
+                STATE["failed_breakout_thesis_credit_applied"] = True
 
-        thesis_action, thesis_reason = thesis_failure_action(
-            side, roe, thesis_score, thesis_reasons,
-            structural_invalidation=bool(ctx.get("structural_invalidation")))
-        if thesis_action == "EXIT":
-            return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
-                            str(ctx.get("thesis_failure_reason") or thesis_reason))
-        if thesis_action == "PROTECT" and not ctx.get("be_done"):
-            return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
-        if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
-            return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
+            thesis_action, thesis_reason = thesis_failure_action(
+                side, roe, thesis_score, thesis_reasons,
+                structural_invalidation=bool(ctx.get("structural_invalidation")))
+            if thesis_action == "EXIT":
+                return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
+                                str(ctx.get("thesis_failure_reason") or thesis_reason))
+            if thesis_action == "PROTECT" and not ctx.get("be_done"):
+                return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
+            if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
+                return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
 
         sl_price = safe_float(ctx.get("synthetic_sl"), 0.0)
         if sl_price > 0 and current > 0:
@@ -3987,13 +3988,11 @@ class LiveTradeManager:
         if not _decision_allowed:
             self.last_decision_blocked_reason = "stale_or_missing_market_data"
             log_execution(
-                f"[DECISION_BLOCKED] {symbol}: market data {_freshness}"
-                f"{' missing=' + ','.join(_missing) if _missing else ''}; "
-                f"no new management decision (SL/BE/trail/TP/close) executed. "
-                f"Native SL and TP protection on the exchange are unchanged.",
+                f"[PRICE_ONLY_MANAGEMENT] {symbol}: indicator snapshot {_freshness}; "
+                f"indicator-driven risk actions paused, but verified price/target/stop checks continue.",
                 "WARN", debounce_key=f"decision_blocked_{symbol}", debounce_sec=30)
-            return
-        self.last_decision_blocked_reason = None
+        else:
+            self.last_decision_blocked_reason = None
 
         # ========== BUILD CONTEXT FOR BOARD ==========
         # Re-evaluate TP2 only after TP1 has actually filled. A weak continuation
@@ -4011,6 +4010,7 @@ class LiveTradeManager:
                 min_continuation=safe_float(os.getenv("TP2_MIN_CONTINUATION", "0.45"), 0.45))
         context = {
             "symbol": symbol, "side": side, "entry": entry, "current_price": mark_price,
+            "indicator_decisions_allowed": bool(_decision_allowed),
             "atr": atr, "roe": roe,
             "remaining_qty": safe_float(STATE.get("remaining_qty"), STATE.get("qty", 0.0)),
             "initial_qty": safe_float(STATE.get("initial_qty"), STATE.get("qty", 0.0)),
