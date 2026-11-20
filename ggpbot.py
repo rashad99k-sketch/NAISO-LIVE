@@ -3716,6 +3716,19 @@ class LiveTradeManager:
             }
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
             current_mode = str(STATE.get("profit_mode") or STANDARD_MODE)
+            # Once a confirmed trend runner is established, ordinary weakening
+            # cannot demote it into a one-shot scalp. A trend downgrade may move
+            # to the standard 50/50 plan; only thesis/structure failure can close it.
+            if current_mode == TREND_MODE and candidate_mode == RANGE_MODE:
+                _trend_broken = bool(
+                    ema_context_live.get("break_confirmed")
+                    or STATE.get("structural_invalidation")
+                    or safe_float(STATE.get("thesis_failure_score"), 0.0) >= 50.0
+                )
+                if not _trend_broken:
+                    candidate_mode = STANDARD_MODE
+                    candidate_reason = "trend_runner_protected_from_range_demotion"
+                    candidate_evidence = tuple(list(candidate_evidence) + ["trend_mode_downgrade_guard"])
             last_mode_ts = safe_float(STATE.get("profit_mode_last_candle_ts"), 0.0)
             if closed_candle_ts > last_mode_ts:
                 STATE["profit_mode_last_candle_ts"] = closed_candle_ts
