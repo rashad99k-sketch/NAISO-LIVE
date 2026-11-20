@@ -2510,6 +2510,8 @@ class TradeManagementBoard:
                 "scalp_target_status": str(ctx.get("scalp_target_status") or "UNKNOWN"),
                 "scalp_target_price": safe_float(ctx.get("scalp_target_price"), 0.0),
                 "scalp_target_tp1_price": safe_float(ctx.get("scalp_target_tp1_price"), 0.0),
+                "risk_score": safe_float((ctx.get("exit_risk_snapshot") or {}).get("score"), 0.0),
+                "risk_groups": list((ctx.get("exit_risk_snapshot") or {}).get("groups") or []),
                 "scalp_target_selected_pct": safe_float(ctx.get("scalp_target_selected_pct"), 0.0),
             }
             self._decision_history.append(meta)
@@ -3688,6 +3690,60 @@ class LiveTradeManager:
                             STATE["scalp_target_tp1_price"] = 0.0
                             STATE["scalp_target_selected_pct"] = 0.0
                             STATE["scalp_target_selection_reason"] = "no_verified_opposing_pool"
+                        # Rebuild confirmed opposing support/resistance from completed candles.
+                        # These levels are exit-risk context only; they never create entries.
+                        _sr_snapshot = build_support_resistance_zones(
+                            df_live.tail(120).to_dict("records"),
+                            price=mark_price, atr=atr, lookback=120,
+                            pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=6,
+                        )
+                        _sr_key = "resistances" if side == "BUY" else "supports"
+                        _sr_candidates = [
+                            z for z in (_sr_snapshot.get(_sr_key) or [])
+                            if isinstance(z, dict)
+                            and str(z.get("status") or "").upper() == "CONFIRMED"
+                            and safe_float(z.get("distance_atr"), 999.0) >= 0.0
+                        ]
+                        _sr_nearest = min(
+                            _sr_candidates,
+                            key=lambda z: safe_float(z.get("distance_atr"), 999.0),
+                            default=None,
+                        )
+                        STATE["management_support_resistance"] = _sr_snapshot
+                        STATE["opposing_zone_distance_atr"] = (
+                            safe_float(_sr_nearest.get("distance_atr"), 999.0)
+                            if _sr_nearest else None
+                        )
+                        STATE["opposing_zone_level"] = (
+                            safe_float(_sr_nearest.get("level"), 0.0)
+                            if _sr_nearest else 0.0
+                        )
+                        _sr_rejection = False
+                        if _sr_nearest and safe_float(_sr_nearest.get("distance_atr"), 999.0) <= 0.50:
+                            _last_sr_candle = df_live.iloc[-1]
+                            _sr_range = max(
+                                safe_float(_last_sr_candle.get("high")) - safe_float(_last_sr_candle.get("low")),
+                                1e-12,
+                            )
+                            if side == "BUY":
+                                _upper_wick = safe_float(_last_sr_candle.get("high")) - max(
+                                    safe_float(_last_sr_candle.get("open")), safe_float(_last_sr_candle.get("close"))
+                                )
+                                _sr_rejection = (
+                                    safe_float(_last_sr_candle.get("high")) >= safe_float(_sr_nearest.get("low"))
+                                    and safe_float(_last_sr_candle.get("close")) < safe_float(_sr_nearest.get("low"))
+                                    and _upper_wick / _sr_range >= 0.35
+                                )
+                            else:
+                                _lower_wick = min(
+                                    safe_float(_last_sr_candle.get("open")), safe_float(_last_sr_candle.get("close"))
+                                ) - safe_float(_last_sr_candle.get("low"))
+                                _sr_rejection = (
+                                    safe_float(_last_sr_candle.get("low")) <= safe_float(_sr_nearest.get("high"))
+                                    and safe_float(_last_sr_candle.get("close")) > safe_float(_sr_nearest.get("high"))
+                                    and _lower_wick / _sr_range >= 0.35
+                                )
+                        STATE["opposing_zone_rejection"] = bool(_sr_rejection)
                         record_trade_management_event(
                             "OPPOSING_LIQUIDITY_REFRESH", "OBSERVED",
                             dedupe_key=f"opposing_pool:{symbol}:{side}:{closed_candle_ts}",
@@ -3940,6 +3996,8 @@ class LiveTradeManager:
             "structure_broken": bool(STATE.get("structure_broken", False)),
             "structural_invalidation": bool(STATE.get("structural_invalidation", False)),
             "opposing_zone_distance_atr": safe_float(STATE.get("opposing_zone_distance_atr"), None),
+            "management_support_resistance": dict(STATE.get("management_support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
+            "opposing_zone_level": safe_float(STATE.get("opposing_zone_level"), 0.0),
             "opposing_zone_rejection": bool(STATE.get("opposing_zone_rejection", False)),
             "liquidity": dict(STATE.get("entry_liquidity") or {}),
             "zone_event": str((STATE.get("market_intelligence") or {}).get("zone_event") or "UNKNOWN"),
