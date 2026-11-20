@@ -5974,6 +5974,35 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return False
     trade_id = uuid.uuid4().hex
     institutional_entry_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+    # Final execution-boundary gate: no institutional, sniper, RF or legacy
+    # setup can bypass the dual EMA9/EMA50-to-session-VWAP closed-candle cross.
+    gate_frame = institutional_entry_ctx.get("closed_candle_frame")
+    gate_tf = str(institutional_entry_ctx.get("candle_timeframe") or INTERVAL)
+    try:
+        gate_result = _validate_dual_ema_vwap_entry_gate(
+            gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
+            now_ms=int(time.time() * 1000), lookback_candles=2,
+        )
+    except Exception as gate_exc:
+        gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
+    institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
+    if not gate_result.get("ready"):
+        log_execution(
+            f"[VWAP_ENTRY_GATE] BLOCKED {symbol} {side} reason={gate_result.get('reason')} "
+            f"EMA9={gate_result.get('ema9')} EMA50={gate_result.get('ema50')} "
+            f"VWAP={gate_result.get('vwap')} EMA9_cross={gate_result.get('ema9_cross')} "
+            f"EMA50_cross={gate_result.get('ema50_cross')} closed_ts={gate_result.get('latest_closed_timestamp')}",
+            "WARN", debounce_key=f"dual_ema_vwap_gate:{symbol}:{side}:{gate_result.get('reason')}",
+            debounce_sec=5,
+        )
+        return False
+    log_execution(
+        f"[VWAP_ENTRY_GATE] PASSED {symbol} {side} "
+        f"EMA9_cross_ts={gate_result.get('ema9_cross_timestamp')} "
+        f"EMA50_cross_ts={gate_result.get('ema50_cross_timestamp')} "
+        f"EMA9={gate_result.get('ema9')} EMA50={gate_result.get('ema50')} VWAP={gate_result.get('vwap')}",
+        "INFO", debounce_key=f"dual_ema_vwap_gate_pass:{symbol}:{side}", debounce_sec=5,
+    )
     entry_spread_pct = safe_float(institutional_entry_ctx.get("spread_pct"), 0.0) or 0.0
     entry_liquidity_quality = str(institutional_entry_ctx.get("liquidity_quality") or "UNKNOWN")
     entry_orderbook_depth = safe_float(institutional_entry_ctx.get("orderbook_depth_usdt"), 0.0) or 0.0
@@ -8755,7 +8784,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="section smart-layer"><div class="title">🌐 SCANNER 1 — PROFESSIONAL GLOBAL DISCOVERY (RF + SMART SCANNER V2)</div>
 <div id="discovery-scanner-panel" class="card" style="font-size:12px;">Waiting for initial market scan...</div>
 </div>
-<div class="section smart-layer"><div class="title">🧭 SCANNER 2 — EMA9 / SESSION VWAP PROXIMITY (CLOSED CANDLES · RANKING ONLY)</div>
+<div class="section smart-layer"><div class="title">🧭 EMA9 + EMA50 / SESSION VWAP (CLOSED CANDLES · ENTRY GATE)</div>
 <div id="proximity-scanner-panel" class="card" style="font-size:12px;max-height:320px;overflow-y:auto;">Waiting for first rotating batch...</div>
 </div>
 {supervisor_panel_html}
@@ -8989,7 +9018,7 @@ function updateUI(d) {{
               <br><small>BUY hypothesis: ${{buyHyp.state || "NOT_ANALYZED"}} / ${{buyHyp.setup || "-"}} | SELL hypothesis: ${{sellHyp.state || "NOT_ANALYZED"}} / ${{sellHyp.setup || "-"}}</small>
               <br><small>Trend Engine: ${{instTrend.state || "UNKNOWN"}} / Health ${{instTrend.health ?? "?"}} | Trade State: ${{w.trade_state || "UNKNOWN"}}</small>
               <br><small>SL: ${{stopText}} | Data: ${{quality}} | Updated: ${{lastUpdate}}</small>
-              <br><small>EMA9/VWAP: ranking context only · not an entry gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
+              <br><small>EMA9/EMA50/VWAP: mandatory execution gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
             </div>`;
         }}
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
@@ -10371,7 +10400,9 @@ from ggp_institutional_bridge import (
     merge_candidates as roro_merge_candidates, AUTHORITY as RORO_ENTRY_AUTHORITY,
 )
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
-from roro_confluence import ema9_vwap_proximity as _roro_ema9_vwap_proximity, timeframe_seconds as _roro_timeframe_seconds
+from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
+                             validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                             timeframe_seconds as _roro_timeframe_seconds)
 try:
     from roro_resource_manager import ResourceManager
     from roro_trade_journal import TradeJournal
