@@ -357,7 +357,7 @@ class TradeStateMachine:
         self.last_state_change = 0
         self.state_confidence = 0.0
 
-    def update(self, smart: dict, momentum: dict, adx: float, regime: str) -> str:
+    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None) -> str:
         banker = smart.get("banker_pressure", 50)
         retail = smart.get("retailer_pressure", 50)
         dist_risk = smart.get("distribution_risk", 0)
@@ -369,6 +369,12 @@ class TradeStateMachine:
         expansion = momentum.get("trend_expansion", False)
         decay = momentum.get("momentum_decay", False)
         bias_detailed = smart.get("institutional_bias_detailed", "NEUTRAL")
+        direction = str(side or "").upper()
+        smart_bias = str(smart.get("institutional_bias") or "").upper()
+        momentum_bias = str(momentum.get("flow_bias") or "").upper()
+        smart_opposed = direction in ("BUY", "SELL") and smart_bias in ("BUY", "SELL") and smart_bias != direction
+        momentum_aligned = direction not in ("BUY", "SELL") or momentum_bias not in ("BUY", "SELL") or momentum_bias == direction
+        adverse_smart_flow = smart_opposed and (dist_risk > 60 or banker > 65)
 
         # PANIC_EXIT
         if (bias_detailed in ("STRONG_SELL", "STRONG_BUY") and
@@ -381,22 +387,18 @@ class TradeStateMachine:
         elif exh_risk > 70 or climax > 75:
             new_state = "LIQUIDITY_EXHAUSTION"
         # PROFIT_DEFENSE
-        elif dist_risk > 50 and banker < 45 and mom_health < 30:
+        elif adverse_smart_flow and dist_risk > 50 and mom_health < 30:
             new_state = "PROFIT_DEFENSE"
-        # DISTRIBUTION
-        elif dist_risk > 60 and banker < 45:
+        # Distribution is adverse only when institutional flow opposes this position.
+        elif adverse_smart_flow and dist_risk > 60:
             new_state = "DISTRIBUTION"
-        # ACCUMULATION
-        elif banker > 65 and dist_risk < 25 and mom_health > 40:
+        elif banker > 65 and dist_risk < 25 and mom_health > 40 and direction != "SELL":
             new_state = "ACCUMULATION"
-        # EXPANSION
-        elif adx > 30 and expansion and cont_strength > 60 and mom_health > 50:
+        elif adx > 30 and expansion and cont_strength > 60 and mom_health > 50 and momentum_aligned:
             new_state = "EXPANSION"
-        # TREND_RIDE
-        elif cont_strength > 75 and mom_health > 60 and dist_risk < 30:
+        elif cont_strength > 75 and mom_health > 60 and dist_risk < 30 and momentum_aligned:
             new_state = "TREND_RIDE"
-        # HEALTHY_PULLBACK
-        elif 20 <= adx <= 35 and mom_health > 45 and not expansion and not decay and dist_risk < 40:
+        elif 20 <= adx <= 35 and mom_health > 45 and not expansion and not decay and dist_risk < 40 and momentum_aligned:
             new_state = "HEALTHY_PULLBACK"
         # FAKE_BREAKOUT
         elif retail > 70 and banker < 45 and climax > 60:
@@ -2419,8 +2421,8 @@ class InstitutionalTradeBrain:
         self.last_update = 0
         self.current_trade_state = "RANGE_CHOP"
 
-    def update(self, smart: dict, momentum: dict, adx: float, regime: str):
-        self.current_trade_state = self.state_machine.update(smart, momentum, adx, regime)
+    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None):
+        self.current_trade_state = self.state_machine.update(smart, momentum, adx, regime, side=side)
         self.last_update = time.time()
         return self.current_trade_state
 
@@ -3589,7 +3591,7 @@ class LiveTradeManager:
                 }
 
             regime = self.regime_classifier.classify(df_live, ob)
-            trade_state = self.brain.update(smart_money, momentum, adx_now, regime)
+            trade_state = self.brain.update(smart_money, momentum, adx_now, regime, side=side)
             STATE["trade_state"] = trade_state
             STATE["smart_trail_mult"] = self.brain.get_trail_multiplier()
             STATE["delay_tp1"] = self.brain.should_delay_tp1()
