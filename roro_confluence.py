@@ -159,8 +159,9 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
         ema_now, vwap_now = float(e9.iloc[-1]), float(vwap.iloc[-1])
         prev_gap = float(e9.iloc[-2] - vwap.iloc[-2])
         gap = float(ema_now - vwap_now)
-        ema50_now = float(e50.iloc[-1]) if len(e50) and np.isfinite(float(e50.iloc[-1])) else None
-        ema50_prev_gap = float(e50.iloc[-2] - vwap.iloc[-2]) if len(e50) >= 2 and np.isfinite(float(e50.iloc[-2])) else None
+        ema50_ready = len(closed) >= 50 and len(e50) >= 2
+        ema50_now = float(e50.iloc[-1]) if ema50_ready and np.isfinite(float(e50.iloc[-1])) else None
+        ema50_prev_gap = float(e50.iloc[-2] - vwap.iloc[-2]) if ema50_ready and np.isfinite(float(e50.iloc[-2])) else None
         ema50_gap = (ema50_now - vwap_now) if ema50_now is not None else None
         atr_proxy = float((closed["high"] - closed["low"]).rolling(14).mean().iloc[-1])
     except Exception:
