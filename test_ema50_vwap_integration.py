@@ -94,5 +94,5 @@ def test_watchlist_candidate_priority_uses_directional_cross_but_keeps_structura
     assert 'prior.get("ema9_vwap_proximity")' in source
     assert 'cross_direction == expected_cross' in source
     assert "vwap_cross_priority" in source
-    assert "UnifiedEntryAuthority" in source
+    assert "AUTHORITY.decide" in source
     assert "execute_entry" not in source
