@@ -158,6 +158,18 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     if structure_broken:
         evidence.append("trend_structure_broken")
 
+    # A fresh, direction-matched EMA9/VWAP or EMA50/VWAP cross is directional
+    # evidence. It must not be mislabeled as a range scalp and fully closed at
+    # the first small target. It does not, by itself, prove a TREND_RIDE.
+    cross_direction = str(ctx.get("vwap_cross_direction") or "").upper()
+    fresh_vwap_cross = bool(ctx.get("fresh_ema9_vwap_cross") or ctx.get("fresh_ema50_vwap_cross"))
+    directional_vwap_cross = fresh_vwap_cross and (
+        (side == "BUY" and cross_direction == "BULLISH")
+        or (side == "SELL" and cross_direction == "BEARISH")
+    )
+    if directional_vwap_cross:
+        evidence.append("fresh_directional_ema_vwap_cross")
+
     # Trend riding requires several independent, side-aligned observations.
     momentum_support = (momentum_strength is not None and momentum_strength >= 55.0) or bool(ctx.get("trend_expansion", False))
     regime_trend = regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or state in {"TREND_RIDE", "EXPANSION", "HEALTHY_PULLBACK"}
@@ -181,8 +193,13 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
         weak_adx and weak_continuation and (low_volume or di_tangled or thin_liquidity)
     )
     thin_market_confirmed = thin_liquidity and (weak_adx or weak_continuation or low_volume) and weakness_count >= 2
-    if range_confirmed or weak_market_confirmed or thin_market_confirmed:
+    if (range_confirmed or weak_market_confirmed or thin_market_confirmed) and not directional_vwap_cross:
         return RANGE_MODE, "confirmed_range_weak_market_or_thin_liquidity", tuple(evidence)
+
+    # A fresh directional VWAP cross vetoes the one-shot scalp classification
+    # until the market proves the new move has failed. Keep TP1/TP2 50/50.
+    if directional_vwap_cross:
+        return STANDARD_MODE, "fresh_directional_vwap_cross_keep_two_stage_50_50", tuple(evidence)
 
     # Crucial fail-safe: indicator/API gaps do not automatically force a short
     # scalp or a full-position exit. Keep the canonical 50/50 management model.
