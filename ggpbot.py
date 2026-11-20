@@ -3360,6 +3360,45 @@ class LiveTradeManager:
             "INFO", debounce_key=f"profit_brain_status_{symbol}", debounce_sec=15
         )
 
+    def _apply_price_only_management(self, symbol, mark_price, reason):
+        """Run verified price/target/stop checks without stale indicator authority."""
+        if self.lifecycle_state != TradeLifecycleState.LIVE or not STATE.get("open"):
+            return
+        context = {
+            "symbol": symbol, "side": str(STATE.get("side") or "").upper(),
+            "entry": safe_float(STATE.get("entry")), "current_price": safe_float(mark_price),
+            "atr": safe_float(STATE.get("atr")), "roe": safe_float(STATE.get("roe_pct")),
+            "remaining_qty": safe_float(STATE.get("remaining_qty"), safe_float(STATE.get("qty"))),
+            "initial_qty": safe_float(STATE.get("initial_qty"), safe_float(STATE.get("qty"))),
+            "synthetic_sl": safe_float(STATE.get("synthetic_sl", STATE.get("sl"))),
+            "trail_stop": safe_float(STATE.get("trail_stop")),
+            "trail_active": bool(STATE.get("trail_activated")),
+            "tp1_hit": bool(STATE.get("tp1_hit")), "tp2_hit": bool(STATE.get("tp2_hit")),
+            "tp1_price": safe_float(STATE.get("tp1_price", STATE.get("synthetic_tp1"))),
+            "tp2_price": safe_float(STATE.get("tp2_price")),
+            "range_target_price": safe_float(STATE.get("range_target_price")),
+            "range_target_move_pct": safe_float(STATE.get("range_target_move_pct")),
+            "scalp_target_status": str(STATE.get("scalp_target_status") or "UNKNOWN"),
+            "scalp_target_price": safe_float(STATE.get("scalp_target_price")),
+            "profit_mode": str(STATE.get("profit_mode") or STANDARD_MODE),
+            "trade_state": "UNKNOWN", "continuation_probability": 0.5,
+            "adx": 20.0, "smart_money": {}, "momentum": {},
+            "be_done": bool(STATE.get("be_done")),
+            "execution_unresolved": bool(STATE.get("execution_unresolved")),
+            "close_reconciliation_required": bool(STATE.get("close_reconciliation_required")),
+            "recovery_hold": bool(STATE.get("recovery_hold")),
+            "indicator_decisions_allowed": False,
+        }
+        decision = self.board.evaluate(context)
+        self._last_decision = decision
+        self._execute_decision(decision, symbol)
+        log_execution(
+            f"[PRICE_ONLY_MANAGEMENT] {symbol} reason={reason} decision={decision.action.value} "
+            f"detail={decision.reason}",
+            "INFO", debounce_key=f"price_only_management:{symbol}:{decision.action.value}:{decision.reason}",
+            debounce_sec=10,
+        )
+
     def _apply_management(self, symbol, now):
         if not STATE.get("open"):
             return
@@ -3394,6 +3433,7 @@ class LiveTradeManager:
                 f"keep current protection (Native SL unchanged)",
                 "WARN", debounce_key=f"mkt_fetch_error_{symbol}", debounce_sec=30)
             STATE["last_market_data_freshness"] = "INVALID"
+            self._apply_price_only_management(symbol, mark_price, "ohlcv_fetch_error")
             return
         df_live = _closed_candle_frame(raw_frame, INTERVAL)
         received = 0 if raw_frame is None else int(len(raw_frame))
@@ -3431,6 +3471,8 @@ class LiveTradeManager:
                 f"  Cache Status: {'HIT' if ohlcv_source == 'CACHE_HIT' else 'MISS'}\n"
                 f"  -> insufficient completed candles; keep current protection (Native SL unchanged)",
                 "WARN", debounce_key=f"mkt_insufficient_{symbol}", debounce_sec=30)
+            STATE["last_market_data_freshness"] = "INSUFFICIENT"
+            self._apply_price_only_management(symbol, mark_price, "insufficient_closed_candles")
             return
         # Freshness relative to the last closed candle we processed.
         prev_closed = safe_float(STATE.get("last_management_closed_candle_ts"), 0.0)
