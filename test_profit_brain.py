@@ -260,3 +260,25 @@ def test_exit_risk_hard_structural_invalidation_is_not_delayed_by_profit_mode():
         "side": "SELL", "roe": -1.0, "structural_invalidation": True,
     })
     assert result["action"] == "HARD_EXIT"
+
+
+def test_institutional_flow_and_di_opposition_tighten_profitable_trade():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": 1.8, "di_plus": 29, "di_minus": 15,
+        "smart_money": {"institutional_bias": "BUY"},
+    })
+    assert result["action"] == "LOCK_PROFIT"
+    assert "DIRECTIONAL_FLOW" in result["groups"]
+    assert "INSTITUTIONAL_FLOW" in result["groups"]
+
+
+def test_opposing_sr_rejection_adds_independent_risk_evidence():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 2.0, "opposing_zone_rejection": True,
+        "opposing_zone_distance_atr": 0.25,
+        "momentum": {"momentum_decay": True},
+    })
+    assert result["action"] == "LOCK_PROFIT"
+    assert "SUPPORT_RESISTANCE" in result["groups"]
