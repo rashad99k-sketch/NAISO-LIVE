@@ -204,3 +204,29 @@ def test_scalp_board_uses_one_full_close_not_partial_tp1():
     assert "TradeDecisionType.FULL_CLOSE" in scalp_block
     assert "TradeDecisionType.PARTIAL_CLOSE" not in scalp_block
     assert "range_scalp_waiting_for_single_target" in scalp_block
+
+
+
+def test_only_recent_directional_vwap_cross_blocks_range_scalp():
+    common = {
+        "side": "BUY", "regime": "CHOPPY", "trade_state": "RANGE_CHOP",
+        "adx": 15, "adx_slope": -1.0, "continuation_probability": 0.38,
+        "di_plus": 18, "di_minus": 17, "volume_ratio": 0.62,
+        "momentum_strength": 20,
+        "fresh_ema9_vwap_cross": True, "vwap_cross_direction": "BULLISH",
+    }
+    recent_mode, recent_reason, _ = classify_profit_mode({
+        **common, "vwap_cross_age_seconds": 60, "vwap_cross_max_age_seconds": 1800,
+    })
+    stale_mode, stale_reason, _ = classify_profit_mode({
+        **common, "vwap_cross_age_seconds": 3600, "vwap_cross_max_age_seconds": 1800,
+    })
+    unknown_mode, _, _ = classify_profit_mode(common)
+
+    assert recent_mode == STANDARD_MODE
+    assert "fresh_directional_vwap_cross" in recent_reason
+    assert stale_mode == RANGE_MODE
+    assert "confirmed_range_weak_market" in stale_reason
+    assert unknown_mode == RANGE_MODE
+
+
