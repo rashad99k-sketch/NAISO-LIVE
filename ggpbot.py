@@ -329,6 +329,7 @@ class MomentumFlowEngine:
             "trend_expansion": False,
             "momentum_decay": False,
             "climax_risk": 0.0,
+            "rsi_value": 50.0,
             "exhaustion_risk": 0.0,
             "greed_state": False,
             "flow_bias": "NEUTRAL"
@@ -373,7 +374,7 @@ class TradeStateMachine:
         smart_bias = str(smart.get("institutional_bias") or "").upper()
         momentum_bias = str(momentum.get("flow_bias") or "").upper()
         smart_opposed = direction in ("BUY", "SELL") and smart_bias in ("BUY", "SELL") and smart_bias != direction
-        momentum_aligned = direction not in ("BUY", "SELL") or momentum_bias not in ("BUY", "SELL") or momentum_bias == direction
+        momentum_aligned = (direction not in ("BUY", "SELL") or momentum_bias not in ("BUY", "SELL") or momentum_bias == direction) and not smart_opposed
         adverse_smart_flow = smart_opposed and (dist_risk > 60 or banker > 65)
 
         # PANIC_EXIT
@@ -10811,7 +10812,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
         if advance_state:
             state_machine.update(
                 smart, momentum, float(adx_state.get("value", 0) or 0),
-                str(analysis.get("market_regime", "UNKNOWN"))
+                str(analysis.get("market_regime", "UNKNOWN")), side=side
             )
             engine_last[symbol_key] = candle_ts
         result["trade_state"] = state_machine.current_state
