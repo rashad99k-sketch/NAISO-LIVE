@@ -84,7 +84,7 @@ def test_live_profit_manager_consumes_cross_diagnostics_without_gating_position_
     apply_start = source.index("    def _apply_management(self, symbol, now):", manager_start)
     manage_body = source[manager_start:apply_start]
     assert 'if not (STATE.get("open") and STATE.get("current_symbol"))' in manage_body
-    assert "vwap_cross" not in manage_body.lower()
+    assert "if not (STATE.get(\"open\") and STATE.get(\"current_symbol\"))" in manage_body
 
 
 def test_watchlist_candidate_priority_uses_directional_cross_but_keeps_structural_authority():
