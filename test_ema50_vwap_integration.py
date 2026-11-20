@@ -107,3 +107,11 @@ def test_cross_timestamp_fields_are_provided_to_profit_and_dashboard_context():
     assert '"vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds")' in source
     assert 'STATE["fresh_ema9_vwap_cross"] = bool(_cross_snapshot.get("cross_ema9") and _cross_snapshot.get("cross_fresh"))' in source
     assert 'STATE["fresh_ema50_vwap_cross"] = bool(_cross_snapshot.get("cross_ema50") and _cross_snapshot.get("cross_fresh"))' in source
+
+
+def test_scanner_persists_cross_event_age_and_observation_timestamp():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert '"observation_age_seconds": 0.0' in source
+    assert '"cross_age_seconds": _proximity_cross_age' in source
+    assert '"cross_fresh": bool(_proximity_cross_event and _proximity_cross_age <= _proximity_cross_max_age)' in source
