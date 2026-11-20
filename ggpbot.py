@@ -86,6 +86,7 @@ from ggp_market_intelligence import (
     build_support_resistance_zones,
 )
 from ggp_institutional_bridge import build_liquidity_pools
+from roro_confluence import classify_liquidity as _classify_live_liquidity
 from location_authority import validate_location_zone
 
 # Observational only: all routine trade-management decisions still come from
@@ -3562,6 +3563,25 @@ class LiveTradeManager:
 
             smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
             momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
+            # Refresh liquidity-event evidence from completed candles; the entry snapshot
+            # is retained separately for provenance and is never mistaken for live evidence.
+            try:
+                _live_liq = _classify_live_liquidity(df_live, atr, build_liquidity_pools)
+                STATE["management_liquidity"] = {
+                    "event": str(getattr(_live_liq, "event", "UNKNOWN") or "UNKNOWN"),
+                    "direction": str(getattr(_live_liq, "direction", "UNKNOWN") or "UNKNOWN"),
+                    "level": safe_float(getattr(_live_liq, "level", 0.0), 0.0),
+                    "confidence": safe_float(getattr(_live_liq, "confidence", 0.0), 0.0),
+                    "reasons": list(getattr(_live_liq, "reasons", []) or []),
+                    "confirmed_at": safe_float(getattr(_live_liq, "timestamp", 0.0), 0.0),
+                    "source": "LIVE_CLOSED_CANDLE_LIQUIDITY_ENGINE",
+                }
+            except Exception as _live_liq_error:
+                STATE["management_liquidity"] = {
+                    "event": "UNKNOWN", "direction": "UNKNOWN", "level": 0.0,
+                    "confidence": 0.0, "reasons": [type(_live_liq_error).__name__],
+                    "source": "LIVE_CLOSED_CANDLE_LIQUIDITY_ENGINE",
+                }
 
             regime = self.regime_classifier.classify(df_live, ob)
             trade_state = self.brain.update(smart_money, momentum, adx_now, regime)
@@ -4007,7 +4027,7 @@ class LiveTradeManager:
             "management_support_resistance": dict(STATE.get("management_support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
             "opposing_zone_level": safe_float(STATE.get("opposing_zone_level"), 0.0),
             "opposing_zone_rejection": bool(STATE.get("opposing_zone_rejection", False)),
-            "liquidity": dict(STATE.get("entry_liquidity") or {}),
+            "liquidity": dict(STATE.get("management_liquidity") or STATE.get("entry_liquidity") or {}),
             "zone_event": str((STATE.get("market_intelligence") or {}).get("zone_event") or "UNKNOWN"),
             "adx": adx_now, "adx_slope": safe_float(STATE.get("adx_slope")),
             "di_plus": plus_di, "di_minus": minus_di,
