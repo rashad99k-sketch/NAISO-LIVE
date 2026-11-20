@@ -694,7 +694,10 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         cross_age = rank_number(proximity.get("cross_age_seconds"), float("inf"))
         timeframe_seconds = rank_number(proximity.get("timeframe_seconds"), 900.0)
         cross_max_age = max(1.0, timeframe_seconds * 2.0)
-        cross_fresh = 0.0 <= cross_age <= cross_max_age
+        cross_fresh = (
+            0.0 <= cross_age <= cross_max_age
+            and bool(proximity.get("cross_fresh", True))
+        )
         # Crosses affect ordering only; structural EntryAuthority remains final.
         vwap_cross_priority = (
             0.65 if cross_fresh and cross_direction and cross_direction == expected_cross
@@ -703,7 +706,8 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         )
         if bool(proximity.get("cross_conflict")) and cross_fresh:
             vwap_cross_priority = -0.50
-        elif str(proximity.get("state") or "").upper() in {"NEAR_CROSS", "CONVERGING"}:
+        elif (0.0 <= rank_number(proximity.get("observation_age_seconds"), float("inf")) <= 1800.0
+              and str(proximity.get("state") or "").upper() in {"NEAR_CROSS", "CONVERGING"}):
             vwap_cross_priority = max(vwap_cross_priority, 0.12)
         discovery_score = max(0.0, min(100.0, rank_number(item.get("score")))) / 100.0
         updated = rank_number(prior.get("last_update", prior.get("last_updated", 0)))
