@@ -231,3 +231,32 @@ def test_only_recent_directional_vwap_cross_blocks_range_scalp():
     assert unknown_mode == RANGE_MODE
 
 
+
+
+def test_exit_risk_closes_profitable_trade_only_on_multi_engine_confluence():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 4.2, "di_plus": 12, "di_minus": 28,
+        "momentum": {"flow_bias": "SELL", "momentum_decay": True, "exhaustion_risk": 72},
+        "smart_money": {"distribution_risk": 68},
+        "continuation_probability": 0.32,
+    })
+    assert result["action"] == "CLOSE_PROFIT"
+    assert result["group_count"] >= 2
+
+
+def test_exit_risk_does_not_close_profitable_trade_on_one_warning():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 2.0,
+        "momentum": {"momentum_decay": True},
+    })
+    assert result["action"] == "HOLD"
+
+
+def test_exit_risk_hard_structural_invalidation_is_not_delayed_by_profit_mode():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": -1.0, "structural_invalidation": True,
+    })
+    assert result["action"] == "HARD_EXIT"
