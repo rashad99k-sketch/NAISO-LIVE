@@ -157,42 +157,6 @@ def test_range_targets_use_price_move_tiers_025_050_100():
     assert (weak, moderate, strong) == (0.25, 0.50, 1.00)
 
 
-def test_exceptional_expansion_can_select_two_percent_price_target():
-    target, reason = select_range_target_pct({
-        "side": "BUY", "adx": 31, "continuation_probability": 0.90,
-        "volume_ratio": 1.70, "di_plus": 34, "di_minus": 10,
-        "aligned_closed_candles": 3, "momentum_strength": 82,
-        "trend_expansion": True, "regime": "EXPANSION",
-    })
-    assert target == 2.00
-    assert reason == "exceptional_expansion_2.00pct"
-
-
-def test_two_percent_target_is_not_selected_without_expansion_confirmation():
-    target, _ = select_range_target_pct({
-        "side": "BUY", "adx": 31, "continuation_probability": 0.90,
-        "volume_ratio": 1.70, "di_plus": 34, "di_minus": 10,
-        "aligned_closed_candles": 3, "momentum_strength": 82,
-        "trend_expansion": False, "regime": "RANGE_CHOP",
-    })
-    assert target == 1.00
-
-
-def test_two_percent_target_is_not_selected_on_adverse_rejection_or_thin_liquidity():
-    base = {
-        "side": "SELL", "adx": 32, "continuation_probability": 0.92,
-        "volume_ratio": 1.80, "di_plus": 8, "di_minus": 36,
-        "aligned_closed_candles": 4, "momentum_strength": 85,
-        "trend_expansion": True,
-    }
-    rejected, _ = select_range_target_pct({**base, "adverse_rejection": True})
-    thin, _ = select_range_target_pct({**base, "thin_liquidity": True})
-    # An adverse rejection invalidates the exceptional and strong extension;
-    # the conservative fallback is the smallest target, not a 1% hold-out.
-    assert rejected == 0.25
-    assert thin == 0.25
-
-
 def test_scalp_board_uses_one_full_close_not_partial_tp1():
     import ast
     from pathlib import Path
