@@ -358,3 +358,170 @@ def adaptive_range_target_price(side: str, entry_price: float, atr: float,
     fallback_distance = 1.10 * volatility
     target = entry + fallback_distance if direction == "BUY" else entry - fallback_distance
     return round(target, 12), "atr_fallback_no_credible_nearby_liquidity"
+
+
+def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Fuse independent, side-aware trade-management evidence into a risk state.
+
+    This is a decision aid, not an order executor. A normal profit-lock requires
+    multiple independent evidence groups. Structural invalidation and explicit
+    panic states remain hard exits. Missing evidence contributes zero risk.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    side = str(ctx.get("side") or "").upper()
+    roe = _number(ctx.get("roe"), 0.0) or 0.0
+    if side not in {"BUY", "SELL"}:
+        return {"action": "HOLD", "score": 0, "groups": (), "reasons": ("invalid_side",)}
+
+    smart = ctx.get("smart_money") if isinstance(ctx.get("smart_money"), dict) else {}
+    momentum = ctx.get("momentum") if isinstance(ctx.get("momentum"), dict) else {}
+    mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
+    liquidity = ctx.get("liquidity") if isinstance(ctx.get("liquidity"), dict) else {}
+    ob = ctx.get("entry_order_block") if isinstance(ctx.get("entry_order_block"), dict) else {}
+    fvg = ctx.get("entry_fvg") if isinstance(ctx.get("entry_fvg"), dict) else {}
+
+    score = 0
+    groups = set()
+    reasons = []
+    trade_state = str(ctx.get("trade_state") or "").upper()
+    hard_states = {"PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"}
+    structural = bool(ctx.get("structural_invalidation") or ctx.get("structure_broken"))
+    if structural:
+        score += 5
+        groups.add("STRUCTURE")
+        reasons.append("structural_invalidation")
+    if trade_state in hard_states:
+        score += 5
+        groups.add("STATE_MACHINE")
+        reasons.append("hard_exit_state:" + trade_state)
+
+    failure_score = _number(ctx.get("thesis_failure_score"), 0.0) or 0.0
+    if failure_score >= 70:
+        score += 5
+        groups.add("THESIS")
+        reasons.append("thesis_failure_score_70_plus")
+
+    plus = _number(ctx.get("di_plus"))
+    minus = _number(ctx.get("di_minus"))
+    di_opposed = (
+        plus is not None and minus is not None
+        and ((side == "BUY" and minus > plus) or (side == "SELL" and plus > minus))
+    )
+    flow_bias = str(momentum.get("flow_bias") or ctx.get("flow_bias") or "").upper()
+    flow_opposed = flow_bias in ({"SELL"} if side == "BUY" else {"BUY"})
+    distribution = _number(smart.get("distribution_risk", ctx.get("distribution_risk")), 0.0) or 0.0
+    smart_bias = str(smart.get("institutional_bias") or "").upper()
+    smart_flow_opposed = smart_bias in ({"SELL"} if side == "BUY" else {"BUY"})
+    exhaustion = _number(momentum.get("exhaustion_risk", ctx.get("exhaustion_risk")), 0.0) or 0.0
+    climax = _number(momentum.get("climax_risk", ctx.get("climax_risk")), 0.0) or 0.0
+    momentum_decay = bool(momentum.get("momentum_decay", ctx.get("momentum_decay", False)))
+    if di_opposed or flow_opposed:
+        score += 1 + int(di_opposed and flow_opposed)
+        groups.add("DIRECTIONAL_FLOW")
+        if di_opposed: reasons.append("di_pressure_opposed")
+        if flow_opposed: reasons.append("momentum_flow_opposed")
+    if smart_flow_opposed:
+        score += 1
+        groups.add("INSTITUTIONAL_FLOW")
+        reasons.append("institutional_bias_opposed")
+    # Distribution pressure is adverse to longs; for shorts the side-aligned
+    # institutional SELL bias is continuation evidence, not an exit warning.
+    distribution_adverse = distribution >= 60 and side == "BUY"
+    if distribution_adverse:
+        score += 1
+        groups.add("INSTITUTIONAL_FLOW")
+        reasons.append("distribution_risk_high")
+    rsi_value = _number(momentum.get("rsi_value", ctx.get("rsi_value")))
+    adverse_climax = (
+        (side == "BUY" and ((rsi_value is not None and rsi_value >= 75) or climax >= 60))
+        or (side == "SELL" and ((rsi_value is not None and rsi_value <= 25) or (climax >= 60 and rsi_value is None)))
+    )
+    if exhaustion >= 60 or adverse_climax or momentum_decay:
+        score += 1
+        groups.add("MOMENTUM")
+        if exhaustion >= 60: reasons.append("momentum_exhaustion_high")
+        if adverse_climax: reasons.append("directional_momentum_climax")
+        if momentum_decay: reasons.append("momentum_decay")
+
+    continuation = _number(ctx.get("continuation_probability"))
+    counter = _number(ctx.get("counter_pressure"))
+    reclaim = _number(ctx.get("reclaim_risk"))
+    if ((continuation is not None and continuation <= 0.40)
+            or (counter is not None and counter >= 0.65)
+            or (reclaim is not None and reclaim >= 0.65)):
+        score += 1
+        groups.add("CONTINUATION")
+        reasons.append("continuation_or_counter_pressure_deteriorated")
+
+    cross_direction = str(ctx.get("vwap_cross_direction") or "").upper()
+    cross_age = _number(ctx.get("vwap_cross_age_seconds"))
+    cross_max_age = _number(ctx.get("vwap_cross_max_age_seconds"))
+    cross_fresh = (
+        bool(ctx.get("fresh_ema9_vwap_cross") or ctx.get("fresh_ema50_vwap_cross"))
+        and cross_age is not None and cross_age >= 0
+        and cross_max_age is not None and cross_max_age > 0
+        and cross_age <= cross_max_age
+    )
+    expected_cross = "BULLISH" if side == "BUY" else "BEARISH"
+    if cross_fresh and cross_direction and cross_direction != expected_cross:
+        score += 2
+        groups.add("CROSS_STRUCTURE")
+        reasons.append("fresh_opposite_ema_vwap_cross")
+
+    ema_state = str(ctx.get("ema_state") or "").upper()
+    if ema_state == "EMA50_BREAK_CONFIRMED":
+        score += 2
+        groups.add("TREND_STRUCTURE")
+        reasons.append("ema50_break_confirmed")
+    elif ema_state == "EMA50_BREAK_PENDING":
+        score += 1
+        groups.add("TREND_STRUCTURE")
+        reasons.append("ema50_break_pending")
+
+    zone_event = str(mi.get("zone_event") or ctx.get("zone_event") or "").upper()
+    opposite_zone_events = {"FAILED_BREAKOUT", "BREAKOUT_CONFIRMED_AGAINST_TRADE", "STRUCTURE_INVALIDATED"}
+    if zone_event in opposite_zone_events:
+        score += 2
+        groups.add("ZONE_STRUCTURE")
+        reasons.append("opposing_zone_event:" + zone_event)
+    ob_validation = ob.get("validation") if isinstance(ob.get("validation"), dict) else {}
+    ob_status = str(ob.get("status") or ob_validation.get("status") or "").upper()
+    if ob_status in {"INVALIDATED", "MITIGATED"}:
+        score += 1
+        groups.add("INSTITUTIONAL_ZONE")
+        reasons.append("entry_order_block_" + ob_status.lower())
+    fvg_status = str(fvg.get("status") or "").upper()
+    if fvg_status == "FILLED":
+        score += 1
+        groups.add("INSTITUTIONAL_ZONE")
+        reasons.append("entry_fvg_filled")
+
+    liq_event = str(liquidity.get("event") or "").upper()
+    liq_direction = str(liquidity.get("direction") or "").upper()
+    expected = "BULLISH" if side == "BUY" else "BEARISH"
+    if liq_event in {"SWEEP", "GRAB"} and liq_direction not in {"", "UNKNOWN", expected}:
+        score += 2
+        groups.add("LIQUIDITY")
+        reasons.append("opposing_liquidity_sweep")
+    sr_rejection = bool(ctx.get("opposing_zone_rejection"))
+    sr_distance = _number(ctx.get("opposing_zone_distance_atr"))
+    if sr_rejection and (sr_distance is None or sr_distance <= 0.5):
+        score += 2
+        groups.add("SUPPORT_RESISTANCE")
+        reasons.append("confirmed_rejection_at_opposing_sr")
+
+    hard_exit = structural or trade_state in hard_states or failure_score >= 70
+    group_count = len(groups)
+    if hard_exit:
+        action = "HARD_EXIT"
+    elif roe > 0 and score >= 4 and group_count >= 2:
+        action = "CLOSE_PROFIT"
+    elif roe > 0 and score >= 2 and group_count >= 2:
+        action = "LOCK_PROFIT"
+    else:
+        action = "HOLD"
+    return {
+        "action": action, "score": score, "group_count": group_count,
+        "groups": tuple(sorted(groups)), "reasons": tuple(reasons),
+        "roe": roe, "hard_exit": hard_exit,
+    }

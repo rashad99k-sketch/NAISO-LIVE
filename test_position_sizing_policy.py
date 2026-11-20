@@ -214,6 +214,18 @@ def _run_execute_entry(monkeypatch, *, side, balance, price=0.06, stop_pct=0.05)
         "low": base * 0.996, "close": base, "volume": np.full(n, 1000.0),
     })
     monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: frame)
+    # This test isolates the sizing/order path. The dual-cross entry gate is
+    # covered by its own tests; provide an explicitly valid gate result here.
+    monkeypatch.setattr(
+        ggpbot, "_validate_dual_ema_vwap_entry_gate",
+        lambda *a, **k: {
+            "ready": True, "reason": "test_valid_dual_cross",
+            "ema9_cross": "BULLISH", "ema50_cross": "BULLISH",
+            "ema9_cross_timestamp": ts[-2], "ema50_cross_timestamp": ts[-2],
+            "ema9": price * 1.001, "ema50": price, "vwap": price * 0.999,
+            "latest_closed_timestamp": ts[-1],
+        },
+    )
     monkeypatch.setattr(ggpbot, "get_ticker_safe", lambda *a, **k: price)
     monkeypatch.setattr(ggpbot, "update_position_dashboard", lambda *a, **k: None)
     monkeypatch.setattr(ggpbot, "tg_entry", lambda *a, **k: None)

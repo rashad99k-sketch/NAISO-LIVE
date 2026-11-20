@@ -140,6 +140,85 @@ def compute_session_vwap(df: pd.DataFrame, timeframe_seconds: int = 900,
     return out
 
 
+
+def validate_dual_ema_vwap_entry_gate(
+    df: pd.DataFrame, side: str, ema_fn: Callable,
+    timeframe_seconds: int = 900, now_ms: Optional[int] = None,
+    lookback_candles: int = 2,
+) -> Dict[str, Any]:
+    """Fail-closed gate: EMA9/VWAP and EMA50/VWAP must both cross freshly
+    in the requested direction on closed candles, with directional EMA stacking.
+    The two crosses may occur on either of the last two closed candles.
+    """
+    direction = str(side or "").upper()
+    lookback = max(1, min(3, int(lookback_candles)))
+    result: Dict[str, Any] = {
+        "ready": False, "side": direction, "reason": "invalid_side",
+        "ema9_cross": None, "ema50_cross": None,
+        "ema9_cross_timestamp": None, "ema50_cross_timestamp": None,
+        "ema9": None, "ema50": None, "vwap": None,
+        "lookback_candles": lookback,
+    }
+    if direction not in {"BUY", "SELL"}:
+        return result
+    if not validate_ohlcv(df):
+        result["reason"] = "invalid_ohlcv"
+        return result
+    closed = closed_candles(df, timeframe_seconds, now_ms=now_ms)
+    if len(closed) < 55:
+        result["reason"] = "insufficient_closed_candles_for_ema50"
+        return result
+    vwap = compute_session_vwap(closed, timeframe_seconds, now_ms=now_ms)
+    if vwap is None:
+        result["reason"] = "session_vwap_unavailable"
+        return result
+    try:
+        close = closed["close"].astype(float)
+        ema9, ema50 = ema_fn(close, 9), ema_fn(close, 50)
+        if len(ema9) != len(closed) or len(ema50) != len(closed):
+            raise ValueError("EMA length mismatch")
+        if not all(np.isfinite(float(s.iloc[-1])) for s in (ema9, ema50, vwap)):
+            raise ValueError("non-finite latest indicator")
+    except Exception as exc:
+        result["reason"] = f"indicator_calculation_failed:{type(exc).__name__}"
+        return result
+
+    expected = "BULLISH" if direction == "BUY" else "BEARISH"
+    first_idx = max(1, len(closed) - lookback)
+    found: Dict[str, Tuple[str, int]] = {}
+    for name, series in (("ema9", ema9), ("ema50", ema50)):
+        for idx in range(len(closed) - 1, first_idx - 1, -1):
+            prev_gap = float(series.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
+            gap = float(series.iloc[idx]) - float(vwap.iloc[idx])
+            crossed = ("BULLISH" if prev_gap <= 0.0 < gap else
+                       "BEARISH" if prev_gap >= 0.0 > gap else None)
+            if crossed:
+                found[name] = (crossed, int(closed["timestamp"].iloc[idx]))
+                break
+
+    e9, e50, vw = float(ema9.iloc[-1]), float(ema50.iloc[-1]), float(vwap.iloc[-1])
+    result.update({
+        "ema9": e9, "ema50": e50, "vwap": vw,
+        "ema9_cross": found.get("ema9", (None, None))[0],
+        "ema50_cross": found.get("ema50", (None, None))[0],
+        "ema9_cross_timestamp": found.get("ema9", (None, None))[1],
+        "ema50_cross_timestamp": found.get("ema50", (None, None))[1],
+        "latest_closed_timestamp": int(closed["timestamp"].iloc[-1]),
+    })
+    if "ema9" not in found or found["ema9"][0] != expected:
+        result["reason"] = "missing_fresh_directional_ema9_vwap_cross"
+        return result
+    if "ema50" not in found or found["ema50"][0] != expected:
+        result["reason"] = "missing_fresh_directional_ema50_vwap_cross"
+        return result
+    aligned = (e9 > e50 > vw) if direction == "BUY" else (e9 < e50 < vw)
+    if not aligned:
+        result["reason"] = "ema9_ema50_vwap_alignment_not_confirmed"
+        return result
+    result.update({"ready": True, "reason": "dual_ema_vwap_cross_confirmed"})
+    return result
+
+
 def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
                         ema_len: int = 9, timeframe_seconds: int = 900,
                         now_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:

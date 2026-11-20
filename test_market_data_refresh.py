@@ -532,9 +532,11 @@ class _BoardSpy:
     def __init__(self, real):
         self._real = real
         self.calls = 0
+        self.contexts = []
 
     def evaluate(self, context):
         self.calls += 1
+        self.contexts.append(dict(context or {}))
         return self._real.evaluate(context)
 
 
@@ -605,31 +607,37 @@ def _run_cycle(monkeypatch, *, scenario, missing=None, emergency=False,
     return mgr, spy, logs
 
 
-def test_gate_blocks_board_on_stale(monkeypatch):
+def test_gate_stale_uses_price_only_board_path(monkeypatch):
     mgr, spy, logs = _run_cycle(monkeypatch, scenario="STALE")
-    assert spy.calls == 0, "STALE data must not reach board.evaluate"
+    assert spy.calls == 1, "STALE data must retain price/target/stop management"
+    assert spy.contexts[-1]["indicator_decisions_allowed"] is False
+    assert spy.contexts[-1]["synthetic_sl"] > 0
     assert mgr.last_decision_blocked_reason == "stale_or_missing_market_data"
-    assert any("DECISION_BLOCKED" in m for m in logs)
+    assert any("PRICE_ONLY_MANAGEMENT" in m for m in logs)
 
 
-def test_gate_blocks_board_on_invalid(monkeypatch):
-    # A fetch failure returns at the market-data error handler (before the gate),
-    # which still guarantees board.evaluate is never reached.
+def test_gate_invalid_uses_price_only_board_path(monkeypatch):
     mgr, spy, logs = _run_cycle(monkeypatch, scenario="INVALID")
-    assert spy.calls == 0, "INVALID data must not reach board.evaluate"
+    assert spy.calls == 1, "INVALID indicators must not disable price/target/stop checks"
+    assert spy.contexts[-1]["indicator_decisions_allowed"] is False
+    assert spy.contexts[-1]["synthetic_sl"] > 0
     assert ggpbot.STATE["last_market_data_freshness"] == "INVALID"
     assert any("fetch error" in m for m in logs)
 
 
-def test_gate_blocks_board_on_insufficient(monkeypatch):
+def test_gate_insufficient_uses_price_only_board_path(monkeypatch):
     mgr, spy, logs = _run_cycle(monkeypatch, scenario="INSUFFICIENT")
-    assert spy.calls == 0, "INSUFFICIENT data must not reach board.evaluate"
+    assert spy.calls == 1, "INSUFFICIENT candles must retain price/target/stop checks"
+    assert spy.contexts[-1]["indicator_decisions_allowed"] is False
+    assert spy.contexts[-1]["synthetic_sl"] > 0
 
 
-def test_gate_blocks_board_when_required_indicators_missing(monkeypatch):
+def test_gate_missing_indicators_uses_price_only_board_path(monkeypatch):
     mgr, spy, logs = _run_cycle(monkeypatch, scenario="MISSING")
-    assert spy.calls == 0, "missing ADX/DI/continuation must block the board"
-    assert any("DECISION_BLOCKED" in m for m in logs)
+    assert spy.calls == 1, "missing indicators must not disable price/target/stop checks"
+    assert spy.contexts[-1]["indicator_decisions_allowed"] is False
+    assert spy.contexts[-1]["synthetic_sl"] > 0
+    assert any("PRICE_ONLY_MANAGEMENT" in m for m in logs)
 
 
 def test_gate_allows_board_on_fresh(monkeypatch):
@@ -644,9 +652,11 @@ def test_gate_allows_board_on_unchanged_but_valid(monkeypatch):
     assert any("UNCHANGED_BUT_VALID" in m for m in logs)
 
 
-def test_gate_stale_without_emergency_no_board_no_decision(monkeypatch):
+def test_gate_stale_without_emergency_still_checks_price_stops(monkeypatch):
     mgr, spy, logs = _run_cycle(monkeypatch, scenario="STALE", emergency=False)
-    assert spy.calls == 0, "STALE + no emergency -> board.evaluate must not run"
+    assert spy.calls == 1, "STALE + no emergency must still run price-only checks"
+    assert spy.contexts[-1]["indicator_decisions_allowed"] is False
+    assert spy.contexts[-1]["synthetic_sl"] > 0
     assert mgr.last_decision_blocked_reason == "stale_or_missing_market_data"
 
 

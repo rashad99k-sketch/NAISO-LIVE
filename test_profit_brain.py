@@ -231,3 +231,94 @@ def test_only_recent_directional_vwap_cross_blocks_range_scalp():
     assert unknown_mode == RANGE_MODE
 
 
+
+
+def test_exit_risk_closes_profitable_trade_only_on_multi_engine_confluence():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 4.2, "di_plus": 12, "di_minus": 28,
+        "momentum": {"flow_bias": "SELL", "momentum_decay": True, "exhaustion_risk": 72},
+        "smart_money": {"distribution_risk": 68},
+        "continuation_probability": 0.32,
+    })
+    assert result["action"] == "CLOSE_PROFIT"
+    assert result["group_count"] >= 2
+
+
+def test_exit_risk_does_not_close_profitable_trade_on_one_warning():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 2.0,
+        "momentum": {"momentum_decay": True},
+    })
+    assert result["action"] == "HOLD"
+
+
+def test_exit_risk_hard_structural_invalidation_is_not_delayed_by_profit_mode():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": -1.0, "structural_invalidation": True,
+    })
+    assert result["action"] == "HARD_EXIT"
+
+
+def test_institutional_flow_and_di_opposition_tighten_profitable_trade():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": 1.8, "di_plus": 29, "di_minus": 15,
+        "smart_money": {"institutional_bias": "BUY"},
+    })
+    assert result["action"] == "LOCK_PROFIT"
+    assert "DIRECTIONAL_FLOW" in result["groups"]
+    assert "INSTITUTIONAL_FLOW" in result["groups"]
+
+
+def test_opposing_sr_rejection_adds_independent_risk_evidence():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 2.0, "opposing_zone_rejection": True,
+        "opposing_zone_distance_atr": 0.25,
+        "momentum": {"momentum_decay": True},
+    })
+    assert result["action"] == "LOCK_PROFIT"
+    assert "SUPPORT_RESISTANCE" in result["groups"]
+
+
+def test_distribution_pressure_is_not_exit_risk_for_aligned_short_trade():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": 2.0,
+        "smart_money": {"distribution_risk": 82, "institutional_bias": "SELL"},
+    })
+    assert result["action"] == "HOLD"
+
+
+def test_fresh_opposite_dual_vwap_cross_adds_risk_for_profitable_position():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": 2.0,
+        "fresh_ema9_vwap_cross": True, "fresh_ema50_vwap_cross": True,
+        "vwap_cross_direction": "BEARISH",
+        "vwap_cross_age_seconds": 60, "vwap_cross_max_age_seconds": 1800,
+        "momentum": {"momentum_decay": True},
+    })
+    assert result["action"] == "LOCK_PROFIT"
+    assert "CROSS_STRUCTURE" in result["groups"]
+
+
+def test_confirmed_bearish_trend_selects_trend_ride():
+    mode, _, _ = classify_profit_mode({
+        "side": "SELL", "regime": "STRONG_TREND", "trade_state": "TREND_RIDE",
+        "adx": 31, "adx_slope": 1.2, "continuation_probability": 0.84,
+        "di_plus": 11, "di_minus": 34, "momentum_strength": 82,
+        "trend_expansion": True,
+    })
+    assert mode == TREND_MODE
+
+
+def test_momentum_engine_uses_direction_neutral_strength_and_separate_flow_bias():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    assert "abs_spread = abs(float(momentum_spread.iloc[-1]))" in source
+    assert "trend_expansion = abs_spread > 0.35" in source
+    assert 'flow_bias = "SELL"' in source
