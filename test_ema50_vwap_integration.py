@@ -97,3 +97,13 @@ def test_watchlist_candidate_priority_uses_directional_cross_but_keeps_structura
     assert "vwap_cross_priority" in source
     assert "AUTHORITY.decide" in source
     assert "execute_entry remain the sole entry authorization path" in source
+
+
+def test_cross_timestamp_fields_are_provided_to_profit_and_dashboard_context():
+    from pathlib import Path
+    source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert '"cross_age_seconds": _cross_age if _cross_event else None' in source
+    assert '"cross_max_age_seconds": _cross_max_age' in source
+    assert '"vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds")' in source
+    assert 'STATE["fresh_ema9_vwap_cross"] = bool(_cross_snapshot.get("cross_ema9") and _cross_snapshot.get("cross_fresh"))' in source
+    assert 'STATE["fresh_ema50_vwap_cross"] = bool(_cross_snapshot.get("cross_ema50") and _cross_snapshot.get("cross_fresh"))' in source
