@@ -304,3 +304,21 @@ def test_fresh_opposite_dual_vwap_cross_adds_risk_for_profitable_position():
     })
     assert result["action"] == "LOCK_PROFIT"
     assert "CROSS_STRUCTURE" in result["groups"]
+
+
+def test_confirmed_bearish_trend_selects_trend_ride():
+    mode, _, _ = classify_profit_mode({
+        "side": "SELL", "regime": "STRONG_TREND", "trade_state": "TREND_RIDE",
+        "adx": 31, "adx_slope": 1.2, "continuation_probability": 0.84,
+        "di_plus": 11, "di_minus": 34, "momentum_strength": 82,
+        "trend_expansion": True,
+    })
+    assert mode == TREND_MODE
+
+
+def test_momentum_engine_uses_direction_neutral_strength_and_separate_flow_bias():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    assert "abs_spread = abs(float(momentum_spread.iloc[-1]))" in source
+    assert "trend_expansion = abs_spread > 0.35" in source
+    assert 'flow_bias = "SELL"' in source
