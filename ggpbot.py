@@ -5977,12 +5977,19 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     # Final execution-boundary gate: no institutional, sniper, RF or legacy
     # setup can bypass the dual EMA9/EMA50-to-session-VWAP closed-candle cross.
     gate_frame = institutional_entry_ctx.get("closed_candle_frame")
+    gate_frame_source = institutional_entry_ctx.get("closed_candle_source") or "ENTRY_CONTEXT"
     gate_tf = str(institutional_entry_ctx.get("candle_timeframe") or INTERVAL)
     try:
+        # Legacy callers may not carry the RORO frame in their context. Re-fetch
+        # through the existing shared scanner-frame cache; missing data never bypasses the gate.
+        if gate_frame is None:
+            gate_frame = _integration_fetch_frame(symbol)
+            gate_frame_source = "SHARED_SCANNER_FRAME_FALLBACK"
         gate_result = _validate_dual_ema_vwap_entry_gate(
             gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
             now_ms=int(time.time() * 1000), lookback_candles=2,
         )
+        gate_result["frame_source"] = gate_frame_source
     except Exception as gate_exc:
         gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
