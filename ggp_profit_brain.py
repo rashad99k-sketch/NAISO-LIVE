@@ -410,6 +410,8 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
     flow_bias = str(momentum.get("flow_bias") or ctx.get("flow_bias") or "").upper()
     flow_opposed = flow_bias in ({"SELL"} if side == "BUY" else {"BUY"})
     distribution = _number(smart.get("distribution_risk", ctx.get("distribution_risk")), 0.0) or 0.0
+    smart_bias = str(smart.get("institutional_bias") or "").upper()
+    smart_flow_opposed = smart_bias in ({"SELL"} if side == "BUY" else {"BUY"})
     exhaustion = _number(momentum.get("exhaustion_risk", ctx.get("exhaustion_risk")), 0.0) or 0.0
     climax = _number(momentum.get("climax_risk", ctx.get("climax_risk")), 0.0) or 0.0
     momentum_decay = bool(momentum.get("momentum_decay", ctx.get("momentum_decay", False)))
@@ -418,6 +420,10 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         groups.add("DIRECTIONAL_FLOW")
         if di_opposed: reasons.append("di_pressure_opposed")
         if flow_opposed: reasons.append("momentum_flow_opposed")
+    if smart_flow_opposed:
+        score += 1
+        groups.add("INSTITUTIONAL_FLOW")
+        reasons.append("institutional_bias_opposed")
     if distribution >= 60:
         score += 1
         groups.add("INSTITUTIONAL_FLOW")
