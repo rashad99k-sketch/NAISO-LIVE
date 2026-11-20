@@ -461,7 +461,8 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         score += 2
         groups.add("ZONE_STRUCTURE")
         reasons.append("opposing_zone_event:" + zone_event)
-    ob_status = str(ob.get("status") or ob.get("validation", {}).get("status") or "").upper()
+    ob_validation = ob.get("validation") if isinstance(ob.get("validation"), dict) else {}
+    ob_status = str(ob.get("status") or ob_validation.get("status") or "").upper()
     if ob_status in {"INVALIDATED", "MITIGATED"}:
         score += 1
         groups.add("INSTITUTIONAL_ZONE")
