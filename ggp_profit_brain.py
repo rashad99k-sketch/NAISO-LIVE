@@ -11,7 +11,7 @@ from math import isfinite
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
-RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00, 2.00)
+RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
 RANGE_MODE = "RANGE_SCALP"
 TREND_MODE = "TREND_RIDE"
 STANDARD_MODE = "TWO_STAGE_50_50"
@@ -210,7 +210,7 @@ def target_reached(side: str, current_price: float, target_price: float) -> bool
 
 
 def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
-    """Select a 0.25/0.50/1.00/2.00% PRICE move from simple, observable evidence.
+    """Select a 0.25/0.50/1.00% PRICE move from simple, observable evidence.
 
     Targets are price movement percentages, not leveraged ROE. Weak/thin
     conditions stay at 0.25%; moderate follow-through earns 0.50%; strong
@@ -238,14 +238,6 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     regime = str(ctx.get("regime") or "").upper()
     trade_state = str(ctx.get("trade_state") or "").upper()
     expansion_confirmed = trend_expansion or regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or trade_state in {"TREND_RIDE", "EXPANSION"}
-
-    # 2% is an exceptional extension, not the routine scalp objective.
-    # It requires at least three aligned completed candles and independent
-    # momentum, volume, ADX, DI and regime/expansion confirmation.
-    if (aligned_count >= 3 and continuation >= 0.85 and adx >= 28.0
-            and volume_ratio >= 1.50 and di_aligned and momentum >= 70.0
-            and expansion_confirmed and not adverse_rejection and not low_liquidity):
-        return RANGE_PROFIT_TARGETS_PCT[3], "exceptional_expansion_2.00pct"
 
     if (aligned_count >= 2 and continuation >= 0.72 and adx >= 22.0
             and volume_ratio >= 1.20 and di_aligned and not adverse_rejection):
