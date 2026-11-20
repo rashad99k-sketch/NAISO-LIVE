@@ -689,14 +689,19 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         cross_direction = str(proximity.get("cross_any") or "").upper()
         selected_side = str(prior.get("side") or "").upper()
         expected_cross = "BULLISH" if selected_side == "BUY" else "BEARISH" if selected_side == "SELL" else ""
-        # Fresh EMA9 or EMA50 VWAP crosses improve watchlist ordering only.
-        # They never bypass the structural EntryAuthority or execution checks.
+        # A previously observed cross is rankable only while its candle age is
+        # within two current timeframes. Unknown timestamps never earn a bonus.
+        cross_age = rank_number(proximity.get("cross_age_seconds"), float("inf"))
+        timeframe_seconds = rank_number(proximity.get("timeframe_seconds"), 900.0)
+        cross_max_age = max(1.0, timeframe_seconds * 2.0)
+        cross_fresh = 0.0 <= cross_age <= cross_max_age
+        # Crosses affect ordering only; structural EntryAuthority remains final.
         vwap_cross_priority = (
-            0.65 if cross_direction and cross_direction == expected_cross
-            else -0.35 if cross_direction and expected_cross and cross_direction != expected_cross
+            0.65 if cross_fresh and cross_direction and cross_direction == expected_cross
+            else -0.35 if cross_fresh and cross_direction and expected_cross and cross_direction != expected_cross
             else 0.0
         )
-        if bool(proximity.get("cross_conflict")):
+        if bool(proximity.get("cross_conflict")) and cross_fresh:
             vwap_cross_priority = -0.50
         elif str(proximity.get("state") or "").upper() in {"NEAR_CROSS", "CONVERGING"}:
             vwap_cross_priority = max(vwap_cross_priority, 0.12)
