@@ -187,7 +187,9 @@ def test_two_percent_target_is_not_selected_on_adverse_rejection_or_thin_liquidi
     }
     rejected, _ = select_range_target_pct({**base, "adverse_rejection": True})
     thin, _ = select_range_target_pct({**base, "thin_liquidity": True})
-    assert rejected == 1.00
+    # An adverse rejection invalidates the exceptional and strong extension;
+    # the conservative fallback is the smallest target, not a 1% hold-out.
+    assert rejected == 0.25
     assert thin == 0.25
 
 
