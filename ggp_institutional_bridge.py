@@ -685,6 +685,34 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         liq = prior.get("liquidity") if isinstance(prior.get("liquidity"), dict) else {}
         liquidity_quality = max(0.0, min(1.0, rank_number(liq.get("confidence")) / 100.0))
         analysis_priority = max(0.0, min(100.0, rank_number(prior.get("analysis_priority_score")))) / 100.0
+        proximity = prior.get("ema9_vwap_proximity") if isinstance(prior.get("ema9_vwap_proximity"), dict) else {}
+        proximity = dict(proximity)
+        proximity_observed_at = rank_number(proximity.get("updated_at"), 0.0)
+        proximity_observation_age = max(0.0, time.time() - proximity_observed_at) if proximity_observed_at else float("inf")
+        proximity["observation_age_seconds"] = proximity_observation_age
+        cross_direction = str(proximity.get("cross_any") or "").upper()
+        selected_side = str(prior.get("side") or "").upper()
+        expected_cross = "BULLISH" if selected_side == "BUY" else "BEARISH" if selected_side == "SELL" else ""
+        # A previously observed cross is rankable only while its candle age is
+        # within two current timeframes. Unknown timestamps never earn a bonus.
+        cross_age = rank_number(proximity.get("cross_age_seconds"), float("inf"))
+        timeframe_seconds = rank_number(proximity.get("timeframe_seconds"), 900.0)
+        cross_max_age = max(1.0, timeframe_seconds * 2.0)
+        cross_fresh = (
+            0.0 <= cross_age <= cross_max_age
+            and bool(proximity.get("cross_fresh", True))
+        )
+        # Crosses affect ordering only; structural EntryAuthority remains final.
+        vwap_cross_priority = (
+            0.65 if cross_fresh and cross_direction and cross_direction == expected_cross
+            else -0.35 if cross_fresh and cross_direction and expected_cross and cross_direction != expected_cross
+            else 0.0
+        )
+        if bool(proximity.get("cross_conflict")) and cross_fresh:
+            vwap_cross_priority = -0.50
+        elif (0.0 <= rank_number(proximity.get("observation_age_seconds"), float("inf")) <= 1800.0
+              and str(proximity.get("state") or "").upper() in {"NEAR_CROSS", "CONVERGING"}):
+            vwap_cross_priority = max(vwap_cross_priority, 0.12)
         discovery_score = max(0.0, min(100.0, rank_number(item.get("score")))) / 100.0
         updated = rank_number(prior.get("last_update", prior.get("last_updated", 0)))
         freshness = max(0.0, 1.0 - max(0.0, time.time() - updated) / 1800.0) if updated else 0.0
@@ -692,7 +720,8 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         # while rotating all symbols to prevent low-ranked candidates starving forever.
         priority = (state_bonus + 0.9 * golden_score + 0.55 * ob_near
                     + 0.35 * liquidity_quality + 0.45 * analysis_priority
-                    + 0.30 * discovery_score + 0.20 * freshness)
+                    + 0.30 * discovery_score + 0.20 * freshness
+                    + vwap_cross_priority)
         return (priority, state_bonus, golden_score, float(item.get("score", 0) or 0), key)
     ordered = sorted(items.items(), key=candidate_rank, reverse=True)
     if not ordered:

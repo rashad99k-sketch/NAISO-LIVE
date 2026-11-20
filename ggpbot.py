@@ -674,12 +674,27 @@ def tg_start(balance, mode):
     balance_text = f"{balance:.2f} USDT" if isinstance(balance, (int, float)) and math.isfinite(balance) else "UNAVAILABLE"
     send_once(f"🚀 <b>GGP Institutional</b>\n💼 Balance: {balance_text}\n⚙️ Mode: {html_escape(str(mode))}\n⚖️ Leverage policy: 20x\n🧠 Trade manager: Unified", "startup", 86400)
 
-def tg_entry(side, symbol, entry, sl, tp, score, reason, entry_type):
-    side_emoji = "🟢" if side == "BUY" else "🔴"
+def tg_entry(side, symbol, entry, sl, tp1, score, reason, entry_type,
+             tp2=None, qty=None, leverage=None, trade_id=None):
+    side_text = str(side).upper()
+    side_emoji = "🟢" if side_text == "BUY" else "🔴" if side_text == "SELL" else "⚪"
     safe_symbol = html_escape(str(symbol))
     safe_type = html_escape(str(entry_type))
-    safe_reason = html_escape(str(reason)[:100])
-    send_once(f"{side_emoji} <b>{html_escape(str(side))} {safe_type}</b>\n📊 {safe_symbol}\n💰 Entry: {entry:.8f}\n🛑 Structural SL: {sl:.8f}\n🎯 TP1: {tp:.8f}\n🧠 Score: {score}\n📌 {safe_reason}", f"entry_{symbol}", 60)
+    safe_reason = html_escape(str(reason)[:160])
+    parts = [
+        f"{side_emoji} <b>POSITION OPENED · {html_escape(side_text)} {safe_type}</b>",
+        f"📊 {safe_symbol}",
+        f"💰 Planned entry: {safe_float(entry):.8f}",
+        f"🛑 Structural SL: {safe_float(sl):.8f}",
+        f"🥇 TP1: {safe_float(tp1):.8f}",
+        f"🥈 TP2: {safe_float(tp2):.8f}" if tp2 is not None and safe_float(tp2) > 0 else "🥈 TP2: NOT SET",
+    ]
+    if qty is not None: parts.append(f"📦 Position quantity: {safe_float(qty):.8f}")
+    if leverage is not None: parts.append(f"⚖️ Leverage: {safe_float(leverage):.2f}x")
+    if score is not None: parts.append(f"🧠 Setup score: {html_escape(str(score))}")
+    if trade_id: parts.append(f"🔖 Trade ID: {html_escape(str(trade_id))}")
+    parts.append(f"📌 Setup: {safe_reason}")
+    send_once("\n".join(parts), f"entry_{trade_id or symbol}", 5)
 
 def tg_tp_hit(symbol, tp_level, pnl_pct=None, qty=None, fill_price=None, order_id=None,
               realized_pnl_usdt=None, pnl_source=None, side=None, entry_price=None):
@@ -712,23 +727,36 @@ def tg_sl_hit(symbol, pnl_pct=None, pnl_usdt=None, fill_price=None, order_id=Non
     send_once("\n".join(parts), f"sl_{symbol}_{order_id or 'verified'}", 30)
 
 def tg_close(symbol, pnl_pct, duration_min, side, close_reason=None, pnl_usdt=None,
-             entry_price=None, exit_price=None, pnl_source=None):
+              entry_price=None, exit_price=None, pnl_source=None,
+              total_qty=None, trade_id=None):
     reason = str(close_reason or "CLOSE").upper()
     if reason == "TP2": icon, title = "🥈", "TP2 VERIFIED · POSITION CLOSED"
     elif reason.startswith("RANGE_SCALP"): icon, title = "⚡", "RANGE SCALP · POSITION CLOSED"
     elif "STOP" in reason: icon, title = "🛑", "STOP / PROTECTIVE EXIT · POSITION CLOSED"
     elif "STRICT" in reason or "THESIS" in reason or "EMERGENCY" in reason: icon, title = "⛔", "STRICT EXIT VERIFIED · POSITION CLOSED"
-    else: icon, title = (("✅" if pnl_usdt is not None and pnl_usdt >= 0 else "❌") if pnl_usdt is not None else "⚪"), "POSITION CLOSED"
-    parts = [f"{icon} <b>{title}</b>", f"📊 {html_escape(str(symbol))} ({html_escape(str(side))})"]
+    else: icon, title = "📋", "POSITION CLOSED"
+    if pnl_usdt is None:
+        outcome = "RESULT: PNL UNAVAILABLE — NOT CLASSIFIED"
+    elif pnl_usdt > 0:
+        outcome = "RESULT: PROFIT"
+    elif pnl_usdt < 0:
+        outcome = "RESULT: LOSS"
+    else:
+        outcome = "RESULT: BREAKEVEN"
+    parts = [f"{icon} <b>{title}</b>", f"📊 {html_escape(str(symbol))} ({html_escape(str(side))})",
+             f"<b>{outcome}</b>"]
     if pnl_usdt is not None:
         parts.append(f"💵 Total realized PnL: {safe_float(pnl_usdt):+.4f} USDT")
         if pnl_pct is not None: parts.append(f"📈 Total realized ROE: {safe_float(pnl_pct):+.2f}%")
     else: parts.append("💵 Total realized PnL: UNAVAILABLE — exchange data incomplete")
     if entry_price and safe_float(entry_price) > 0: parts.append(f"Entry: {safe_float(entry_price):.8f}")
     if exit_price and safe_float(exit_price) > 0: parts.append(f"Final exit fill: {safe_float(exit_price):.8f}")
+    if total_qty is not None: parts.append(f"📦 Original position quantity: {safe_float(total_qty):.8f}")
     parts.extend([f"⏱ Duration: {safe_float(duration_min):.0f} min", f"Reason: {html_escape(reason)}"])
     if pnl_source: parts.append(f"🧾 Source: {html_escape(str(pnl_source))}")
-    send_once("\n".join(parts), f"close_{symbol}_{reason}", 10)
+    if trade_id: parts.append(f"🔖 Trade ID: {html_escape(str(trade_id))}")
+    close_key = str(trade_id or (str(symbol) + "_" + reason))
+    send_once("\n".join(parts), f"close_{close_key}", 1)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{html_escape(str(error_type))}]\n{html_escape(str(err_msg)[:200])}", f"err_{error_type}_{str(err_msg)[:50]}", 60)
@@ -2468,6 +2496,10 @@ class TradeManagementBoard:
                 "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
                 "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
+                "fresh_ema9_vwap_cross": bool(ctx.get("fresh_ema9_vwap_cross", False)),
+                "fresh_ema50_vwap_cross": bool(ctx.get("fresh_ema50_vwap_cross", False)),
+                "vwap_cross_direction": str(ctx.get("vwap_cross_direction") or ""),
+                "vwap_cross_trigger": str(ctx.get("vwap_cross_trigger") or "NONE"),
                 "market_regime": str(ctx.get("regime") or "UNKNOWN"),
                 "tp1_hit": bool(ctx.get("tp1_hit")),
                 "tp2_hit": bool(ctx.get("tp2_hit")),
@@ -3269,6 +3301,7 @@ class LiveTradeManager:
             f"BE={bool(STATE.get('be_done'))} Trail(local)={bool(STATE.get('trail_activated'))} | "
             f"ADX={safe_float(STATE.get('adx_live')):.1f} DI+={safe_float(STATE.get('di_plus_live')):.1f} "
             f"DI-={safe_float(STATE.get('di_minus_live')):.1f} Continuation={safe_float(STATE.get('continuation_probability'),0.5):.2f} | "
+            f"VWAPCross={STATE.get('vwap_cross_trigger', 'UNKNOWN')} Direction={STATE.get('vwap_cross_direction', 'UNKNOWN')} | "
             f"State={state_str} RecoveryHold={bool(STATE.get('recovery_hold'))}",
             "INFO", debounce_key=f"profit_brain_status_{symbol}", debounce_sec=15
         )
@@ -3391,6 +3424,54 @@ class LiveTradeManager:
 
         # Heavy calculations every 5 seconds (ADX, DI, SmartMoney, Momentum, StateMachine)
         if now - self.last_heavy_calc_ts >= 5:
+            # Preserve the legacy closed-candle EMA9/session-VWAP method and add
+            # an independent EMA50/VWAP cross. This is management context, not
+            # an order by itself. Open-position protection never waits for a cross.
+            try:
+                _cross_snapshot = _roro_ema9_vwap_proximity(
+                    df_live, ema, ema_len=9,
+                    timeframe_seconds=_timeframe_seconds(INTERVAL),
+                    now_ms=int(now * 1000),
+                )
+                if isinstance(_cross_snapshot, dict):
+                    _cross_snapshot = dict(_cross_snapshot)
+                    _cross_ts_ms = safe_float(_cross_snapshot.get("candle_timestamp"), 0.0)
+                    _cross_frame_seconds = float(_timeframe_seconds(INTERVAL))
+                    _cross_age = max(0.0, float(now) - (_cross_ts_ms / 1000.0 + _cross_frame_seconds))
+                    _cross_max_age = 2.0 * _cross_frame_seconds
+                    _cross_event = bool(_cross_snapshot.get("cross_ema9") or _cross_snapshot.get("cross_ema50"))
+                    _cross_snapshot.update({
+                        "cross_age_seconds": _cross_age if _cross_event else None,
+                        "cross_max_age_seconds": _cross_max_age,
+                        "timeframe_seconds": _cross_frame_seconds,
+                        "cross_fresh": bool(_cross_event and _cross_age <= _cross_max_age),
+                    })
+                    STATE["vwap_cross_snapshot"] = dict(_cross_snapshot)
+                    STATE["fresh_ema9_vwap_cross"] = bool(_cross_snapshot.get("cross_ema9") and _cross_snapshot.get("cross_fresh"))
+                    STATE["fresh_ema50_vwap_cross"] = bool(_cross_snapshot.get("cross_ema50") and _cross_snapshot.get("cross_fresh"))
+                    STATE["vwap_cross_direction"] = str(_cross_snapshot.get("cross_any") or "")
+                    STATE["vwap_cross_trigger"] = str(_cross_snapshot.get("cross_trigger") or "NONE")
+                    STATE["vwap_cross_candle_timestamp"] = int(_cross_snapshot.get("candle_timestamp") or 0)
+                    STATE["vwap_cross_age_seconds"] = _cross_snapshot.get("cross_age_seconds")
+                    STATE["vwap_cross_max_age_seconds"] = _cross_max_age
+                else:
+                    STATE["vwap_cross_snapshot"] = {}
+                    STATE["fresh_ema9_vwap_cross"] = False
+                    STATE["fresh_ema50_vwap_cross"] = False
+                    STATE["vwap_cross_direction"] = ""
+                    STATE["vwap_cross_trigger"] = "UNKNOWN"
+                    STATE["vwap_cross_age_seconds"] = None
+                    STATE["vwap_cross_max_age_seconds"] = 2.0 * float(_timeframe_seconds(INTERVAL))
+            except Exception as _cross_error:
+                STATE["vwap_cross_snapshot"] = {}
+                STATE["fresh_ema9_vwap_cross"] = False
+                STATE["fresh_ema50_vwap_cross"] = False
+                STATE["vwap_cross_direction"] = ""
+                STATE["vwap_cross_trigger"] = "UNKNOWN"
+                log_execution(
+                    f"[EMA_VWAP_CROSS] {symbol}: {type(_cross_error).__name__}: {_cross_error}",
+                    "WARN", debounce_key=f"ema_vwap_cross_{symbol}", debounce_sec=60
+                )
             plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
             if plus_di is None: plus_di = 20.0
             if minus_di is None: minus_di = 20.0
@@ -3511,6 +3592,12 @@ class LiveTradeManager:
                 "min_orderbook_depth_usdt": STATE.get("min_orderbook_depth_usdt", 0),
                 "structure_broken": bool(STATE.get("structure_broken", False)),
                 "trend_expansion": bool(momentum.get("trend_expansion", False)),
+                "fresh_ema9_vwap_cross": bool(STATE.get("fresh_ema9_vwap_cross", False)),
+                "fresh_ema50_vwap_cross": bool(STATE.get("fresh_ema50_vwap_cross", False)),
+                "vwap_cross_direction": str(STATE.get("vwap_cross_direction") or ""),
+                "vwap_cross_trigger": str(STATE.get("vwap_cross_trigger") or "NONE"),
+                "vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds"),
+                "vwap_cross_max_age_seconds": STATE.get("vwap_cross_max_age_seconds"),
             }
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
             current_mode = str(STATE.get("profit_mode") or STANDARD_MODE)
@@ -3839,6 +3926,13 @@ class LiveTradeManager:
 
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
+            "fresh_ema9_vwap_cross": bool(STATE.get("fresh_ema9_vwap_cross", False)),
+            "fresh_ema50_vwap_cross": bool(STATE.get("fresh_ema50_vwap_cross", False)),
+            "vwap_cross_direction": str(STATE.get("vwap_cross_direction") or ""),
+            "vwap_cross_trigger": str(STATE.get("vwap_cross_trigger") or "NONE"),
+            "vwap_cross_snapshot": dict(STATE.get("vwap_cross_snapshot") or {}),
+            "vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds"),
+            "vwap_cross_max_age_seconds": STATE.get("vwap_cross_max_age_seconds"),
             "entry_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
             "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
             "entry_mode_confidence": safe_float(STATE.get("entry_behavior_confidence"), 0.0),
@@ -6272,7 +6366,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
         return True
 
     sym = normalize_symbol(symbol)
@@ -6431,7 +6525,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _persist_trade_journal_snapshot(force=True)
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
         time.sleep(1)
         sync_position_state(symbol)
         return True
@@ -7908,7 +8002,8 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                      (time.time()-safe_float(STATE.get("entry_time"), time.time()))/60.0,
                      STATE.get("side"), close_reason=reason,
                      pnl_usdt=pnl_usdt if pnl_known else None,
-                     entry_price=entry, exit_price=close_price, pnl_source=pnl_source)
+                     entry_price=entry, exit_price=close_price, pnl_source=pnl_source,
+                      total_qty=initial_qty, trade_id=trade_id)
         except Exception:
             pass
 
@@ -8847,7 +8942,7 @@ function updateUI(d) {{
         let pHtml = "";
         d.ema9_vwap_proximity_scanner.forEach(item => {{
             let icon = item.cross ? "⚡" : (item.state === "NEAR_CROSS" || item.state === "CONVERGING" ? "🟡" : item.direction === "BUY" ? "📈" : item.direction === "SELL" ? "📉" : "⚪");
-            pHtml += `<div style="padding:6px;border-bottom:1px solid #26364a;">${{icon}} <b>${{item.symbol}}</b> | ${{item.direction || "UNKNOWN"}} | ${{item.state || "UNKNOWN"}} | Score: ${{item.score ?? "-"}} | Gap ATR: ${{item.gap_atr ?? "-"}} | EMA9: ${{item.ema9 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}} <small>· Closed candle · Ranking only</small></div>`;
+            pHtml += `<div style="padding:6px;border-bottom:1px solid #26364a;">${{icon}} <b>${{item.symbol}}</b> | ${{item.direction || "UNKNOWN"}} | ${{item.state || "UNKNOWN"}} | Score: ${{item.score ?? "-"}} | Gap ATR: ${{item.gap_atr ?? "-"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}} | Cross: ${{item.cross_trigger || "NONE"}} <small>· Closed candle · Ranking only</small></div>`;
         }});
         let pm = d.ema9_vwap_proximity_scanner_meta || {{}};
         document.getElementById("proximity-scanner-panel").innerHTML = (pHtml || "No proximity candidates") + `<small>Batch: ${{pm.observed_this_batch ?? 0}} | Pool: ${{pm.symbols ?? 0}} | Updated: ${{pm.updated_at ? new Date(pm.updated_at*1000).toLocaleTimeString() : "-"}} | Role: ${{pm.role || "RANKING_ONLY"}}</small>`;
@@ -9248,7 +9343,7 @@ def health():
         "proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}).get("state", "UNKNOWN"),
         "trade_management_authority": "TradeManagementBoard / LiveTradeManager",
         "trade_management_events": len(TRADE_MANAGEMENT_LOG),
-        "telegram": {"configured": TELEGRAM_NOTIFIER.configured},
+        "telegram": TELEGRAM_NOTIFIER.status(),
     })
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
@@ -10456,9 +10551,25 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                 if last_seen.get(symbol_key) != candle_ts:
                     MEMORY["_proximity_batch_updates"] = int(MEMORY.get("_proximity_batch_updates", 0)) + 1
                     last_seen[symbol_key] = candle_ts
+                    _observed_at = time.time()
+                    _proximity_frame_seconds = float(timeframe_seconds)
+                    _proximity_cross_event = bool(proximity.get("cross_ema9") or proximity.get("cross_ema50"))
+                    _proximity_cross_age = (
+                        max(0.0, _observed_at - (float(proximity.get("candle_timestamp") or 0) / 1000.0
+                                                 + _proximity_frame_seconds))
+                        if _proximity_cross_event else None
+                    )
+                    _proximity_cross_max_age = 2.0 * _proximity_frame_seconds
                     proximity_item = {
                         "symbol": symbol_key, "exchange_symbol": roro_exchange_symbol(symbol_for_proximity),
-                        **proximity, "updated_at": time.time(), "data_quality": "CLOSED_CANDLES",
+                        **proximity,
+                        "updated_at": _observed_at,
+                        "observation_age_seconds": 0.0,
+                        "timeframe_seconds": _proximity_frame_seconds,
+                        "cross_age_seconds": _proximity_cross_age,
+                        "cross_max_age_seconds": _proximity_cross_max_age,
+                        "cross_fresh": bool(_proximity_cross_event and _proximity_cross_age <= _proximity_cross_max_age),
+                        "data_quality": "CLOSED_CANDLES",
                         "role": "RANKING_ONLY_NOT_ENTRY_GATE",
                     }
                     rows = MEMORY.setdefault("ema9_vwap_proximity_scanner", [])
@@ -10468,7 +10579,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                     MEMORY["ema9_vwap_proximity_scanner"] = rows[:30]
                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                 icons = dict(analysis.get("icons") or {})
-                icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross") else
+                icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
                                                 "🟡" if proximity.get("state") in ("NEAR_CROSS", "CONVERGING") else
                                                 "📈" if proximity.get("direction") == "BUY" else
                                                 "📉" if proximity.get("direction") == "SELL" else "⚪")
