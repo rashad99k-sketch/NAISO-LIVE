@@ -10522,9 +10522,25 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                 if last_seen.get(symbol_key) != candle_ts:
                     MEMORY["_proximity_batch_updates"] = int(MEMORY.get("_proximity_batch_updates", 0)) + 1
                     last_seen[symbol_key] = candle_ts
+                    _observed_at = time.time()
+                    _proximity_frame_seconds = float(timeframe_seconds)
+                    _proximity_cross_event = bool(proximity.get("cross_ema9") or proximity.get("cross_ema50"))
+                    _proximity_cross_age = (
+                        max(0.0, _observed_at - (float(proximity.get("candle_timestamp") or 0) / 1000.0
+                                                 + _proximity_frame_seconds))
+                        if _proximity_cross_event else None
+                    )
+                    _proximity_cross_max_age = 2.0 * _proximity_frame_seconds
                     proximity_item = {
                         "symbol": symbol_key, "exchange_symbol": roro_exchange_symbol(symbol_for_proximity),
-                        **proximity, "updated_at": time.time(), "data_quality": "CLOSED_CANDLES",
+                        **proximity,
+                        "updated_at": _observed_at,
+                        "observation_age_seconds": 0.0,
+                        "timeframe_seconds": _proximity_frame_seconds,
+                        "cross_age_seconds": _proximity_cross_age,
+                        "cross_max_age_seconds": _proximity_cross_max_age,
+                        "cross_fresh": bool(_proximity_cross_event and _proximity_cross_age <= _proximity_cross_max_age),
+                        "data_quality": "CLOSED_CANDLES",
                         "role": "RANKING_ONLY_NOT_ENTRY_GATE",
                     }
                     rows = MEMORY.setdefault("ema9_vwap_proximity_scanner", [])
