@@ -85,3 +85,14 @@ def test_live_profit_manager_consumes_cross_diagnostics_without_gating_position_
     manage_body = source[manager_start:apply_start]
     assert 'if not (STATE.get("open") and STATE.get("current_symbol"))' in manage_body
     assert "vwap_cross" not in manage_body.lower()
+
+
+def test_watchlist_candidate_priority_uses_directional_cross_but_keeps_structural_authority():
+    from pathlib import Path
+
+    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert 'prior.get("ema9_vwap_proximity")' in source
+    assert 'cross_direction == expected_cross' in source
+    assert "vwap_cross_priority" in source
+    assert "UnifiedEntryAuthority" in source
+    assert "execute_entry" not in source
