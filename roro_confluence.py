@@ -153,10 +153,15 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
     if vwap is None:
         return None
     try:
-        e = ema_fn(closed["close"].astype(float), ema_len)
-        ema_now, vwap_now = float(e.iloc[-1]), float(vwap.iloc[-1])
-        prev_gap = float(e.iloc[-2] - vwap.iloc[-2])
+        close_series = closed["close"].astype(float)
+        e9 = ema_fn(close_series, ema_len)
+        e50 = ema_fn(close_series, 50)
+        ema_now, vwap_now = float(e9.iloc[-1]), float(vwap.iloc[-1])
+        prev_gap = float(e9.iloc[-2] - vwap.iloc[-2])
         gap = float(ema_now - vwap_now)
+        ema50_now = float(e50.iloc[-1]) if len(e50) and np.isfinite(float(e50.iloc[-1])) else None
+        ema50_prev_gap = float(e50.iloc[-2] - vwap.iloc[-2]) if len(e50) >= 2 and np.isfinite(float(e50.iloc[-2])) else None
+        ema50_gap = (ema50_now - vwap_now) if ema50_now is not None else None
         atr_proxy = float((closed["high"] - closed["low"]).rolling(14).mean().iloc[-1])
     except Exception:
         return None
@@ -165,14 +170,21 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
     if ema_now <= 0 or vwap_now <= 0 or atr_proxy <= 0:
         return None
     direction = "BUY" if gap > 0 else ("SELL" if gap < 0 else "NEUTRAL")
+    # Keep the legacy EMA9/VWAP calculation unchanged; EMA50 is an independent signal.
     crossed = "BULLISH" if prev_gap <= 0 < gap else ("BEARISH" if prev_gap >= 0 > gap else None)
+    crossed50 = (
+        "BULLISH" if ema50_prev_gap is not None and ema50_gap is not None and ema50_prev_gap <= 0 < ema50_gap
+        else "BEARISH" if ema50_prev_gap is not None and ema50_gap is not None and ema50_prev_gap >= 0 > ema50_gap
+        else None
+    )
+    any_cross = crossed or crossed50
     gap_pct = abs(gap) / vwap_now * 100.0
     gap_atr = abs(gap) / atr_proxy
     closeness = max(0.0, min(55.0, 55.0 * (1.0 - min(gap_atr, 2.0) / 2.0)))
     convergence = 25.0 if abs(gap) < abs(prev_gap) else 0.0
-    cross_bonus = 20.0 if crossed else 0.0
+    cross_bonus = 20.0 if any_cross else 0.0
     score = max(0.0, min(100.0, closeness + convergence + cross_bonus))
-    if crossed:
+    if any_cross:
         state = "CROSS_CONFIRMED"
     elif direction == "NEUTRAL":
         state = "AT_VWAP"
@@ -186,11 +198,18 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
         "direction": direction,
         "signal": "BULLISH" if direction == "BUY" else ("BEARISH" if direction == "SELL" else "NEUTRAL"),
         "cross": crossed,
+        "cross_ema9": crossed,
+        "cross_ema50": crossed50,
+        "cross_any": any_cross,
+        "cross_trigger": "EMA9_VWAP" if crossed else "EMA50_VWAP" if crossed50 else "NONE",
+        "ema50_direction": "BUY" if ema50_gap is not None and ema50_gap > 0 else "SELL" if ema50_gap is not None and ema50_gap < 0 else "NEUTRAL",
         "state": state,
         "score": round(score, 2),
-        "ema9": round(ema_now, 10), "vwap": round(vwap_now, 10),
+        "ema9": round(ema_now, 10), "ema50": round(ema50_now, 10) if ema50_now is not None else None,
+        "vwap": round(vwap_now, 10),
         "gap": round(gap, 10), "gap_pct": round(gap_pct, 5),
         "gap_atr": round(gap_atr, 4), "gap_change": round(gap - prev_gap, 10),
+        "ema50_gap": round(ema50_gap, 10) if ema50_gap is not None else None,
         "converging": bool(abs(gap) < abs(prev_gap)),
         "candle_timestamp": int(closed["timestamp"].iloc[-1]),
     }
