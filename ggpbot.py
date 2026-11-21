@@ -6193,9 +6193,16 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
             now_ms=int(time.time() * 1000), lookback_candles=2,
         )
-        gate_result["frame_source"] = gate_frame_source
+            gate_result["frame_source"] = gate_frame_source
     except Exception as gate_exc:
         gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
+    raw_signal_id = str(gate_result.get("signal_candle_id") or "").strip()
+    if raw_signal_id:
+        try:
+            event_symbol = normalize_symbol(symbol)
+        except Exception:
+            event_symbol = str(symbol or "").strip().upper()
+        gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"
     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
     # Preserve the exact gate snapshot for the serialized final execution wrapper.
     globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
@@ -6211,7 +6218,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return False
     # Consume the current signal identity only after this call has computed it,
     # and before sizing/order submission. Fail closed if durable state is unreadable.
-    entry_event_id = str(gate_result.get("signal_candle_id") or "").strip()
+    entry_event_id = str(gate_result.get("durable_event_id") or "").strip()
     entry_event_journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     if not entry_event_id and not PAPER_MODE and MODE_LIVE:
         log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: missing signal candle identity for {symbol}", "ERROR")
@@ -12707,7 +12714,7 @@ def execute_entry(*args, **kwargs):
         globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
         result = _original_execute_entry_for_journal(*args, **kwargs)
         gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
-        event_id = str(gate.get("signal_candle_id") or "").strip()
+        event_id = str(gate.get("durable_event_id") or "").strip()
         journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
         if result and STATE.get("open"):
             ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
