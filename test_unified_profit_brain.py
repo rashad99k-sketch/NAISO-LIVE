@@ -627,8 +627,26 @@ def test_production_defaults_keep_brain_in_safe_shadow_mode(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload["brain"] is False
-    assert payload["shadow"] is True
+    assert payload["brain"] is True
+    assert payload["shadow"] is False
+
+
+def test_live_profit_brain_is_shadow_only_without_explicit_authority():
+    assert ggpbot._resolve_profit_brain_shadow_mode(
+        paper_mode=False, requested_shadow=False, live_authority=False
+    ) is True
+
+
+def test_live_profit_brain_requires_separate_explicit_authority_opt_in():
+    assert ggpbot._resolve_profit_brain_shadow_mode(
+        paper_mode=False, requested_shadow=False, live_authority=True
+    ) is False
+
+
+def test_paper_profit_brain_can_be_authoritative_without_shadow():
+    assert ggpbot._resolve_profit_brain_shadow_mode(
+        paper_mode=True, requested_shadow=False, live_authority=False
+    ) is False
 
 
 def test_isolated_normal_pullback_and_liquidity_sweep_are_not_defensive(monkeypatch):
