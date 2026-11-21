@@ -6197,6 +6197,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     except Exception as gate_exc:
         gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
+    # Preserve the exact gate snapshot for the serialized final execution wrapper.
+    globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
     if not gate_result.get("ready"):
         log_execution(
             f"[VWAP_ENTRY_GATE] BLOCKED {symbol} {side} reason={gate_result.get('reason')} "
@@ -12671,14 +12673,63 @@ def sync_all_states():
         pass
 
 
-# Journal start/snapshot is tied to the existing GGP trade lifecycle, not a second manager.
+# Serialize final entry authorization so one closed-candle trigger cannot
+# submit two orders from concurrent scanner paths. Durable consumption occurs
+# only after the existing execution path verifies the fill and opens STATE.
+_ENTRY_EVENT_EXECUTION_LOCK = threading.RLock()
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
-    result = _original_execute_entry_for_journal(*args, **kwargs)
-    if result and STATE.get("open"):
-        ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-        _persist_trade_journal_start(ctx.get("setup_type"))
-    return result
+    with _ENTRY_EVENT_EXECUTION_LOCK:
+        gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
+        event_id = str(gate.get("signal_candle_id") or "").strip()
+        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        if event_id:
+            if journal is None:
+                if not PAPER_MODE and MODE_LIVE:
+                    log_execution(
+                        f"[ENTRY_EVENT_GUARD] BLOCKED live entry: durable journal unavailable for {event_id}",
+                        "ERROR",
+                    )
+                    return False
+            else:
+                try:
+                    if journal.is_event_consumed(event_id):
+                        log_execution(
+                            f"[ENTRY_EVENT_GUARD] BLOCKED duplicate closed-candle signal {event_id}",
+                            "WARN", debounce_key=f"entry_event_consumed:{event_id}", debounce_sec=30,
+                        )
+                        return False
+                except Exception as exc:
+                    log_execution(
+                        f"[ENTRY_EVENT_GUARD] BLOCKED: cannot verify durable event state "
+                        f"for {event_id}: {type(exc).__name__}: {exc}", "ERROR",
+                    )
+                    return False
+
+        result = _original_execute_entry_for_journal(*args, **kwargs)
+        if result and STATE.get("open"):
+            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+            _persist_trade_journal_start(ctx.get("setup_type"))
+            if event_id and journal is not None:
+                trade_id = str(STATE.get("trade_id") or "")
+                try:
+                    if not trade_id or not journal.consume_event(event_id, trade_id):
+                        STATE["entry_event_persistence_failed"] = True
+                        globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                        log_execution(
+                            f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                            f"but could not durably consume signal {event_id}; new entries blocked",
+                            "ERROR",
+                        )
+                except Exception as exc:
+                    STATE["entry_event_persistence_failed"] = True
+                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                    log_execution(
+                        f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
+                        f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
+                        "ERROR",
+                    )
+        return result
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):
