@@ -489,12 +489,14 @@ def validate_ema915_vwap_pullback_entry_gate(
     last_high, last_low = float(last["high"]), float(last["low"])
     previous_high, previous_low = float(previous["high"]), float(previous["low"])
     candle_range = max(0.0, last_high - last_low)
+    lower_wick_ratio = (min(last_open, last_close) - last_low) / candle_range if candle_range > 0 else 0.0
+    upper_wick_ratio = (last_high - max(last_open, last_close)) / candle_range if candle_range > 0 else 0.0
     if direction == "BUY":
-        rejection = last_close > last_open and last_close > e9_now
+        rejection = last_close > last_open and last_close > e9_now and lower_wick_ratio >= 0.10
         continuation = last_close > previous_high
         extension = (float(current_price) if current_price is not None else last_close) - e9_now
     else:
-        rejection = last_close < last_open and last_close < e9_now
+        rejection = last_close < last_open and last_close < e9_now and upper_wick_ratio >= 0.10
         continuation = last_close < previous_low
         extension = e9_now - (float(current_price) if current_price is not None else last_close)
     if not rejection:
@@ -533,6 +535,7 @@ def validate_ema915_vwap_pullback_entry_gate(
         "ema9": e9_now, "ema15": e15_now, "vwap": vwap_now, "atr": atr,
         "latest_closed_timestamp": latest_ts, "data_age_seconds": data_age,
         "pullback_touch": True, "rejection_confirmed": True,
+        "rejection_wick_ratio": lower_wick_ratio if direction == "BUY" else upper_wick_ratio,
         "continuation_break": True, "continuation_level": previous_high if direction == "BUY" else previous_low,
         "entry_price": live_price, "extension_atr": extension / atr,
         "signal_candle_range": candle_range,
