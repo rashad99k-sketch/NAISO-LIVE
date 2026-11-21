@@ -6179,7 +6179,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     trade_id = uuid.uuid4().hex
     institutional_entry_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
     # Final execution-boundary gate: no institutional, sniper, RF or legacy
-    # setup can bypass the dual EMA9/EMA50-to-session-VWAP closed-candle cross.
+    # setup can bypass the mandatory EMA9-to-session-VWAP closed-candle cross.
     gate_frame = institutional_entry_ctx.get("closed_candle_frame")
     gate_frame_source = institutional_entry_ctx.get("closed_candle_source") or "ENTRY_CONTEXT"
     gate_tf = str(institutional_entry_ctx.get("candle_timeframe") or INTERVAL)
