@@ -33,6 +33,16 @@ def test_entry_checks_current_event_before_order_and_persists_after_verified_fil
                   else node.func.id if isinstance(node.func, ast.Name) else ""
                   for node in ast.walk(core_entry) if isinstance(node, ast.Call)]
     assert "is_event_consumed" in core_calls
+    guard_line = min(node.lineno for node in ast.walk(core_entry)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and node.func.attr == "is_event_consumed")
+    sizing_line = min(node.lineno for node in ast.walk(core_entry)
+                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                      and node.func.id == "calculate_position_size")
+    submit_line = min(node.lineno for node in ast.walk(core_entry)
+                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                      and node.func.attr == "submit_market_entry")
+    assert guard_line < sizing_line < submit_line
 
     wrapper_calls = [node.func.attr if isinstance(node.func, ast.Attribute)
                      else node.func.id if isinstance(node.func, ast.Name) else ""
