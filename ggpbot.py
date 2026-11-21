@@ -11331,6 +11331,26 @@ def run_fast_ema9_vwap_discovery():
             if not isinstance(proximity, dict):
                 errors += 1
                 continue
+            proximity = dict(proximity)
+            proximity["timeframe_seconds"] = timeframe_seconds
+            # Persist the last confirmed EMA9 cross across scan rotations; EMA50 never releases entry.
+            cross_memory = MEMORY.setdefault("_ema9_vwap_last_confirmed_cross", {})
+            key = roro_canonical_symbol(symbol)
+            current_cross = str(proximity.get("cross_ema9") or "").upper()
+            if current_cross in ("BULLISH", "BEARISH"):
+                cross_memory[key] = {"direction": current_cross, "candle_timestamp": int(proximity.get("candle_timestamp") or 0), "timeframe_seconds": timeframe_seconds}
+            remembered = cross_memory.get(key)
+            if isinstance(remembered, dict):
+                remembered_ts = int(remembered.get("candle_timestamp") or 0)
+                remembered_tf = max(1, int(remembered.get("timeframe_seconds") or timeframe_seconds))
+                remembered_age = max(0.0, time.time() - (remembered_ts / 1000.0 + remembered_tf)) if remembered_ts else float("inf")
+                if remembered_age <= 2.0 * remembered_tf:
+                    proximity["cross_ema9"] = remembered.get("direction")
+                    proximity["candle_timestamp"] = remembered_ts
+                    proximity["timeframe_seconds"] = remembered_tf
+                    proximity["cross_event_persisted"] = True
+                else:
+                    cross_memory.pop(key, None)
             candle_ts = int(proximity.get("candle_timestamp") or 0)
             key = roro_canonical_symbol(symbol)
             if not candle_ts or candle_ts <= int(last_seen.get(key, 0) or 0):
