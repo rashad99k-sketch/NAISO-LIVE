@@ -5494,10 +5494,12 @@ def compute_sl_tp(entry_price, side, classification, atr, df, symbol=None):
         min_sl_dist = 1.2 * atr
         if abs(entry_price - sl) < min_sl_dist:
             sl = entry_price - min_sl_dist if side == "BUY" else entry_price + min_sl_dist
-        # Reversal/range trades use the adaptive 0.25/0.50/1.00% range
-        # target selector in TradeManagementBoard. The canonical two-stage
-        # fallback levels remain 1% / 3% price movement.
-        tp1, tp2 = trend_target_prices(side, entry_price)
+        # Reversal/range trades use the adaptive range target selector in
+        # TradeManagementBoard. Until fresh liquidity evidence selects a nearer
+        # level, retain the conservative 0.50% / 1.00% price-move fallback.
+        range_sign = 1.0 if side == "BUY" else -1.0
+        tp1 = entry_price * (1.0 + range_sign * 0.50 / 100.0)
+        tp2 = entry_price * (1.0 + range_sign * 1.00 / 100.0)
     elif classification == "EARLY_TREND":
         ema50 = ema(df['close'], 50).iloc[-1]
         sl = ema50 - atr * 1.2 if side == "BUY" else ema50 + atr * 1.2
