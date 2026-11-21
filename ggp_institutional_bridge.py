@@ -760,7 +760,15 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 result["sources"] = list(candidate.get("sources", []))
                 result["discovery_score"] = candidate.get("score", 0)
                 result["side_hints"] = list(candidate.get("sides", []))
-            ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
+            proximity_event = candidate.get("ema9_vwap_proximity") if isinstance(candidate.get("ema9_vwap_proximity"), dict) else {}
+            cross_dir = str(proximity_event.get("cross_ema9") or "").upper()
+            cross_ts = int(proximity_event.get("candle_timestamp") or candidate.get("closed_candle_timestamp") or 0)
+            cross_tf = max(1, int(proximity_event.get("timeframe_seconds") or 900))
+            cross_age = max(0.0, time.time() - (cross_ts / 1000.0 + cross_tf)) if cross_ts > 0 else float("inf")
+            fresh_cross_dir = cross_dir if cross_dir in {"BULLISH", "BEARISH"} and cross_age <= 2.0 * cross_tf else None
+            # When a fresh EMA9 cross exists, evaluate that direction first; do not let an opposite-side setup override it.
+            decision_results = [row for row in results if row.get("side") == ("BUY" if fresh_cross_dir == "BULLISH" else "SELL")] if fresh_cross_dir else results
+            ready = [row for row in decision_results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
             if len(ready) > 1:
                 best = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
                 best.update({"decision_state": DecisionState.REJECTED.value, "entry_status": DecisionState.REJECTED.value,
@@ -771,9 +779,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                              "icons": {**(best.get("icons") or {}), "status": "⛔", "setup": "⚠️", "stop": "⚪"}})
             else:
                 hints = set(candidate.get("sides", []))
-                best = dict(max(results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
+                best = dict(max(decision_results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
                 best["side_hint_used_as_gate"] = False
-                best["side_selection_reason"] = "both_directions_analyzed; discovery_side_is_soft_hint"
+                best["side_selection_reason"] = "fresh_ema9_cross_direction" if fresh_cross_dir else "both_directions_analyzed; discovery_side_is_soft_hint"
             best["side_analyses"] = {
                 row.get("side"): {"state": row.get("decision_state"), "setup": row.get("decision_setup_type"),
                                   "score": row.get("score"), "reason": row.get("decision_reason"),
