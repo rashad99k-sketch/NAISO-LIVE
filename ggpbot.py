@@ -6193,7 +6193,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
             now_ms=int(time.time() * 1000), lookback_candles=2,
         )
-            gate_result["frame_source"] = gate_frame_source
+        gate_result["frame_source"] = gate_frame_source
     except Exception as gate_exc:
         gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
     raw_signal_id = str(gate_result.get("signal_candle_id") or "").strip()
