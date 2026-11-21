@@ -223,7 +223,7 @@ def _run_execute_entry(monkeypatch, *, side, balance, price=0.06, stop_pct=0.05)
             "cross_direction": "BULLISH" if side == "BUY" else "BEARISH",
             "cross_timestamp": ts[-3], "pullback_timestamp": ts[-2],
             "signal_candle_timestamp": ts[-1],
-            "signal_candle_id": f"{side}:TEST:{__import__('uuid').uuid4().hex}",
+            "signal_candle_id": f"{side}:TEST:{ts[-3]}:{ts[-2]}:{ts[-1]}",
             "ema9": price, "ema15": price, "vwap": price * (0.999 if side == "BUY" else 1.001),
             "latest_closed_timestamp": ts[-1],
         },
