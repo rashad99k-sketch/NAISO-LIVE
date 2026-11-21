@@ -238,3 +238,12 @@ def test_live_trade_manager_remains_the_existing_post_fill_management_authority(
     main_loop = ast.get_source_segment(SOURCE, _function("main_loop_sniper"))
     assert "_live_manager.manage_live_trade()" in main_loop
     assert "if TRADE_STATE[\"in_position\"] or STATE[\"open\"]:" in main_loop
+
+
+def test_ema9_cross_boolean_uses_signal_field_for_direction():
+    scanner = ast.get_source_segment(SOURCE, _function("run_fast_ema9_vwap_discovery"))
+    bridge = (ROOT / "ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert 'proximity.get("signal")' in scanner
+    assert 'bool(proximity.get("cross_ema9"))' in scanner
+    assert 'proximity_event.get("signal")' in bridge
+    assert 'bool(proximity_event.get("cross_ema9"))' in bridge
