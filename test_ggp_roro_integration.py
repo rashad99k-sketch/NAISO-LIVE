@@ -27,7 +27,7 @@ def test_canonical_symbol_and_source_merge():
 
 def test_analysis_returns_evidence_and_fails_closed_shape():
     result = analyze_symbol("BTC", "BUY", frame(), now_ms=1_700_000_000_000 + 80 * 900_000)
-    assert result["decision_state"] in {"ENTRY_READY", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_RETEST", "REJECTED"}
+    assert result["decision_state"] in {"ENTRY_READY", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_RETEST", "WAITING_FOR_EMA9_VWAP_CROSS", "WAITING_FOR_INSTITUTIONAL_ZONE", "REJECTED"}
     assert "evidence" in result or "rejection_reason" in result
     assert "market_regime" in result
 
@@ -72,7 +72,9 @@ def test_update_watchlist_checks_both_sides_even_when_discovery_hint_is_one_side
     out = bridge.update_unified_watchlist(memory, lambda _: frame(), max_items=10, batch_size=10)
     assert seen == ["BUY", "SELL"]
     assert out["ETH"]["side"] == "SELL"
-    assert out["ETH"]["decision_state"] == "ENTRY_READY"
+    assert out["ETH"]["decision_state"] == "WAITING_FOR_EMA9_VWAP_CROSS"
+    assert out["ETH"]["pre_cross_decision_state"] == "ENTRY_READY"
+    assert out["ETH"]["entry_cross_gate_passed"] is False
     assert out["ETH"]["side_hint_used_as_gate"] is False
 
 

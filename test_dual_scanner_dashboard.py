@@ -187,3 +187,63 @@ def test_effective_watchlist_cleanup_uses_copy_snapshot():
     )
     source = ast.get_source_segment(SOURCE, fn)
     assert "wl.copy().items()" in source
+
+
+def test_fast_ema9_vwap_discovery_is_rotating_closed_candle_and_ranking_only():
+    tree = ast.parse(SOURCE)
+    functions = {node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert "run_fast_ema9_vwap_discovery" in functions
+    scanner = ast.get_source_segment(SOURCE, functions["run_fast_ema9_vwap_discovery"])
+    assert "_EMA9_VWAP_CURSOR" in scanner
+    assert "_get_scanner_frame" in scanner
+    assert "_roro_ema9_vwap_proximity" in scanner
+    assert "closed_candle_timestamp" in scanner
+    assert "ema9_vwap_global_discovery" in scanner
+    assert "UNIFIED_ENTRY_AUTHORITY_ONLY" in scanner
+    assert "execute_entry(" not in scanner
+    assert "create_order(" not in scanner
+
+
+def test_fast_ema9_vwap_discovery_is_scheduled_independently_of_slow_global_scan():
+    tree = ast.parse(SOURCE)
+    main_loop = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "main_loop_sniper")
+    body = ast.get_source_segment(SOURCE, main_loop)
+    assert "EMA9_VWAP_DISCOVERY_INTERVAL" in body
+    assert 'dispatch_scanner_task("ema9_vwap_discovery", run_fast_ema9_vwap_discovery)' in body
+
+
+def test_unified_watchlist_waits_for_fresh_ema9_cross_before_entry_ready():
+    bridge = (ROOT / "ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    tree = ast.parse(bridge)
+    update = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "update_unified_watchlist")
+    source = ast.get_source_segment(bridge, update)
+    assert "cross_ema9" in source
+    assert "cross_fresh" in source
+    assert "WAITING_FOR_EMA9_VWAP_CROSS" in source
+    assert "entry_cross_gate_passed" in source
+    assert "cross_matches_selected_side" in source
+
+
+def test_fresh_ema9_cross_selects_matching_direction_not_opposite_setup():
+    bridge = (ROOT / "ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    tree = ast.parse(bridge)
+    update = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "update_unified_watchlist")
+    source = ast.get_source_segment(bridge, update)
+    assert "decision_results" in source
+    assert 'fresh_cross_dir == "BULLISH" else "SELL"' in source
+    assert "fresh_ema9_cross_direction" in source
+
+
+def test_live_trade_manager_remains_the_existing_post_fill_management_authority():
+    main_loop = ast.get_source_segment(SOURCE, _function("main_loop_sniper"))
+    assert "_live_manager.manage_live_trade()" in main_loop
+    assert "if TRADE_STATE[\"in_position\"] or STATE[\"open\"]:" in main_loop
+
+
+def test_ema9_cross_boolean_uses_signal_field_for_direction():
+    scanner = ast.get_source_segment(SOURCE, _function("run_fast_ema9_vwap_discovery"))
+    bridge = (ROOT / "ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert 'proximity.get("signal")' in scanner
+    assert 'bool(proximity.get("cross_ema9"))' in scanner
+    assert 'proximity_event.get("signal")' in bridge
+    assert 'bool(proximity_event.get("cross_ema9"))' in bridge

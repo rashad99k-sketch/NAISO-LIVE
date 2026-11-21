@@ -760,7 +760,15 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 result["sources"] = list(candidate.get("sources", []))
                 result["discovery_score"] = candidate.get("score", 0)
                 result["side_hints"] = list(candidate.get("sides", []))
-            ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
+            proximity_event = candidate.get("ema9_vwap_proximity") if isinstance(candidate.get("ema9_vwap_proximity"), dict) else {}
+            cross_dir = str(proximity_event.get("signal") or "").upper() if bool(proximity_event.get("cross_ema9")) else ""
+            cross_ts = int(proximity_event.get("candle_timestamp") or candidate.get("closed_candle_timestamp") or 0)
+            cross_tf = max(1, int(proximity_event.get("timeframe_seconds") or 900))
+            cross_age = max(0.0, time.time() - (cross_ts / 1000.0 + cross_tf)) if cross_ts > 0 else float("inf")
+            fresh_cross_dir = cross_dir if cross_dir in {"BULLISH", "BEARISH"} and cross_age <= 2.0 * cross_tf else None
+            # When a fresh EMA9 cross exists, evaluate that direction first; do not let an opposite-side setup override it.
+            decision_results = [row for row in results if row.get("side") == ("BUY" if fresh_cross_dir == "BULLISH" else "SELL")] if fresh_cross_dir else results
+            ready = [row for row in decision_results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
             if len(ready) > 1:
                 best = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
                 best.update({"decision_state": DecisionState.REJECTED.value, "entry_status": DecisionState.REJECTED.value,
@@ -771,9 +779,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                              "icons": {**(best.get("icons") or {}), "status": "⛔", "setup": "⚠️", "stop": "⚪"}})
             else:
                 hints = set(candidate.get("sides", []))
-                best = dict(max(results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
+                best = dict(max(decision_results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
                 best["side_hint_used_as_gate"] = False
-                best["side_selection_reason"] = "both_directions_analyzed; discovery_side_is_soft_hint"
+                best["side_selection_reason"] = "fresh_ema9_cross_direction" if fresh_cross_dir else "both_directions_analyzed; discovery_side_is_soft_hint"
             best["side_analyses"] = {
                 row.get("side"): {"state": row.get("decision_state"), "setup": row.get("decision_setup_type"),
                                   "score": row.get("score"), "reason": row.get("decision_reason"),
@@ -781,6 +789,110 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                                   "trend_support": (row.get("institutional_trend") or {}).get("supporting_check")}
                 for row in results
             }
+        # Carry the global EMA9/VWAP discovery event into the persistent Watchlist.
+        # A symbol may wait here before the cross; only a fresh CLOSED EMA9/VWAP cross
+        # in the selected direction can release the existing structural entry authority.
+        proximity_event = candidate.get("ema9_vwap_proximity") if isinstance(candidate.get("ema9_vwap_proximity"), dict) else {}
+        cross_ema9 = str(proximity_event.get("cross_ema9") or "").upper()
+        expected_cross = "BULLISH" if str(best.get("side") or "").upper() == "BUY" else "BEARISH" if str(best.get("side") or "").upper() == "SELL" else ""
+        cross_ts = int(proximity_event.get("candle_timestamp") or candidate.get("closed_candle_timestamp") or 0)
+        tf_seconds = max(1, int(proximity_event.get("timeframe_seconds") or 900))
+        cross_age = max(0.0, time.time() - (cross_ts / 1000.0 + tf_seconds)) if cross_ts > 0 else float("inf")
+        cross_fresh = bool(cross_ema9 in {"BULLISH", "BEARISH"} and cross_ts > 0 and cross_age <= 2.0 * tf_seconds)
+        cross_matches = bool(cross_fresh and cross_ema9 == expected_cross)
+
+        # The trigger must occur at a validated institutional location, not merely
+        # somewhere on the chart. Prefer a causal OB; a direction-matched live FVG
+        # is the only alternate zone. Use the exact closed cross candle timestamp.
+        cross_zone = {"status": "NOT_EVALUATED", "type": None, "overlap": False,
+                      "cross_candle_timestamp": cross_ts or None}
+        if cross_matches:
+            cross_row = None
+            try:
+                if isinstance(frame, pd.DataFrame) and "timestamp" in frame.columns:
+                    _cross_rows = frame[pd.to_numeric(frame["timestamp"], errors="coerce") == cross_ts]
+                    if not _cross_rows.empty:
+                        cross_row = _cross_rows.iloc[-1]
+            except Exception:
+                cross_row = None
+            ob = best.get("order_block") if isinstance(best.get("order_block"), dict) else None
+            ob_validation = ob.get("validation") if isinstance(ob, dict) and isinstance(ob.get("validation"), dict) else {}
+            ob_valid = bool(
+                isinstance(ob, dict) and ob_validation.get("valid") is True
+                and str(ob_validation.get("status") or ob.get("status") or "").upper()
+                    not in {"MITIGATED", "INVALIDATED"}
+            )
+            fvg = best.get("fvg") if isinstance(best.get("fvg"), dict) else None
+            expected_direction = "BULLISH" if expected_cross == "BULLISH" else "BEARISH"
+            fvg_valid = bool(
+                isinstance(fvg, dict)
+                and str(fvg.get("direction") or "").upper() == expected_direction
+                and str(fvg.get("status") or "").upper() in {"UNFILLED", "PARTIALLY_FILLED"}
+            )
+            zones = []
+            if ob_valid:
+                zones.append(("ORDER_BLOCK", float(ob.get("low") or 0.0), float(ob.get("high") or 0.0)))
+            if fvg_valid:
+                zones.append(("FVG", float(fvg.get("lower") or 0.0), float(fvg.get("upper") or 0.0)))
+            for zone_type, zone_low, zone_high in zones:
+                if (cross_row is not None and 0 < zone_low < zone_high
+                        and float(cross_row["low"]) <= zone_high
+                        and float(cross_row["high"]) >= zone_low):
+                    cross_zone = {"status": "CONFIRMED", "type": zone_type, "overlap": True,
+                                  "low": zone_low, "high": zone_high,
+                                  "cross_candle_timestamp": cross_ts}
+                    break
+            if cross_zone["status"] != "CONFIRMED":
+                cross_zone["status"] = "NOT_ON_VALIDATED_INSTITUTIONAL_ZONE"
+                cross_zone["ob_available"] = ob_valid
+                cross_zone["fvg_available"] = fvg_valid
+                cross_zone["cross_candle_found"] = cross_row is not None
+
+        ema50_confirmation = str(candidate.get("ema50_confirmation") or proximity_event.get("ema50_alignment") or "UNKNOWN").upper()
+        ema50_supportive = ema50_confirmation in {"ALIGNED", "SUPPORTIVE"}
+        best["ema50_confluence"] = {
+            "status": "SUPPORTIVE" if ema50_supportive else "OPPOSED" if ema50_confirmation in {"OPPOSITE", "OPPOSED"} else "NEUTRAL_OR_UNAVAILABLE",
+            "required": False,
+            "confirmation": ema50_confirmation,
+        }
+        best["cross_institutional_zone"] = cross_zone
+        best["ema9_vwap_discovery"] = {
+            "state": candidate.get("state") or proximity_event.get("state") or "UNKNOWN",
+            "cross_ema9": cross_ema9 or None,
+            "cross_ema50": proximity_event.get("cross_ema50"),
+            "ema50_confirmation": candidate.get("ema50_confirmation") or "UNKNOWN",
+            "cross_candle_timestamp": cross_ts or None,
+            "cross_age_seconds": round(cross_age, 2) if np.isfinite(cross_age) else None,
+            "cross_fresh": cross_fresh,
+            "cross_matches_selected_side": cross_matches,
+            "required_for_entry": True,
+        }
+        best["entry_cross_gate_passed"] = cross_matches
+        best["entry_institutional_zone_gate_passed"] = bool(cross_matches and cross_zone.get("status") == "CONFIRMED")
+        if not cross_matches:
+            best["pre_cross_decision_state"] = best.get("decision_state")
+            best["pre_cross_decision_reason"] = best.get("decision_reason")
+            best["decision_state"] = "WAITING_FOR_EMA9_VWAP_CROSS"
+            best["entry_status"] = "WAITING_FOR_EMA9_VWAP_CROSS"
+            best["decision_reason"] = "waiting_for_fresh_closed_ema9_vwap_cross_in_selected_direction"
+            reasons = list(best.get("rejection_reasons") or [])
+            if "ema9_vwap_cross_not_confirmed_or_stale" not in reasons:
+                reasons.append("ema9_vwap_cross_not_confirmed_or_stale")
+            best["rejection_reasons"] = reasons
+            best["icons"] = {**(best.get("icons") or {}), "status": "🟡", "setup": "⏳"}
+        elif cross_zone.get("status") != "CONFIRMED":
+            best["pre_zone_decision_state"] = best.get("decision_state")
+            best["pre_zone_decision_reason"] = best.get("decision_reason")
+            best["decision_state"] = "WAITING_FOR_INSTITUTIONAL_ZONE"
+            best["entry_status"] = "WAITING_FOR_INSTITUTIONAL_ZONE"
+            best["decision_reason"] = "fresh_ema9_vwap_cross_not_overlapping_validated_order_block_or_directional_fvg"
+            reasons = list(best.get("rejection_reasons") or [])
+            reasons.append("cross_not_on_validated_institutional_zone")
+            best["rejection_reasons"] = list(dict.fromkeys(reasons))
+            best["icons"] = {**(best.get("icons") or {}), "status": "🟡", "setup": "🧱"}
+        else:
+            best["cross_gate_release_state"] = best.get("decision_state")
+            best["decision_reason"] = (str(best.get("decision_reason") or "") + " | fresh_closed_cross_on_institutional_zone").strip(" |")
         previous = out.get(key, {})
         best["first_seen"] = previous.get("first_seen", time.time())
         best["discovery_sources"] = list(candidate.get("sources", []))
