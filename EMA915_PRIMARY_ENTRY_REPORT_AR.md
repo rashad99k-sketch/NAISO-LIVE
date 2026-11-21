@@ -31,7 +31,7 @@
 
 لم يتم تعديل:
 - Position sizing أو leverage أو risk caps.
-- هندسة SL/TP أو أهداف RANGE/TREND.
+- هندسة SL/TP وإدارة الأهداف الاتجاهية 2%/3%. تم فقط تصحيح fallback لصفقات REVERSAL/RANGE إلى 0.50%/1.00% لحين اختيار TradeManagementBoard هدفًا تكيفيًا من أدلة السيولة؛ لا يتغير تقسيم TP1/TP2 50/50.
 - TradeExecutionService أو التحقق من fills أو Native SL.
 - TradeManagementBoard أو LiveTradeManager أو Profit Brain.
 - منطق TP1/TP2 وتقسيم 50/50.
