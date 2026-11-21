@@ -14,7 +14,7 @@ import math
 import gc
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Iterable
 from enum import Enum
 from collections import deque
 import queue
@@ -815,6 +815,15 @@ SCANNER_UNIVERSE_MAX = _env_int_range("SCANNER_UNIVERSE_MAX", 80, 30, 100)
 INSTITUTIONAL_WATCHLIST_BATCH_SIZE = _env_int_range("INSTITUTIONAL_WATCHLIST_BATCH_SIZE", 12, 4, 24)
 INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS = _env_int_range("INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20, 10, 300)
 INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS = _env_int_range("INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 120, 30, 150)
+
+# Unified Profit Management Brain. Per the final execution order, the Brain is
+# enabled by default and is the routine decision authority. The legacy Board
+# remains available only as an explicit fallback by setting the flag to false.
+# Shadow Mode remains available for diagnostics but is disabled by default.
+ENABLE_UNIFIED_PROFIT_BRAIN = _env_bool("ENABLE_UNIFIED_PROFIT_BRAIN", True)
+PROFIT_BRAIN_SHADOW_MODE = _env_bool("PROFIT_BRAIN_SHADOW_MODE", False)
+PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES = _env_int_range(
+    "PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES", 2, 1, 5)
 
 MAX_SPREAD_PERCENT_DEFAULT = 0.08
 MAX_SPREAD_PERCENT_VOLATILE = 0.15
@@ -2448,7 +2457,9 @@ from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
                               tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
-                              trend_target_prices, RANGE_MODE, TREND_MODE, STANDARD_MODE)
+                              trend_target_prices, RANGE_MODE, TREND_MODE, STANDARD_MODE,
+                              TradeMode, BrainAction, ProfitBrainDecision, evaluate_profit_brain,
+                              build_trade_thesis_snapshot, compare_profit_brain_decisions)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -2468,6 +2479,18 @@ class TradeDecision:
     params: Dict = field(default_factory=dict)
     reason: str = ""
     confidence: float = 1.0
+    decision_id: str = ""
+    mode: str = ""
+    mode_candidate: str = ""
+    execution_plan: str = ""
+    evidence_for: List[str] = field(default_factory=list)
+    evidence_against: List[str] = field(default_factory=list)
+    missing_evidence: List[str] = field(default_factory=list)
+    data_quality: str = "UNKNOWN"
+    next_action: str = ""
+    confirmed_danger: bool = False
+    thesis_snapshot: Dict = field(default_factory=dict)
+    vwap_ema_context: Dict = field(default_factory=dict)
 
 class TradeManagementBoard:
     """The only routine authority for TP, runner, trailing and thesis exits."""
@@ -2477,8 +2500,353 @@ class TradeManagementBoard:
         self._decision_history = deque(maxlen=200)
         self._last_visible_signature = None
         self._last_visible_ts = 0.0
+        self._brain_shadow_last_signature = None
+        self._brain_shadow_last_ts = 0.0
 
     def evaluate(self, context: Dict) -> TradeDecision:
+        """Thin adapter: legacy Board or Unified Profit Management Brain.
+
+        ENABLE_UNIFIED_PROFIT_BRAIN=False preserves the legacy decision exactly.
+        When enabled with PROFIT_BRAIN_SHADOW_MODE=True, the legacy decision is
+        still the only one returned/executed; the Brain decision is logged for
+        comparison. Only when Shadow Mode is disabled does the Brain decision
+        become authoritative, and even then execution stays in _execute_decision.
+        """
+        ctx = context if isinstance(context, dict) else {}
+        if not ENABLE_UNIFIED_PROFIT_BRAIN:
+            return self._evaluate_legacy(ctx)
+        brain_context = self._build_brain_context(ctx)
+        candidate_brain = evaluate_profit_brain(brain_context)
+        effective_mode = self._resolve_brain_mode(candidate_brain, brain_context)
+        # Re-evaluate action policy using the hysteresis-approved mode. This
+        # prevents an unconfirmed candidate mode from driving live actions.
+        brain_context["effective_mode_override"] = effective_mode
+        brain = evaluate_profit_brain(brain_context)
+        brain_decision = self._to_trade_decision(brain, effective_mode)
+        if PROFIT_BRAIN_SHADOW_MODE:
+            legacy = self._evaluate_legacy(ctx)
+            self._record_shadow_comparison(legacy, brain_decision, brain, brain_context)
+            return legacy
+        self._publish_brain_decision(brain_decision, brain, brain_context)
+        return brain_decision
+
+    def _build_brain_context(self, ctx: Dict) -> Dict:
+        brain_ctx = dict(ctx)
+        state_gate = STATE.get("entry_gate_snapshot")
+        context_gate = ctx.get("entry_gate_snapshot")
+        gate_snapshot = state_gate if isinstance(state_gate, dict) else (
+            context_gate if isinstance(context_gate, dict) else {})
+        brain_ctx.update({
+            "entry_atr": safe_float(STATE.get("atr"), 0.0) or safe_float(ctx.get("entry_atr"), 0.0),
+            "entry_time": STATE.get("entry_time") or ctx.get("entry_time") or 0.0,
+            "entry_reasons": list(STATE.get("entry_reasons") or ctx.get("entry_reasons") or []),
+            "entry_gate_snapshot": dict(gate_snapshot),
+            "entry_spread_pct": (STATE.get("entry_spread_pct") if STATE.get("entry_spread_pct") is not None
+                                 else ctx.get("entry_spread_pct")),
+            "liquidity_quality": STATE.get("liquidity_quality") or ctx.get("liquidity_quality", "UNKNOWN"),
+            "orderbook_depth_usdt": (STATE.get("orderbook_depth_usdt") if STATE.get("orderbook_depth_usdt") is not None
+                                     else ctx.get("orderbook_depth_usdt")),
+            "data_freshness": STATE.get("last_market_data_freshness", ctx.get("data_freshness", "UNKNOWN")),
+            "trade_id": STATE.get("trade_id"),
+            "current_mode": STATE.get("profit_brain_mode"),
+            "mode_candidate": STATE.get("profit_brain_mode_candidate"),
+            "mode_candidate_count": int(safe_float(STATE.get("profit_brain_mode_candidate_count"), 0)),
+            "mode_last_candle_ts": safe_float(STATE.get("profit_brain_mode_last_candle_ts"), 0.0),
+            "closed_candle_ts": safe_float(STATE.get("last_management_closed_candle_ts"), 0.0),
+        })
+        thesis = build_trade_thesis_snapshot(brain_ctx)
+        trade_key = str(STATE.get("trade_id") or STATE.get("current_symbol") or "UNKNOWN")
+        thesis["trade_key"] = trade_key
+        if STATE.get("profit_brain_trade_id") != trade_key:
+            # A new trade must never inherit the previous trade's Brain mode.
+            for key in ("profit_brain_mode", "profit_brain_mode_candidate",
+                        "profit_brain_mode_candidate_count", "profit_brain_mode_last_candle_ts",
+                        "profit_brain_mode_reason", "profit_brain_mode_evidence",
+                        "profit_brain_mode_changed_ts", "profit_brain_thesis"):
+                STATE.pop(key, None)
+            STATE["profit_brain_trade_id"] = trade_key
+        existing = STATE.get("profit_brain_thesis")
+        if not isinstance(existing, dict) or existing.get("trade_key") != trade_key:
+            STATE["profit_brain_thesis"] = thesis
+            unknown = list(thesis.get("unknown_fields") or [])
+            log_execution(
+                f"[TRADE_THESIS] {trade_key} side={thesis.get('side')} "
+                f"entry={thesis.get('entry_price')} entry_atr={thesis.get('entry_atr')} "
+                f"mode={thesis.get('entry_mode')} behavior={thesis.get('entry_behavior')} "
+                f"regime={thesis.get('entry_regime')} signal={thesis.get('signal_candle_id')} "
+                f"zone={str(thesis.get('entry_order_block'))[:60]} "
+                f"liquidity={str(thesis.get('entry_liquidity'))[:60]} "
+                f"unknown_fields={','.join(unknown[:10])}",
+                "INFO", debounce_key=f"trade_thesis:{trade_key}", debounce_sec=30,
+            )
+        brain_ctx["thesis_snapshot"] = dict(STATE.get("profit_brain_thesis") or thesis)
+        return brain_ctx
+
+    def _log_brain_mode_change(self, ctx: Dict, old: str, new: str, reason: str,
+                               evidence: Iterable[str], level: str = "INFO") -> None:
+        if old == new:
+            return
+        log_execution(
+            f"[TRADE_MODE_CHANGE] {ctx.get('symbol')} {ctx.get('side')} "
+            f"old={old} new={new} reason={reason} "
+            f"evidence={','.join(list(evidence)[:10])}",
+            level, debounce_key=f"brain_mode_change:{ctx.get('symbol')}:{old}:{new}", debounce_sec=5,
+        )
+
+    def _resolve_brain_mode(self, brain: ProfitBrainDecision, ctx: Dict) -> str:
+        candidate = str(getattr(brain, "mode", TradeMode.MOMENTUM_MODE.value) or TradeMode.MOMENTUM_MODE.value).upper()
+        valid = {item.value for item in TradeMode}
+        if candidate not in valid:
+            candidate = TradeMode.MOMENTUM_MODE.value
+        previous_mode = str(STATE.get("profit_brain_mode") or "UNKNOWN").upper()
+        current = previous_mode
+        initialized = False
+        if current not in valid:
+            current = candidate
+            initialized = True
+        confirmed_danger = bool(getattr(brain, "confirmed_danger", False)) or str(
+            getattr(brain, "action", "")
+        ).upper() in {BrainAction.EMERGENCY_EXIT.value, BrainAction.THESIS_FAILURE_EXIT.value}
+        evidence = list(getattr(brain, "evidence_for", ()) or [])
+        reason = str(getattr(brain, "reason", "") or "")
+        if confirmed_danger:
+            self._log_brain_mode_change(ctx, previous_mode, TradeMode.DEFENSIVE_MODE.value,
+                                        reason or "confirmed_danger", evidence, level="WARN")
+            STATE["profit_brain_mode"] = TradeMode.DEFENSIVE_MODE.value
+            STATE["profit_brain_mode_candidate"] = TradeMode.DEFENSIVE_MODE.value
+            STATE["profit_brain_mode_candidate_count"] = 0
+            STATE["profit_brain_mode_reason"] = reason or "confirmed_danger"
+            STATE["profit_brain_mode_evidence"] = evidence
+            STATE["profit_brain_mode_changed_ts"] = time.time()
+            return TradeMode.DEFENSIVE_MODE.value
+        if candidate == current:
+            if initialized:
+                self._log_brain_mode_change(ctx, previous_mode, current, reason, evidence)
+            STATE["profit_brain_mode"] = current
+            STATE["profit_brain_mode_candidate"] = candidate
+            STATE["profit_brain_mode_candidate_count"] = 0
+            STATE["profit_brain_mode_reason"] = reason
+            STATE["profit_brain_mode_evidence"] = evidence
+            return current
+        closed_ts = safe_float(ctx.get("closed_candle_ts"), 0.0)
+        last_ts = safe_float(STATE.get("profit_brain_mode_last_candle_ts"), 0.0)
+        if closed_ts > last_ts:
+            stored_candidate = str(STATE.get("profit_brain_mode_candidate") or "").upper()
+            count = int(safe_float(STATE.get("profit_brain_mode_candidate_count"), 0))
+            count = count + 1 if stored_candidate == candidate else 1
+            STATE["profit_brain_mode_candidate"] = candidate
+            STATE["profit_brain_mode_candidate_count"] = count
+            STATE["profit_brain_mode_last_candle_ts"] = closed_ts
+            if count >= PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES:
+                self._log_brain_mode_change(ctx, current, candidate, reason, evidence)
+                current = candidate
+                STATE["profit_brain_mode"] = current
+                STATE["profit_brain_mode_candidate_count"] = 0
+                STATE["profit_brain_mode_changed_ts"] = time.time()
+        STATE["profit_brain_mode"] = current
+        STATE["profit_brain_mode_reason"] = reason
+        STATE["profit_brain_mode_evidence"] = evidence
+        return current
+
+    def _to_trade_decision(self, brain: ProfitBrainDecision, mode: str) -> TradeDecision:
+        action_map = {
+            BrainAction.NO_ACTION.value: TradeDecisionType.NO_ACTION,
+            BrainAction.HOLD.value: TradeDecisionType.HOLD,
+            BrainAction.MOVE_SL.value: TradeDecisionType.MOVE_SL,
+            BrainAction.BREAKEVEN.value: TradeDecisionType.BREAKEVEN,
+            BrainAction.LOCK_PROFITS.value: TradeDecisionType.LOCK_PROFITS,
+            BrainAction.PARTIAL_CLOSE.value: TradeDecisionType.PARTIAL_CLOSE,
+            BrainAction.TRAIL.value: TradeDecisionType.TRAIL,
+            BrainAction.FULL_CLOSE.value: TradeDecisionType.FULL_CLOSE,
+            BrainAction.THESIS_FAILURE_EXIT.value: TradeDecisionType.THESIS_FAILURE_EXIT,
+            BrainAction.EMERGENCY_EXIT.value: TradeDecisionType.EMERGENCY_EXIT,
+        }
+        action = action_map.get(str(getattr(brain, "action", "")).upper(), TradeDecisionType.HOLD)
+        return TradeDecision(
+            action,
+            params=dict(getattr(brain, "params", {}) or {}),
+            reason=str(getattr(brain, "reason", "") or ""),
+            confidence=float(getattr(brain, "confidence", 0.0) or 0.0),
+            decision_id=str(getattr(brain, "decision_id", "") or ""),
+            mode=str(mode or ""),
+            mode_candidate=str(getattr(brain, "mode_candidate", "") or ""),
+            execution_plan=str(getattr(brain, "execution_plan", "") or ""),
+            evidence_for=list(getattr(brain, "evidence_for", ()) or []),
+            evidence_against=list(getattr(brain, "evidence_against", ()) or []),
+            missing_evidence=list(getattr(brain, "missing_evidence", ()) or []),
+            data_quality=str(getattr(brain, "data_quality", "UNKNOWN") or "UNKNOWN"),
+            next_action=str(getattr(brain, "next_action", "") or ""),
+            confirmed_danger=bool(getattr(brain, "confirmed_danger", False)),
+            thesis_snapshot=dict(getattr(brain, "thesis_snapshot", {}) or {}),
+            vwap_ema_context=dict(getattr(brain, "vwap_ema_context", {}) or {}),
+        )
+
+    def _log_brain_evidence_snapshot(self, ctx: Dict, decision: TradeDecision,
+                                     shadow: bool = False) -> None:
+        symbol = ctx.get("symbol")
+        side = ctx.get("side")
+        momentum = ctx.get("momentum") if isinstance(ctx.get("momentum"), dict) else {}
+        liquidity = ctx.get("liquidity") if isinstance(ctx.get("liquidity"), dict) else {}
+        mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
+        log_execution(
+            f"[MOMENTUM_ANALYSIS] {symbol} {side} shadow={shadow} "
+            f"adx={safe_float(ctx.get('adx')):.2f} adx_slope={safe_float(ctx.get('adx_slope')):.2f} "
+            f"continuation={safe_float(ctx.get('continuation_probability')):.2f} "
+            f"momentum={safe_float(ctx.get('momentum_strength')):.1f} "
+            f"volume={safe_float(ctx.get('volume_ratio')):.2f} rsi={safe_float(momentum.get('rsi_value')):.1f}",
+            "INFO", debounce_key=f"pb_momentum:{symbol}:{int(safe_float(ctx.get('adx')))}:"
+                                 f"{int(safe_float(ctx.get('continuation_probability')) * 10)}",
+            debounce_sec=30,
+        )
+        log_execution(
+            f"[LIQUIDITY_ANALYSIS] {symbol} {side} shadow={shadow} "
+            f"event={str(liquidity.get('event') or 'UNKNOWN')} "
+            f"direction={str(liquidity.get('direction') or 'UNKNOWN')} "
+            f"level={safe_float(liquidity.get('level')):.8f} "
+            f"confidence={safe_float(liquidity.get('confidence')):.1f}",
+            "INFO", debounce_key=f"pb_liquidity:{symbol}:{str(liquidity.get('event') or 'UNKNOWN')}:"
+                                 f"{str(liquidity.get('direction') or 'UNKNOWN')}",
+            debounce_sec=30,
+        )
+        log_execution(
+            f"[STRUCTURE_ANALYSIS] {symbol} {side} shadow={shadow} "
+            f"aligned={bool(ctx.get('structure_aligned'))} broken={bool(ctx.get('structure_broken'))} "
+            f"structural_invalidation={bool(ctx.get('structural_invalidation'))} "
+            f"regime={str(ctx.get('regime') or 'UNKNOWN')} ema_state={str(ctx.get('ema_state') or 'UNKNOWN')} "
+            f"zone_event={str(mi.get('zone_event') or 'UNKNOWN')}",
+            "INFO", debounce_key=f"pb_structure:{symbol}:{bool(ctx.get('structure_aligned'))}:"
+                                 f"{bool(ctx.get('structure_broken'))}:{str(ctx.get('regime') or 'UNKNOWN')}",
+            debounce_sec=30,
+        )
+        vwap_ema = decision.vwap_ema_context if isinstance(decision.vwap_ema_context, dict) else {}
+        log_execution(
+            f"[VWAP_EMA_ANALYSIS] {symbol} {side} shadow={shadow} "
+            f"ema9={vwap_ema.get('ema9')} ema15={vwap_ema.get('ema15')} vwap={vwap_ema.get('vwap')} "
+            f"cross_state={vwap_ema.get('cross_state')} cross_direction={vwap_ema.get('cross_direction')} "
+            f"alignment={vwap_ema.get('alignment')} fresh_cross={vwap_ema.get('fresh_cross')} "
+            f"price_vwap_atr={vwap_ema.get('price_vwap_atr')} ema9_vwap_atr={vwap_ema.get('ema9_vwap_atr')} "
+            f"no_chase_risk={vwap_ema.get('no_chase_risk')}",
+            "INFO", debounce_key=f"pb_vwap_ema:{symbol}:{vwap_ema.get('alignment')}:"
+                                 f"{vwap_ema.get('fresh_cross')}:{vwap_ema.get('no_chase_risk')}",
+            debounce_sec=30,
+        )
+        if decision.action != TradeDecisionType.HOLD:
+            close_reason = str(decision.params.get("close_reason") or "").upper()
+            if decision.action == TradeDecisionType.PARTIAL_CLOSE or close_reason in {"TP1", "TP2", "SCALP_TARGET"}:
+                prefix = "[TP_DECISION]"
+            elif decision.action in {TradeDecisionType.FULL_CLOSE, TradeDecisionType.THESIS_FAILURE_EXIT,
+                                     TradeDecisionType.EMERGENCY_EXIT}:
+                prefix = "[EXIT_DECISION]"
+            elif decision.action == TradeDecisionType.TRAIL:
+                prefix = "[TRAILING_DECISION]"
+            else:
+                prefix = "[PROFIT_PROTECTION]"
+            log_execution(
+                f"{prefix} {symbol} {side} shadow={shadow} mode={decision.mode} "
+                f"mode_candidate={decision.mode_candidate} plan={decision.execution_plan} "
+                f"action={decision.action.value} "
+                f"reason={decision.reason} price={safe_float(ctx.get('current_price')):.8f} "
+                f"roe={safe_float(ctx.get('roe')):+.2f}% confidence={decision.confidence:.2f} "
+                f"data_quality={decision.data_quality} confirmed_danger={decision.confirmed_danger} "
+                f"decision_id={decision.decision_id}",
+                "INFO", debounce_key=f"pb_action:{symbol}:{decision.action.value}:{close_reason}:{shadow}",
+                debounce_sec=10,
+            )
+        log_execution(
+            f"[TRADE_MANAGEMENT_AUDIT] {symbol} {side} shadow={shadow} mode={decision.mode} "
+            f"mode_candidate={decision.mode_candidate} plan={decision.execution_plan} "
+            f"action={decision.action.value} "
+            f"evidence_for={len(decision.evidence_for)} evidence_against={len(decision.evidence_against)} "
+            f"missing={len(decision.missing_evidence)} data_quality={decision.data_quality} "
+            f"decision_id={decision.decision_id}",
+            "INFO", debounce_key=f"pb_audit:{symbol}:{decision.action.value}:{shadow}", debounce_sec=30,
+        )
+
+    def _publish_brain_decision(self, decision: TradeDecision, brain: ProfitBrainDecision,
+                                ctx: Dict) -> None:
+        self._last_decision = decision
+        self._last_decision_time = time.time()
+        try:
+            STATE["exit_risk_snapshot"] = dict(evaluate_exit_risk(ctx))
+        except Exception:
+            pass
+        meta = {
+            "engine": "UNIFIED_PROFIT_BRAIN",
+            "decision_id": decision.decision_id,
+            "mode": decision.mode,
+            "mode_candidate": decision.mode_candidate,
+            "execution_plan": decision.execution_plan,
+            "action": decision.action.value,
+            "reason": decision.reason,
+            "confidence": decision.confidence,
+            "data_quality": decision.data_quality,
+            "next_action": decision.next_action,
+            "confirmed_danger": bool(decision.confirmed_danger),
+            "vwap_ema_context": dict(decision.vwap_ema_context),
+            "evidence_for": list(decision.evidence_for),
+            "evidence_against": list(decision.evidence_against),
+            "missing_evidence": list(decision.missing_evidence),
+            "shadow": False,
+        }
+        self._decision_history.append(meta)
+        record_trade_management_event(
+            "BOARD_DECISION",
+            "DECIDED" if decision.action != TradeDecisionType.HOLD else "WAITING",
+            log_level="INFO" if decision.action != TradeDecisionType.HOLD else None,
+            dedupe_key=f"brain:{ctx.get('symbol')}:{decision.action.value}:{decision.reason}",
+            dedupe_seconds=10,
+            symbol=ctx.get("symbol"), side=ctx.get("side"),
+            price=safe_float(ctx.get("current_price"), 0.0),
+            roe_pct=safe_float(ctx.get("roe"), 0.0),
+            **meta,
+        )
+        log_execution(
+            f"[PROFIT_BRAIN] {ctx.get('symbol')} {ctx.get('side')} mode={decision.mode} "
+            f"mode_candidate={decision.mode_candidate} plan={decision.execution_plan} "
+            f"action={decision.action.value} reason={decision.reason} "
+            f"confidence={decision.confidence:.2f} data_quality={decision.data_quality} "
+            f"evidence={','.join(decision.evidence_for[:8])} missing={','.join(decision.missing_evidence[:8])}",
+            "INFO", debounce_key=f"profit_brain:{ctx.get('symbol')}:{decision.action.value}:{decision.reason}",
+            debounce_sec=10,
+        )
+        self._log_brain_evidence_snapshot(ctx, decision, shadow=False)
+
+    def _record_shadow_comparison(self, legacy: TradeDecision, brain_decision: TradeDecision,
+                                  brain: ProfitBrainDecision, ctx: Dict) -> None:
+        comparison = compare_profit_brain_decisions(legacy, brain, ctx)
+        signature = (
+            str(comparison.get("legacy_action")), str(comparison.get("brain_action")),
+            str(comparison.get("brain_mode")), bool(comparison.get("match")),
+        )
+        now = time.time()
+        if signature == self._brain_shadow_last_signature and now - self._brain_shadow_last_ts < 10:
+            return
+        self._brain_shadow_last_signature = signature
+        self._brain_shadow_last_ts = now
+        record_trade_management_event(
+            "PROFIT_BRAIN_SHADOW", "COMPARED", log_level="INFO",
+            dedupe_key=f"profit_brain_shadow:{ctx.get('symbol')}:{comparison.get('legacy_action')}:"
+                       f"{comparison.get('brain_action')}:{comparison.get('brain_mode')}",
+            dedupe_seconds=10,
+            symbol=ctx.get("symbol"), side=ctx.get("side"),
+            price=safe_float(ctx.get("current_price"), 0.0),
+            roe_pct=safe_float(ctx.get("roe"), 0.0),
+            **comparison,
+        )
+        log_execution(
+            f"[PROFIT_BRAIN_SHADOW] {ctx.get('symbol')} {ctx.get('side')} "
+            f"legacy={comparison.get('legacy_action')} brain={comparison.get('brain_action')} "
+            f"mode={comparison.get('brain_mode')} mode_candidate={comparison.get('brain_mode_candidate')} "
+            f"plan={comparison.get('execution_plan')} match={comparison.get('match')} "
+            f"differences={comparison.get('differences')} "
+            f"data_quality={comparison.get('data_quality')} "
+            f"confirmed_danger={comparison.get('confirmed_danger')} "
+            f"risk_flags={comparison.get('risk_flags')} decision_id={comparison.get('decision_id')}",
+            "INFO", debounce_key=f"profit_brain_shadow:{ctx.get('symbol')}:{signature}", debounce_sec=10,
+        )
+        self._log_brain_evidence_snapshot(ctx, brain_decision, shadow=True)
+
+    def _evaluate_legacy(self, context: Dict) -> TradeDecision:
         ctx = context if isinstance(context, dict) else {}
         side = str(ctx.get("side") or "").upper()
         entry = safe_float(ctx.get("entry"), 0.0)
