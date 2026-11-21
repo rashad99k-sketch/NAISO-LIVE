@@ -355,6 +355,190 @@ def validate_dual_ema_vwap_entry_gate(
     return result
 
 
+
+def validate_ema915_vwap_pullback_entry_gate(
+    df: pd.DataFrame, side: str, ema_fn: Callable,
+    timeframe_seconds: int = 900, now_ms: Optional[int] = None,
+    cross_lookback_candles: int = 8, pullback_lookback_candles: int = 5,
+    current_price: Optional[float] = None, max_extension_atr: float = 1.5,
+) -> Dict[str, Any]:
+    """Primary entry authority: fresh EMA9/EMA15 cross, VWAP alignment,
+    a subsequent pullback into the EMA band, then a closed-candle continuation
+    break. Pure validation only; it never places or manages orders.
+    """
+    direction = str(side or "").strip().upper()
+    expected = "BULLISH" if direction == "BUY" else "BEARISH"
+    cross_window = max(2, min(12, int(cross_lookback_candles)))
+    pullback_window = max(2, min(8, int(pullback_lookback_candles)))
+    result: Dict[str, Any] = {
+        "ready": False, "side": direction, "trigger": "EMA9_EMA15_VWAP_PULLBACK",
+        "reason": "invalid_side", "ema9": None, "ema15": None, "vwap": None,
+        "cross_direction": None, "cross_timestamp": None, "pullback_timestamp": None,
+        "signal_candle_timestamp": None, "signal_candle_id": None,
+        "atr": None, "pullback_touch": False, "continuation_break": False,
+    }
+    if direction not in {"BUY", "SELL"}:
+        return result
+    if not validate_ohlcv(df):
+        result["reason"] = "invalid_ohlcv"
+        return result
+    tf = max(1, int(timeframe_seconds))
+    closed = closed_candles(df, tf, now_ms=now_ms)
+    if len(closed) < 20:
+        result["reason"] = "insufficient_closed_candles_for_ema915_vwap_atr"
+        return result
+    vwap = compute_session_vwap(closed, tf, now_ms=now_ms)
+    if vwap is None:
+        result["reason"] = "session_vwap_unavailable"
+        return result
+    try:
+        close = closed["close"].astype(float)
+        ema9 = pd.Series(ema_fn(close, 9), index=closed.index, dtype=float)
+        ema15 = pd.Series(ema_fn(close, 15), index=closed.index, dtype=float)
+        if len(ema9) != len(closed) or len(ema15) != len(closed):
+            raise ValueError("EMA length mismatch")
+        tr = pd.concat([
+            (closed["high"] - closed["low"]).rename("hl"),
+            (closed["high"] - closed["close"].shift(1)).abs().rename("hc"),
+            (closed["low"] - closed["close"].shift(1)).abs().rename("lc"),
+        ], axis=1).max(axis=1)
+        atr_series = tr.rolling(14, min_periods=14).mean()
+        atr = float(atr_series.iloc[-1])
+    except Exception as exc:
+        result["reason"] = f"indicator_calculation_failed:{type(exc).__name__}"
+        return result
+    latest_ts = int(closed["timestamp"].iloc[-1])
+    now_value_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    data_age = (now_value_ms - (latest_ts + tf * 1000)) / 1000.0
+    max_data_age = 2.0 * tf
+    if data_age < 0.0 or data_age > max_data_age:
+        result.update({"reason": "stale_closed_candle_data", "data_age_seconds": data_age,
+                       "max_data_age_seconds": max_data_age})
+        return result
+    if not np.isfinite(atr) or atr <= 0:
+        result["reason"] = "atr_unavailable"
+        return result
+    if not np.isfinite(float(ema9.iloc[-1])) or not np.isfinite(float(ema15.iloc[-1])) or not np.isfinite(float(vwap.iloc[-1])):
+        result["reason"] = "non_finite_indicator"
+        return result
+
+    cross_idx = None
+    cross_direction = None
+    first_idx = max(1, len(closed) - cross_window)
+    for idx in range(len(closed) - 1, first_idx - 1, -1):
+        previous_gap = float(ema9.iloc[idx - 1] - ema15.iloc[idx - 1])
+        current_gap = float(ema9.iloc[idx] - ema15.iloc[idx])
+        crossed = ("BULLISH" if previous_gap <= 0.0 and current_gap > 0.0 else
+                   "BEARISH" if previous_gap >= 0.0 and current_gap < 0.0 else None)
+        if crossed:
+            cross_idx, cross_direction = idx, crossed
+            break
+    if cross_idx is None:
+        result["reason"] = "missing_fresh_ema9_ema15_cross"
+        return result
+    cross_ts = int(closed["timestamp"].iloc[cross_idx])
+    cross_age_bars = len(closed) - 1 - cross_idx
+    if cross_direction != expected:
+        result.update({"reason": "ema9_ema15_cross_direction_mismatch",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts})
+        return result
+    if cross_age_bars < 2:
+        result.update({"reason": "waiting_for_post_cross_pullback",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts})
+        return result
+    if cross_age_bars > pullback_window + 1:
+        result.update({"reason": "pullback_window_expired",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts})
+        return result
+
+    e9_now, e15_now, vwap_now = float(ema9.iloc[-1]), float(ema15.iloc[-1]), float(vwap.iloc[-1])
+    latest_close = float(close.iloc[-1])
+    if direction == "BUY":
+        aligned = e9_now > e15_now and e9_now > vwap_now and latest_close > vwap_now
+    else:
+        aligned = e9_now < e15_now and e9_now < vwap_now and latest_close < vwap_now
+    if not aligned:
+        result.update({"reason": "ema915_or_vwap_direction_not_aligned",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts})
+        return result
+
+    # A pullback must occur AFTER the cross and BEFORE the continuation candle.
+    pullback_idx = None
+    scan_start = max(cross_idx + 1, len(closed) - 1 - pullback_window)
+    for idx in range(scan_start, len(closed) - 1):
+        e9_i, e15_i = float(ema9.iloc[idx]), float(ema15.iloc[idx])
+        band_low, band_high = min(e9_i, e15_i), max(e9_i, e15_i)
+        candle_low, candle_high = float(closed["low"].iloc[idx]), float(closed["high"].iloc[idx])
+        candle_close = float(closed["close"].iloc[idx])
+        if direction == "BUY":
+            touched = candle_low <= band_high + 0.25 * atr and candle_low >= band_low - 0.35 * atr
+            held = candle_close >= band_low - 0.35 * atr
+        else:
+            touched = candle_high >= band_low - 0.25 * atr and candle_high <= band_high + 0.35 * atr
+            held = candle_close <= band_high + 0.35 * atr
+        if touched and held:
+            pullback_idx = idx
+    if pullback_idx is None:
+        result.update({"reason": "waiting_for_ema_band_pullback",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts})
+        return result
+
+    last = closed.iloc[-1]
+    previous = closed.iloc[-2]
+    last_open, last_close = float(last["open"]), float(last["close"])
+    last_high, last_low = float(last["high"]), float(last["low"])
+    previous_high, previous_low = float(previous["high"]), float(previous["low"])
+    candle_range = max(0.0, last_high - last_low)
+    if direction == "BUY":
+        rejection = last_close > last_open and last_close > e9_now
+        continuation = last_close > previous_high
+        extension = (float(current_price) if current_price is not None else last_close) - e9_now
+    else:
+        rejection = last_close < last_open and last_close < e9_now
+        continuation = last_close < previous_low
+        extension = e9_now - (float(current_price) if current_price is not None else last_close)
+    if not rejection:
+        result.update({"reason": "waiting_for_directional_rejection",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts,
+                       "pullback_timestamp": int(closed["timestamp"].iloc[pullback_idx])})
+        return result
+    if not continuation:
+        result.update({"reason": "waiting_for_continuation_break",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts,
+                       "pullback_timestamp": int(closed["timestamp"].iloc[pullback_idx])})
+        return result
+    live_price = float(current_price) if current_price is not None else last_close
+    if not np.isfinite(live_price) or live_price <= 0:
+        result["reason"] = "invalid_current_price"
+        return result
+    if extension < -0.10 * atr or extension > max(0.1, float(max_extension_atr)) * atr:
+        result.update({"reason": "entry_window_missed_no_chase",
+                       "cross_direction": cross_direction, "cross_timestamp": cross_ts,
+                       "pullback_timestamp": int(closed["timestamp"].iloc[pullback_idx]),
+                       "extension_atr": extension / atr})
+        return result
+    if (direction == "BUY" and live_price <= vwap_now) or (direction == "SELL" and live_price >= vwap_now):
+        result["reason"] = "live_price_lost_vwap_alignment"
+        return result
+
+    signal_ts = int(last["timestamp"])
+    pullback_ts = int(closed["timestamp"].iloc[pullback_idx])
+    result.update({
+        "ready": True, "reason": "ema915_cross_vwap_pullback_rejection_continuation_confirmed",
+        "authorization_state": "EMA915_VWAP_PULLBACK_VALID",
+        "cross_direction": cross_direction, "cross_timestamp": cross_ts,
+        "cross_age_bars": cross_age_bars, "pullback_timestamp": pullback_ts,
+        "signal_candle_timestamp": signal_ts,
+        "signal_candle_id": f"{direction}:EMA9_EMA15:{cross_ts}:PULLBACK:{pullback_ts}:BREAK:{signal_ts}",
+        "ema9": e9_now, "ema15": e15_now, "vwap": vwap_now, "atr": atr,
+        "latest_closed_timestamp": latest_ts, "data_age_seconds": data_age,
+        "pullback_touch": True, "rejection_confirmed": True,
+        "continuation_break": True, "continuation_level": previous_high if direction == "BUY" else previous_low,
+        "entry_price": live_price, "extension_atr": extension / atr,
+        "signal_candle_range": candle_range,
+    })
+    return result
+
 def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
                         ema_len: int = 9, timeframe_seconds: int = 900,
                         now_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
