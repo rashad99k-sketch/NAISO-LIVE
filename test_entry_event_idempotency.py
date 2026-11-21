@@ -33,6 +33,7 @@ def test_entry_checks_current_event_before_order_and_persists_after_verified_fil
                   else node.func.id if isinstance(node.func, ast.Name) else ""
                   for node in ast.walk(core_entry) if isinstance(node, ast.Call)]
     assert "is_event_consumed" in core_calls
+    assert 'gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"' in source
     guard_line = min(node.lineno for node in ast.walk(core_entry)
                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                      and node.func.attr == "is_event_consumed")
@@ -41,7 +42,7 @@ def test_entry_checks_current_event_before_order_and_persists_after_verified_fil
                       and node.func.id == "calculate_position_size")
     submit_line = min(node.lineno for node in ast.walk(core_entry)
                       if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                      and node.func.id == "open_position")
+                      and node.func.attr == "open_position")
     assert guard_line < sizing_line < submit_line
 
     wrapper_calls = [node.func.attr if isinstance(node.func, ast.Attribute)
