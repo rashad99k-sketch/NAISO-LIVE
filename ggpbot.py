@@ -816,12 +816,11 @@ INSTITUTIONAL_WATCHLIST_BATCH_SIZE = _env_int_range("INSTITUTIONAL_WATCHLIST_BAT
 INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS = _env_int_range("INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20, 10, 300)
 INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS = _env_int_range("INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 120, 30, 150)
 
-# Unified Profit Management Brain. Per the final execution order, the Brain is
-# enabled by default and is the routine decision authority. The legacy Board
-# remains available only as an explicit fallback by setting the flag to false.
-# Shadow Mode remains available for diagnostics but is disabled by default.
-ENABLE_UNIFIED_PROFIT_BRAIN = _env_bool("ENABLE_UNIFIED_PROFIT_BRAIN", True)
-PROFIT_BRAIN_SHADOW_MODE = _env_bool("PROFIT_BRAIN_SHADOW_MODE", False)
+# Unified Profit Management Brain. Keep production on the legacy decision
+# path by default until BingX PAPER validation is explicitly approved.
+# Shadow Mode collects comparisons without changing the executed decision.
+ENABLE_UNIFIED_PROFIT_BRAIN = _env_bool("ENABLE_UNIFIED_PROFIT_BRAIN", False)
+PROFIT_BRAIN_SHADOW_MODE = _env_bool("PROFIT_BRAIN_SHADOW_MODE", True)
 PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES = _env_int_range(
     "PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES", 2, 1, 5)
 
