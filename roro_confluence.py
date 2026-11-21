@@ -194,6 +194,17 @@ def validate_dual_ema_vwap_entry_gate(
         result["reason"] = f"indicator_calculation_failed:{type(exc).__name__}"
         return result
 
+    latest_closed_timestamp = int(closed["timestamp"].iloc[-1])
+    now_value_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    latest_closed_at_ms = latest_closed_timestamp + timeframe_seconds * 1000
+    data_age_seconds = (now_value_ms - latest_closed_at_ms) / 1000.0
+    max_data_age_seconds = float(lookback * timeframe_seconds)
+    if data_age_seconds < 0.0 or data_age_seconds > max_data_age_seconds:
+        result["reason"] = "stale_closed_candle_data"
+        result["data_age_seconds"] = data_age_seconds
+        result["max_data_age_seconds"] = max_data_age_seconds
+        return result
+
     latest_gap = float(ema9.iloc[-1]) - float(vwap.iloc[-1])
     if (direction == "BUY" and latest_gap <= 0.0) or (direction == "SELL" and latest_gap >= 0.0):
         result["reason"] = "latest_closed_ema9_vwap_relationship_not_directional"
@@ -292,8 +303,11 @@ def validate_dual_ema_vwap_entry_gate(
         "ema50_cross": ema50_cross,
         "ema9_cross_timestamp": int(closed["timestamp"].iloc[cross_idx]) if cross_idx is not None else None,
         "ema50_cross_timestamp": ema50_cross_ts,
-        "latest_closed_timestamp": int(closed["timestamp"].iloc[-1]),
+        "latest_closed_timestamp": latest_closed_timestamp,
+        "data_age_seconds": data_age_seconds,
+        "max_data_age_seconds": max_data_age_seconds,
         "signal_candle_timestamp": int(closed["timestamp"].iloc[signal_idx]),
+        "signal_candle_id": f"{direction}:{int(closed['timestamp'].iloc[signal_idx])}",
         "ema50_alignment": ema50_alignment,
         "ema50_distance_atr": ema50_distance_atr,
         "ema50_slope_atr": ema50_slope_atr,
