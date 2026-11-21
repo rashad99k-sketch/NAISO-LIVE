@@ -89,6 +89,28 @@ def test_missing_ema9_ema15_cross_fails_closed(monkeypatch):
     assert result["reason"] == "missing_fresh_ema9_ema15_cross"
 
 
+def test_three_recent_vwap_crosses_block_choppy_entry(monkeypatch):
+    frame = _frame("BUY")
+    def whipsaw_ema(values, period):
+        if period == 9:
+            out = np.full(len(values), 99.8, dtype=float)
+            out[-8:] = [99.4, 99.6, 99.4, 99.6, 99.4, 99.6, 100.2, 100.2]
+        else:
+            out = np.full(len(values), 100.0, dtype=float)
+        return pd.Series(out, index=values.index)
+    monkeypatch.setattr(
+        confluence, "compute_session_vwap",
+        lambda closed, timeframe_seconds, now_ms=None: pd.Series(99.5, index=closed.index),
+    )
+    result = confluence.validate_ema915_vwap_pullback_entry_gate(
+        frame, "BUY", whipsaw_ema, timeframe_seconds=900,
+        now_ms=int(frame.timestamp.iloc[-1] + 901_000), current_price=100.5,
+    )
+    assert result["ready"] is False
+    assert result["reason"] == "excessive_vwap_whipsaw"
+    assert result["ema9_vwap_crosses_last_8"] >= 3
+
+
 def test_vwap_direction_must_agree_with_ema_cross(monkeypatch):
     result = _run(monkeypatch, "BUY", vwap_value=100.4)
     assert result["ready"] is False
