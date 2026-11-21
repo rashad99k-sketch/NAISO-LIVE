@@ -113,6 +113,14 @@ def test_rejection_and_continuation_break_are_separate_requirements(monkeypatch)
     assert result["reason"] == "waiting_for_continuation_break"
 
 
+def test_continuation_without_rejection_wick_is_not_authorized(monkeypatch):
+    frame = _frame("BUY")
+    frame.loc[len(frame) - 1, ["open", "high", "low", "close"]] = [100.10, 100.60, 100.10, 100.50]
+    result = _run(monkeypatch, "BUY", frame=frame)
+    assert result["ready"] is False
+    assert result["reason"] == "waiting_for_directional_rejection"
+
+
 def test_no_chase_guard_uses_actual_ticker_price(monkeypatch):
     result = _run(monkeypatch, "BUY", current_price=102.0)
     assert result["ready"] is False
@@ -147,3 +155,4 @@ def test_all_execution_paths_use_primary_gate_and_live_last_mile_revalidates():
     scaling = source[source.index("def scaling_logic("):source.index("def council_exit(")]
     assert "_validate_ema915_vwap_pullback_entry_gate(" in scaling
     assert "EMA915_SCALE_IN_BLOCK" in scaling
+    assert scaling.index('STATE["qty"] += actual_scale_qty') < scaling.index("journal.consume_event(event_id, scale_trade_id)")
