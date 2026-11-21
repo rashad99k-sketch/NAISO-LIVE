@@ -9700,16 +9700,19 @@ function updateUI(d) {{
         let pHtml = "";
         d.ema9_vwap_proximity_scanner.forEach(item => {{
             let icon = item.cross ? "⚡" : (item.state === "NEAR_CROSS" || item.state === "CONVERGING" ? "🟡" : item.direction === "BUY" ? "📈" : item.direction === "SELL" ? "📉" : "⚪");
-            let st = item.ema915_vwap_strategy || {};
+            let st = item.ema915_vwap_strategy || {{}};
             let stage = st.stage || "WAITING_FOR_SCAN";
             let stageColor = stage === "ENTRY_READY" ? "#2ecc71" :
                 (stage === "ENTRY_WINDOW_MISSED" || stage === "CHOP_FILTER" || stage === "STALE_DATA" ? "#e74c3c" :
                 (stage === "NO_FRESH_CROSS" ? "#95a5a6" : "#f1c40f"));
             let active = st.active_side || "NONE";
             let sideCheck = st[active.toLowerCase()] || {{}};
+            let buyCheck = st.buy || {{}};
+            let sellCheck = st.sell || {{}};
             pHtml += `<div style="padding:8px;border-bottom:1px solid #26364a;">
               ${{icon}} <b>${{item.symbol}}</b> | <span style="color:${{stageColor}};font-weight:bold;">${{stage}}</span> | Side: ${{active}}
-              <br><small>EMA9/VWAP context: ${{item.state || "UNKNOWN"}} · ${{item.cross_trigger || "No EMA9/VWAP cross"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}}</small>
+              <br><small>BUY: ${{buyCheck.stage || "NOT_EVALUATED"}} · Completion ${{buyCheck.setup_progress_pct ?? 0}}% · ${{buyCheck.reason || "-"}} | SELL: ${{sellCheck.stage || "NOT_EVALUATED"}} · Completion ${{sellCheck.setup_progress_pct ?? 0}}% · ${{sellCheck.reason || "-"}}</small>
+              <br><small>Legacy EMA9/VWAP proximity (EMA50 advisory): ${{item.state || "UNKNOWN"}} · ${{item.cross_trigger || "No EMA9/VWAP cross"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}}</small>
               <br><small>EMA9/EMA15/VWAP: ${{st.trigger || "NOT_EVALUATED"}} | Cross: ${{sideCheck.cross_direction || "-"}} | Cross age: ${{sideCheck.cross_age_bars ?? "-"}} bars | EMA9: ${{sideCheck.ema9 ?? "-"}} | EMA15: ${{sideCheck.ema15 ?? "-"}} | VWAP: ${{sideCheck.vwap ?? "-"}}</small>
               <br><small>Pullback: ${{sideCheck.pullback_touch ? "CONFIRMED" : "WAITING"}} | Rejection: ${{sideCheck.rejection_confirmed ? "CONFIRMED" : "WAITING"}} | Continuation break: ${{sideCheck.continuation_break ? "CONFIRMED" : "WAITING"}} | No-chase: ${{stage === "ENTRY_WINDOW_MISSED" ? "BLOCKED" : "OK"}}</small>
               <br><small>Reason: ${{st.reason || "Waiting for closed-candle setup"}} · Closed candles · Watchlist only; final live entry revalidation required</small>
@@ -11367,6 +11370,14 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                             "stale_closed_candle_data": "STALE_DATA",
                         }
                         _check["stage"] = ("ENTRY_READY" if _check.get("ready") else _stage_map.get(_reason, "WAITING"))
+                        # Rule-stage completion, not a statistical win probability.
+                        _progress_by_stage = {"ENTRY_READY": 100, "WAITING_FOR_CONTINUATION_BREAK": 80,
+                            "WAITING_FOR_REJECTION": 65, "WAITING_FOR_PULLBACK": 40,
+                            "WAITING_FOR_ALIGNMENT": 25, "OPPOSITE_CROSS": 10,
+                            "NO_FRESH_CROSS": 0, "CROSS_EXPIRED": 0, "ENTRY_WINDOW_MISSED": 0,
+                            "CHOP_FILTER": 0, "STALE_DATA": 0}
+                        _check["setup_progress_pct"] = int(_progress_by_stage.get(_check["stage"], 15))
+                        _check["setup_progress_basis"] = "RULE_STAGE_COMPLETION_NOT_WIN_PROBABILITY"
                         _ema915_checks[_watch_side] = _check
                     _ready_sides = [s for s, v in _ema915_checks.items() if v.get("ready")]
                     _active_side = _ready_sides[0] if _ready_sides else None
