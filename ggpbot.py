@@ -5758,6 +5758,32 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         if price <= 0:
             raise ValueError("Invalid live ticker price")
 
+        # Last-mile live revalidation against the actual exchange ticker.
+        # The entry must still be the exact closed-candle setup approved by execute_entry.
+        gate_snapshot = management_state.get("entry_gate_snapshot") if isinstance(management_state, dict) else None
+        if not isinstance(gate_snapshot, dict) or gate_snapshot.get("ready") is not True:
+            log_execution(f"[EMA915_FINAL_GATE] BLOCKED {sym}: approved entry snapshot missing", "ERROR")
+            return None
+        latest_gate_frame = _integration_fetch_frame(sym)
+        final_gate = _validate_ema915_vwap_pullback_entry_gate(
+            latest_gate_frame, side, ema,
+            timeframe_seconds=_roro_timeframe_seconds(str(
+                management_state.get("entry_gate_timeframe") or INTERVAL
+            )),
+            now_ms=int(time.time() * 1000), cross_lookback_candles=8,
+            pullback_lookback_candles=5, current_price=price,
+        )
+        if (not final_gate.get("ready")
+                or final_gate.get("signal_candle_id") != gate_snapshot.get("signal_candle_id")):
+            log_execution(
+                f"[EMA915_FINAL_GATE] BLOCKED {sym} {side}: "
+                f"reason={final_gate.get('reason')} "
+                f"approved_event={gate_snapshot.get('signal_candle_id')} "
+                f"live_event={final_gate.get('signal_candle_id')}; exchange order not submitted",
+                "WARN",
+            )
+            return None
+
         required_margin = (amount * contract_size * price) / LEVERAGE
         if usdt < required_margin * 1.01:
             log_execution(f"Insufficient margin: need {required_margin:.2f}, have {usdt:.2f}", "ERROR")
@@ -6190,9 +6216,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         if gate_frame is None:
             gate_frame = _integration_fetch_frame(symbol)
             gate_frame_source = "SHARED_SCANNER_FRAME_FALLBACK"
-        gate_result = _validate_dual_ema_vwap_entry_gate(
+        gate_result = _validate_ema915_vwap_pullback_entry_gate(
             gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
-            now_ms=int(time.time() * 1000), lookback_candles=2,
+            now_ms=int(time.time() * 1000), cross_lookback_candles=8,
+            pullback_lookback_candles=5, current_price=float(price),
         )
         gate_result["frame_source"] = gate_frame_source
     except Exception as gate_exc:
@@ -6204,15 +6231,16 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         except Exception:
             event_symbol = str(symbol or "").strip().upper()
         gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"
-    institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
+    institutional_entry_ctx["ema915_vwap_pullback_gate"] = dict(gate_result)
     # Preserve the exact gate snapshot for the serialized final execution wrapper.
     globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
     if not gate_result.get("ready"):
         log_execution(
-            f"[VWAP_ENTRY_GATE] BLOCKED {symbol} {side} reason={gate_result.get('reason')} "
-            f"EMA9={gate_result.get('ema9')} EMA50={gate_result.get('ema50')} "
-            f"VWAP={gate_result.get('vwap')} EMA9_cross={gate_result.get('ema9_cross')} "
-            f"EMA50_cross={gate_result.get('ema50_cross')} closed_ts={gate_result.get('latest_closed_timestamp')}",
+            f"[EMA915_VWAP_PULLBACK_GATE] BLOCKED {symbol} {side} reason={gate_result.get('reason')} "
+            f"EMA9={gate_result.get('ema9')} EMA15={gate_result.get('ema15')} "
+            f"VWAP={gate_result.get('vwap')} cross={gate_result.get('cross_direction')} "
+            f"cross_ts={gate_result.get('cross_timestamp')} pullback_ts={gate_result.get('pullback_timestamp')} "
+            f"closed_ts={gate_result.get('latest_closed_timestamp')}",
             "WARN", debounce_key=f"dual_ema_vwap_gate:{symbol}:{side}:{gate_result.get('reason')}",
             debounce_sec=5,
         )
@@ -6242,10 +6270,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             )
             return False
     log_execution(
-        f"[VWAP_ENTRY_GATE] PASSED {symbol} {side} "
-        f"EMA9_cross_ts={gate_result.get('ema9_cross_timestamp')} "
-        f"EMA50_cross_ts={gate_result.get('ema50_cross_timestamp')} "
-        f"EMA9={gate_result.get('ema9')} EMA50={gate_result.get('ema50')} VWAP={gate_result.get('vwap')}",
+        f"[EMA915_VWAP_PULLBACK_GATE] PASSED {symbol} {side} "
+        f"cross_ts={gate_result.get('cross_timestamp')} pullback_ts={gate_result.get('pullback_timestamp')} "
+        f"signal_ts={gate_result.get('signal_candle_timestamp')} "
+        f"EMA9={gate_result.get('ema9')} EMA15={gate_result.get('ema15')} VWAP={gate_result.get('vwap')}",
         "INFO", debounce_key=f"dual_ema_vwap_gate_pass:{symbol}:{side}", debounce_sec=5,
     )
     entry_spread_pct = safe_float(institutional_entry_ctx.get("spread_pct"), 0.0) or 0.0
@@ -6661,6 +6689,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "max_trade_risk_pct": MAX_TRADE_RISK_PCT,
         "entry_time": time.time(), "tp1_hit": False, "tp2_hit": False,
         "trail_activated": False, "be_done": False,
+        "entry_gate_snapshot": dict(gate_result),
+        "entry_gate_timeframe": gate_tf,
     }
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] cooldown activated during validation; order not submitted for {symbol}", "WARN")
@@ -10655,6 +10685,7 @@ from ggp_institutional_bridge import (
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
 from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
                              validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                             validate_ema915_vwap_pullback_entry_gate as _validate_ema915_vwap_pullback_entry_gate,
                              timeframe_seconds as _roro_timeframe_seconds)
 try:
     from roro_resource_manager import ResourceManager
