@@ -685,7 +685,12 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         liq = prior.get("liquidity") if isinstance(prior.get("liquidity"), dict) else {}
         liquidity_quality = max(0.0, min(1.0, rank_number(liq.get("confidence")) / 100.0))
         analysis_priority = max(0.0, min(100.0, rank_number(prior.get("analysis_priority_score")))) / 100.0
-        proximity = prior.get("ema9_vwap_proximity") if isinstance(prior.get("ema9_vwap_proximity"), dict) else {}
+        # Newly discovered proximity candidates carry closed-candle evidence
+        # before their first institutional Watchlist analysis.
+        proximity_source = prior.get("ema9_vwap_proximity")
+        if not isinstance(proximity_source, dict):
+            proximity_source = item.get("ema9_vwap_proximity") if isinstance(item.get("ema9_vwap_proximity"), dict) else {}
+        proximity = dict(proximity_source)
         proximity = dict(proximity)
         proximity_observed_at = rank_number(proximity.get("updated_at"), 0.0)
         proximity_observation_age = max(0.0, time.time() - proximity_observed_at) if proximity_observed_at else float("inf")
