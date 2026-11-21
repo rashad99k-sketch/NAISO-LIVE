@@ -800,6 +800,62 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         cross_age = max(0.0, time.time() - (cross_ts / 1000.0 + tf_seconds)) if cross_ts > 0 else float("inf")
         cross_fresh = bool(cross_ema9 in {"BULLISH", "BEARISH"} and cross_ts > 0 and cross_age <= 2.0 * tf_seconds)
         cross_matches = bool(cross_fresh and cross_ema9 == expected_cross)
+
+        # The trigger must occur at a validated institutional location, not merely
+        # somewhere on the chart. Prefer a causal OB; a direction-matched live FVG
+        # is the only alternate zone. Use the exact closed cross candle timestamp.
+        cross_zone = {"status": "NOT_EVALUATED", "type": None, "overlap": False,
+                      "cross_candle_timestamp": cross_ts or None}
+        if cross_matches:
+            cross_row = None
+            try:
+                if isinstance(frame, pd.DataFrame) and "timestamp" in frame.columns:
+                    _cross_rows = frame[pd.to_numeric(frame["timestamp"], errors="coerce") == cross_ts]
+                    if not _cross_rows.empty:
+                        cross_row = _cross_rows.iloc[-1]
+            except Exception:
+                cross_row = None
+            ob = best.get("order_block") if isinstance(best.get("order_block"), dict) else None
+            ob_validation = ob.get("validation") if isinstance(ob, dict) and isinstance(ob.get("validation"), dict) else {}
+            ob_valid = bool(
+                isinstance(ob, dict) and ob_validation.get("valid") is True
+                and str(ob_validation.get("status") or ob.get("status") or "").upper()
+                    not in {"MITIGATED", "INVALIDATED"}
+            )
+            fvg = best.get("fvg") if isinstance(best.get("fvg"), dict) else None
+            expected_direction = "BULLISH" if expected_cross == "BULLISH" else "BEARISH"
+            fvg_valid = bool(
+                isinstance(fvg, dict)
+                and str(fvg.get("direction") or "").upper() == expected_direction
+                and str(fvg.get("status") or "").upper() in {"UNFILLED", "PARTIALLY_FILLED"}
+            )
+            zones = []
+            if ob_valid:
+                zones.append(("ORDER_BLOCK", safe_float(ob.get("low"), 0.0), safe_float(ob.get("high"), 0.0)))
+            if fvg_valid:
+                zones.append(("FVG", safe_float(fvg.get("lower"), 0.0), safe_float(fvg.get("upper"), 0.0)))
+            for zone_type, zone_low, zone_high in zones:
+                if (cross_row is not None and 0 < zone_low < zone_high
+                        and float(cross_row["low"]) <= zone_high
+                        and float(cross_row["high"]) >= zone_low):
+                    cross_zone = {"status": "CONFIRMED", "type": zone_type, "overlap": True,
+                                  "low": zone_low, "high": zone_high,
+                                  "cross_candle_timestamp": cross_ts}
+                    break
+            if cross_zone["status"] != "CONFIRMED":
+                cross_zone["status"] = "NOT_ON_VALIDATED_INSTITUTIONAL_ZONE"
+                cross_zone["ob_available"] = ob_valid
+                cross_zone["fvg_available"] = fvg_valid
+                cross_zone["cross_candle_found"] = cross_row is not None
+
+        ema50_confirmation = str(candidate.get("ema50_confirmation") or proximity_event.get("ema50_alignment") or "UNKNOWN").upper()
+        ema50_supportive = ema50_confirmation in {"ALIGNED", "SUPPORTIVE"}
+        best["ema50_confluence"] = {
+            "status": "SUPPORTIVE" if ema50_supportive else "OPPOSED" if ema50_confirmation in {"OPPOSITE", "OPPOSED"} else "NEUTRAL_OR_UNAVAILABLE",
+            "required": False,
+            "confirmation": ema50_confirmation,
+        }
+        best["cross_institutional_zone"] = cross_zone
         best["ema9_vwap_discovery"] = {
             "state": candidate.get("state") or proximity_event.get("state") or "UNKNOWN",
             "cross_ema9": cross_ema9 or None,
@@ -812,6 +868,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
             "required_for_entry": True,
         }
         best["entry_cross_gate_passed"] = cross_matches
+        best["entry_institutional_zone_gate_passed"] = bool(cross_matches and cross_zone.get("status") == "CONFIRMED")
         if not cross_matches:
             best["pre_cross_decision_state"] = best.get("decision_state")
             best["pre_cross_decision_reason"] = best.get("decision_reason")
@@ -823,9 +880,19 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 reasons.append("ema9_vwap_cross_not_confirmed_or_stale")
             best["rejection_reasons"] = reasons
             best["icons"] = {**(best.get("icons") or {}), "status": "🟡", "setup": "⏳"}
+        elif cross_zone.get("status") != "CONFIRMED":
+            best["pre_zone_decision_state"] = best.get("decision_state")
+            best["pre_zone_decision_reason"] = best.get("decision_reason")
+            best["decision_state"] = "WAITING_FOR_INSTITUTIONAL_ZONE"
+            best["entry_status"] = "WAITING_FOR_INSTITUTIONAL_ZONE"
+            best["decision_reason"] = "fresh_ema9_vwap_cross_not_overlapping_validated_order_block_or_directional_fvg"
+            reasons = list(best.get("rejection_reasons") or [])
+            reasons.append("cross_not_on_validated_institutional_zone")
+            best["rejection_reasons"] = list(dict.fromkeys(reasons))
+            best["icons"] = {**(best.get("icons") or {}), "status": "🟡", "setup": "🧱"}
         else:
             best["cross_gate_release_state"] = best.get("decision_state")
-            best["decision_reason"] = (str(best.get("decision_reason") or "") + " | fresh_ema9_vwap_cross_confirmed").strip(" |")
+            best["decision_reason"] = (str(best.get("decision_reason") or "") + " | fresh_closed_cross_on_institutional_zone").strip(" |")
         previous = out.get(key, {})
         best["first_seen"] = previous.get("first_seen", time.time())
         best["discovery_sources"] = list(candidate.get("sources", []))
