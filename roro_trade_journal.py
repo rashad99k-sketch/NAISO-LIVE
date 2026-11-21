@@ -62,6 +62,12 @@ class TradeJournal:
             CREATE TABLE IF NOT EXISTS runtime_state (
                 state_key TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_ts REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS reserved_events (
+                event_id TEXT PRIMARY KEY, trade_id TEXT NOT NULL,
+                created_ts REAL NOT NULL, updated_ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'RESERVED', reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_reserved_events_trade ON reserved_events(trade_id);
             """)
             # Upgrade databases created by earlier releases without discarding rows.
             existing = {row[1] for row in db.execute("PRAGMA table_info(trades)")}
@@ -306,6 +312,12 @@ class TradeJournal:
             db.execute("COMMIT")
             return True
 
+            CREATE TABLE IF NOT EXISTS reserved_events (
+                event_id TEXT PRIMARY KEY, trade_id TEXT NOT NULL,
+                created_ts REAL NOT NULL, updated_ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'RESERVED', reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_reserved_events_trade ON reserved_events(trade_id);
     def is_event_consumed(self, event_id: str) -> bool:
         if not event_id:
             return False
