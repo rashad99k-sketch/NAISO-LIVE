@@ -6220,6 +6220,71 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             debounce_sec=5,
         )
         return False
+
+    # Institutional location is a second, independent execution-boundary gate:
+    # the exact closed candle that produced EMA9/VWAP cross must overlap a
+    # validated, directional causal OB or an unfilled directional FVG.
+    # EMA50 is a quality confluence only; it never substitutes for the zone.
+    zone_result = {"ready": False, "status": "MISSING_INSTITUTIONAL_ZONE",
+                   "zone_type": None, "cross_candle_timestamp": gate_result.get("signal_candle_timestamp")}
+    try:
+        _cross_ts = int(gate_result.get("signal_candle_timestamp") or 0)
+        _tf_seconds = _roro_timeframe_seconds(gate_tf)
+        _cross_row = None
+        if gate_frame is not None and _cross_ts > 0 and hasattr(gate_frame, "columns") and "timestamp" in gate_frame.columns:
+            _timestamps = pd.to_numeric(gate_frame["timestamp"], errors="coerce")
+            _matches = gate_frame.loc[_timestamps == _cross_ts]
+            if not _matches.empty and _cross_ts + _tf_seconds * 1000 <= int(time.time() * 1000):
+                _cross_row = _matches.iloc[-1]
+        _expected_direction = "BULLISH" if side == "BUY" else "BEARISH"
+        _zones = []
+        _ob = institutional_entry_ctx.get("order_block")
+        if isinstance(_ob, dict):
+            _validation = _ob.get("validation") if isinstance(_ob.get("validation"), dict) else {}
+            if (_validation.get("valid") is True
+                    and str(_validation.get("status") or _ob.get("status") or "").upper() not in {"MITIGATED", "INVALIDATED"}):
+                _zones.append(("ORDER_BLOCK", float(_ob.get("low") or 0.0), float(_ob.get("high") or 0.0)))
+        _fvg = institutional_entry_ctx.get("fvg")
+        if (isinstance(_fvg, dict)
+                and str(_fvg.get("direction") or "").upper() == _expected_direction
+                and str(_fvg.get("status") or "").upper() in {"UNFILLED", "PARTIALLY_FILLED"}):
+            _zones.append(("FVG", float(_fvg.get("lower") or 0.0), float(_fvg.get("upper") or 0.0)))
+        for _zone_type, _zone_low, _zone_high in _zones:
+            if (_cross_row is not None and 0 < _zone_low < _zone_high
+                    and float(_cross_row["low"]) <= _zone_high
+                    and float(_cross_row["high"]) >= _zone_low):
+                zone_result = {"ready": True, "status": "CROSS_ON_VALIDATED_INSTITUTIONAL_ZONE",
+                               "zone_type": _zone_type, "zone_low": _zone_low, "zone_high": _zone_high,
+                               "cross_candle_timestamp": _cross_ts}
+                break
+        if not zone_result["ready"]:
+            zone_result.update({
+                "status": "CROSS_NOT_ON_VALIDATED_INSTITUTIONAL_ZONE",
+                "cross_candle_found": _cross_row is not None,
+                "validated_zone_count": len(_zones),
+            })
+    except Exception as _zone_exc:
+        zone_result = {"ready": False, "status": f"ZONE_VALIDATION_ERROR:{type(_zone_exc).__name__}",
+                       "cross_candle_timestamp": gate_result.get("signal_candle_timestamp")}
+    gate_result["institutional_zone"] = dict(zone_result)
+    gate_result["ema50_confluence"] = {
+        "alignment": str(gate_result.get("ema50_alignment") or "UNAVAILABLE"),
+        "supportive": str(gate_result.get("ema50_alignment") or "").upper() == "SUPPORTIVE",
+        "required": False,
+    }
+    globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
+    if not zone_result.get("ready"):
+        log_execution(
+            f"[INSTITUTIONAL_ZONE_GATE] BLOCKED {symbol} {side} status={zone_result.get('status')} "
+            f"EMA50={gate_result.get('ema50_alignment')} cross_ts={gate_result.get('signal_candle_timestamp')}",
+            "WARN", debounce_key=f"institutional_zone_gate:{symbol}:{side}:{zone_result.get('status')}",
+            debounce_sec=5,
+        )
+        return False
+
+    # Consume the current signal identity only after both the closed cross and
+    # its institutional-zone location have been verified, before order sizing.
+    # EMA50 remains a soft confluence, not a mandatory veto.
     # Consume the current signal identity only after this call has computed it,
     # and before sizing/order submission. Fail closed if durable state is unreadable.
     entry_event_id = str(gate_result.get("durable_event_id") or "").strip()
