@@ -210,3 +210,31 @@ def test_fast_ema9_vwap_discovery_is_scheduled_independently_of_slow_global_scan
     body = ast.get_source_segment(SOURCE, main_loop)
     assert "EMA9_VWAP_DISCOVERY_INTERVAL" in body
     assert 'dispatch_scanner_task("ema9_vwap_discovery", run_fast_ema9_vwap_discovery)' in body
+
+
+def test_unified_watchlist_waits_for_fresh_ema9_cross_before_entry_ready():
+    bridge = (ROOT / "ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    tree = ast.parse(bridge)
+    update = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "update_unified_watchlist")
+    source = ast.get_source_segment(bridge, update)
+    assert "cross_ema9" in source
+    assert "cross_fresh" in source
+    assert "WAITING_FOR_EMA9_VWAP_CROSS" in source
+    assert "entry_cross_gate_passed" in source
+    assert "cross_matches_selected_side" in source
+
+
+def test_fresh_ema9_cross_selects_matching_direction_not_opposite_setup():
+    bridge = (ROOT / "ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    tree = ast.parse(bridge)
+    update = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "update_unified_watchlist")
+    source = ast.get_source_segment(bridge, update)
+    assert "decision_results" in source
+    assert 'fresh_cross_dir == "BULLISH" else "SELL"' in source
+    assert "fresh_ema9_cross_direction" in source
+
+
+def test_live_trade_manager_remains_the_existing_post_fill_management_authority():
+    main_loop = ast.get_source_segment(SOURCE, _function("main_loop_sniper"))
+    assert "_live_manager.manage_live_trade()" in main_loop
+    assert "if TRADE_STATE[\"in_position\"] or STATE[\"open\"]:" in main_loop
