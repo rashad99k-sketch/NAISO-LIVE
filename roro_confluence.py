@@ -146,9 +146,11 @@ def validate_dual_ema_vwap_entry_gate(
     timeframe_seconds: int = 900, now_ms: Optional[int] = None,
     lookback_candles: int = 2,
 ) -> Dict[str, Any]:
-    """Fail-closed gate: EMA9/VWAP and EMA50/VWAP must both cross freshly
-    in the requested direction on closed candles, with directional EMA stacking.
-    The two crosses may occur on either of the last two closed candles.
+    """Authorize on a fresh closed-candle EMA9/VWAP cross.
+
+    EMA50 is deliberately diagnostic/contextual only. It can describe alignment
+    or conflict, but it cannot veto a valid EMA9/VWAP trigger. Institutional
+    zone, retest, liquidity and risk gates remain separate and authoritative.
     """
     direction = str(side or "").upper()
     lookback = max(1, min(3, int(lookback_candles)))
@@ -157,6 +159,7 @@ def validate_dual_ema_vwap_entry_gate(
         "ema9_cross": None, "ema50_cross": None,
         "ema9_cross_timestamp": None, "ema50_cross_timestamp": None,
         "ema9": None, "ema50": None, "vwap": None,
+        "ema50_context": "INSUFFICIENT_DATA",
         "lookback_candles": lookback,
     }
     if direction not in {"BUY", "SELL"}:
@@ -165,8 +168,10 @@ def validate_dual_ema_vwap_entry_gate(
         result["reason"] = "invalid_ohlcv"
         return result
     closed = closed_candles(df, timeframe_seconds, now_ms=now_ms)
-    if len(closed) < 55:
-        result["reason"] = "insufficient_closed_candles_for_ema50"
+    # EMA50 is not an authorization prerequisite; only enough data for EMA9/VWAP
+    # is required here. The EMA50 value is added when its history is available.
+    if len(closed) < 12:
+        result["reason"] = "insufficient_closed_candles_for_ema9"
         return result
     vwap = compute_session_vwap(closed, timeframe_seconds, now_ms=now_ms)
     if vwap is None:
@@ -174,11 +179,21 @@ def validate_dual_ema_vwap_entry_gate(
         return result
     try:
         close = closed["close"].astype(float)
-        ema9, ema50 = ema_fn(close, 9), ema_fn(close, 50)
-        if len(ema9) != len(closed) or len(ema50) != len(closed):
-            raise ValueError("EMA length mismatch")
-        if not all(np.isfinite(float(s.iloc[-1])) for s in (ema9, ema50, vwap)):
-            raise ValueError("non-finite latest indicator")
+        ema9 = ema_fn(close, 9)
+        if len(ema9) != len(closed):
+            raise ValueError("EMA9 length mismatch")
+        if len(closed) >= 50:
+            ema50 = ema_fn(close, 50)
+            if len(ema50) != len(closed):
+                raise ValueError("EMA50 length mismatch")
+            ema50_value = float(ema50.iloc[-1])
+        else:
+            ema50 = None
+            ema50_value = None
+        if not all(np.isfinite(float(s.iloc[-1])) for s in (ema9, vwap)):
+            raise ValueError("non-finite EMA9/VWAP latest indicator")
+        if ema50_value is not None and not np.isfinite(ema50_value):
+            ema50_value = None
     except Exception as exc:
         result["reason"] = f"indicator_calculation_failed:{type(exc).__name__}"
         return result
@@ -187,6 +202,8 @@ def validate_dual_ema_vwap_entry_gate(
     first_idx = max(1, len(closed) - lookback)
     found: Dict[str, Tuple[str, int]] = {}
     for name, series in (("ema9", ema9), ("ema50", ema50)):
+        if series is None:
+            continue
         for idx in range(len(closed) - 1, first_idx - 1, -1):
             prev_gap = float(series.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
             gap = float(series.iloc[idx]) - float(vwap.iloc[idx])
@@ -196,29 +213,42 @@ def validate_dual_ema_vwap_entry_gate(
                 found[name] = (crossed, int(closed["timestamp"].iloc[idx]))
                 break
 
-    e9, e50, vw = float(ema9.iloc[-1]), float(ema50.iloc[-1]), float(vwap.iloc[-1])
+    e9, vw = float(ema9.iloc[-1]), float(vwap.iloc[-1])
     result.update({
-        "ema9": e9, "ema50": e50, "vwap": vw,
+        "ema9": e9, "ema50": ema50_value, "vwap": vw,
         "ema9_cross": found.get("ema9", (None, None))[0],
         "ema50_cross": found.get("ema50", (None, None))[0],
         "ema9_cross_timestamp": found.get("ema9", (None, None))[1],
         "ema50_cross_timestamp": found.get("ema50", (None, None))[1],
         "latest_closed_timestamp": int(closed["timestamp"].iloc[-1]),
     })
+    if "ema50" not in found:
+        result["ema50_context"] = "NOT_CROSSED_OR_UNAVAILABLE"
+    elif found["ema50"][0] == expected:
+        result["ema50_context"] = "ALIGNED_CROSS"
+    else:
+        result["ema50_context"] = "OPPOSITE_CROSS"
+
     if "ema9" not in found or found["ema9"][0] != expected:
         result["reason"] = "missing_fresh_directional_ema9_vwap_cross"
         return result
-    if "ema50" not in found or found["ema50"][0] != expected:
-        result["reason"] = "missing_fresh_directional_ema50_vwap_cross"
-        return result
-    aligned = (e9 > e50 > vw) if direction == "BUY" else (e9 < e50 < vw)
-    if not aligned:
-        result["reason"] = "ema9_ema50_vwap_alignment_not_confirmed"
-        return result
-    result.update({"ready": True, "reason": "dual_ema_vwap_cross_confirmed"})
+
+    # Context is observational, never a hard gate. This avoids requiring a
+    # second, slower EMA50 crossover after the primary EMA9/VWAP trigger.
+    stack_aligned = (
+        ema50_value is not None
+        and ((e9 > ema50_value > vw) if direction == "BUY" else (e9 < ema50_value < vw))
+    )
+    stack_opposed = (
+        ema50_value is not None
+        and ((e9 <= ema50_value) if direction == "BUY" else (e9 >= ema50_value))
+    )
+    result["ema50_context"] = (
+        "ALIGNED" if stack_aligned else "OPPOSING" if stack_opposed
+        else result["ema50_context"]
+    )
+    result.update({"ready": True, "reason": "ema9_vwap_cross_confirmed"})
     return result
-
-
 def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
                         ema_len: int = 9, timeframe_seconds: int = 900,
                         now_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
