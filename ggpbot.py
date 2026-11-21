@@ -8485,12 +8485,26 @@ def scaling_logic(symbol, df, ind):
             trade_id=scale_trade_id, management_state=scale_management,
         )
         if order:
+            actual_scale_qty = safe_float(order.get("filled"), 0.0)
+            if actual_scale_qty <= 0:
+                STATE.update({"recovery_hold": True, "execution_unresolved": True})
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                log_execution(
+                    f"[EMA915_SCALE_IN_RECOVERY_HOLD] {sym_norm}: accepted order has no verified fill quantity",
+                    "ERROR",
+                )
+                return False
+            # Reflect verified exposure before journal persistence. If persistence
+            # fails, the runtime still manages the real filled quantity under hold.
+            STATE["qty"] += actual_scale_qty
+            STATE["remaining_qty"] += actual_scale_qty
+            STATE["scale_ins"] = STATE.get("scale_ins", 0) + 1
             try:
                 if not journal.consume_event(event_id, scale_trade_id):
                     STATE.update({"recovery_hold": True, "execution_unresolved": True})
                     globals()["RECOVERY_BLOCK_ENTRIES"] = True
                     log_execution(
-                        f"[EMA915_SCALE_IN_RECOVERY_HOLD] {sym_norm}: fill accepted but event persistence conflicted",
+                        f"[EMA915_SCALE_IN_RECOVERY_HOLD] {sym_norm}: fill recorded in state but event persistence conflicted",
                         "ERROR",
                     )
                     return False
@@ -8498,14 +8512,11 @@ def scaling_logic(symbol, df, ind):
                 STATE.update({"recovery_hold": True, "execution_unresolved": True})
                 globals()["RECOVERY_BLOCK_ENTRIES"] = True
                 log_execution(
-                    f"[EMA915_SCALE_IN_RECOVERY_HOLD] {sym_norm}: fill accepted but event persistence failed: {exc}",
+                    f"[EMA915_SCALE_IN_RECOVERY_HOLD] {sym_norm}: fill recorded in state but event persistence failed: {exc}",
                     "ERROR",
                 )
                 return False
-            STATE["qty"] += qty
-            STATE["remaining_qty"] += qty
-            STATE["scale_ins"] = STATE.get("scale_ins", 0) + 1
-            log_execution(f"Scaled in {qty:.6f} at {df['close'].iloc[-1]:.4f}", "SUCCESS")
+            log_execution(f"Scaled in {actual_scale_qty:.6f} at {df['close'].iloc[-1]:.4f}", "SUCCESS")
             return True
     return False
 
