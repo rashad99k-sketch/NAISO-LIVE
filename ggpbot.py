@@ -2448,7 +2448,7 @@ from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
                               tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
-                              RANGE_MODE, TREND_MODE, STANDARD_MODE)
+                              trend_target_prices, RANGE_MODE, TREND_MODE, STANDARD_MODE)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -5494,20 +5494,21 @@ def compute_sl_tp(entry_price, side, classification, atr, df, symbol=None):
         min_sl_dist = 1.2 * atr
         if abs(entry_price - sl) < min_sl_dist:
             sl = entry_price - min_sl_dist if side == "BUY" else entry_price + min_sl_dist
-        tp1 = entry_price * (1 + 0.005) if side == "BUY" else entry_price * (1 - 0.005)
-        tp2 = entry_price * (1 + 0.01) if side == "BUY" else entry_price * (1 - 0.01)
+        # Reversal/range trades use the adaptive 0.25/0.50/1.00% range
+        # target selector in TradeManagementBoard. The canonical two-stage
+        # fallback levels remain 1% / 3% price movement.
+        tp1, tp2 = trend_target_prices(side, entry_price)
     elif classification == "EARLY_TREND":
         ema50 = ema(df['close'], 50).iloc[-1]
         sl = ema50 - atr * 1.2 if side == "BUY" else ema50 + atr * 1.2
-        tp1 = entry_price * (1 + 0.008) if side == "BUY" else entry_price * (1 - 0.008)
-        tp2 = entry_price * (1 + 0.02) if side == "BUY" else entry_price * (1 - 0.02)
+        tp1, tp2 = trend_target_prices(side, entry_price)
     else:
         sl = entry_price - atr * 1.6 if side == "BUY" else entry_price + atr * 1.6
-        tp1 = entry_price * (1 + 0.008) if side == "BUY" else entry_price * (1 - 0.008)
-        tp2 = entry_price * (1 + 0.02) if side == "BUY" else entry_price * (1 - 0.02)
+        tp1, tp2 = trend_target_prices(side, entry_price)
 
-    # Adjust SL and the near target using the existing volatility floor.
-    sl, tp1 = PrecisionSafety.adjust_sl_tp(
+    # Preserve the existing SL volatility safety adjustment. Profit targets
+    # are fixed price-move percentages and must not be silently widened by ATR.
+    sl, _adjusted_tp1 = PrecisionSafety.adjust_sl_tp(
         pricing_symbol, entry_price, sl, tp1, side, atr
     )
     # The legacy adjustment only moved TP1; when ATR was wide it could push
