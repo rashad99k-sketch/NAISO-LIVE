@@ -153,6 +153,10 @@ def _env_float_range(name, default, minimum, maximum):
         print(f"[CONFIG] Invalid {name}; safe default {default} applied")
         return float(default)
 
+def _resolve_profit_brain_shadow_mode(paper_mode, requested_shadow, live_authority):
+    """Never let the Brain become a LIVE execution authority without a separate opt-in."""
+    return bool(requested_shadow or (not bool(paper_mode) and not bool(live_authority)))
+
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
 TRADE_MANAGEMENT_LOG = TradeManagementEventLog(max_items=200)
@@ -816,14 +820,13 @@ INSTITUTIONAL_WATCHLIST_BATCH_SIZE = _env_int_range("INSTITUTIONAL_WATCHLIST_BAT
 INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS = _env_int_range("INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20, 10, 300)
 INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS = _env_int_range("INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 120, 30, 150)
 
-# Unified Profit Management Brain. Per the final execution order, the Brain is
-# enabled by default and is the routine decision authority. The legacy Board
-# remains available only as an explicit fallback by setting the flag to false.
-# Shadow Mode remains available for diagnostics but is disabled by default.
-# Keep the new profit Brain observational until dedicated exchange PAPER validation.
-# Existing execution/management remains authoritative unless explicitly enabled.
-ENABLE_UNIFIED_PROFIT_BRAIN = _env_bool("ENABLE_UNIFIED_PROFIT_BRAIN", False)
-PROFIT_BRAIN_SHADOW_MODE = _env_bool("PROFIT_BRAIN_SHADOW_MODE", True)
+# Unified Profit Management Brain. Active authority is enabled by default in PAPER.
+# LIVE remains shadow-only unless a separate explicit live-authority opt-in is supplied.
+ENABLE_UNIFIED_PROFIT_BRAIN = _env_bool("ENABLE_UNIFIED_PROFIT_BRAIN", True)
+PROFIT_BRAIN_LIVE_AUTHORITY = _env_bool("PROFIT_BRAIN_LIVE_AUTHORITY", False)
+_PROFIT_BRAIN_SHADOW_REQUESTED = _env_bool("PROFIT_BRAIN_SHADOW_MODE", not PAPER_MODE)
+PROFIT_BRAIN_SHADOW_MODE = _resolve_profit_brain_shadow_mode(
+    PAPER_MODE, _PROFIT_BRAIN_SHADOW_REQUESTED, PROFIT_BRAIN_LIVE_AUTHORITY)
 PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES = _env_int_range(
     "PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES", 2, 1, 5)
 
