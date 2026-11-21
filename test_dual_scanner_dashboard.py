@@ -187,3 +187,26 @@ def test_effective_watchlist_cleanup_uses_copy_snapshot():
     )
     source = ast.get_source_segment(SOURCE, fn)
     assert "wl.copy().items()" in source
+
+
+def test_fast_ema9_vwap_discovery_is_rotating_closed_candle_and_ranking_only():
+    tree = ast.parse(SOURCE)
+    functions = {node.name: node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert "run_fast_ema9_vwap_discovery" in functions
+    scanner = ast.get_source_segment(SOURCE, functions["run_fast_ema9_vwap_discovery"])
+    assert "_EMA9_VWAP_CURSOR" in scanner
+    assert "_get_scanner_frame" in scanner
+    assert "_roro_ema9_vwap_proximity" in scanner
+    assert "closed_candle_timestamp" in scanner
+    assert "ema9_vwap_global_discovery" in scanner
+    assert "UNIFIED_ENTRY_AUTHORITY_ONLY" in scanner
+    assert "execute_entry(" not in scanner
+    assert "create_order(" not in scanner
+
+
+def test_fast_ema9_vwap_discovery_is_scheduled_independently_of_slow_global_scan():
+    tree = ast.parse(SOURCE)
+    main_loop = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "main_loop_sniper")
+    body = ast.get_source_segment(SOURCE, main_loop)
+    assert "EMA9_VWAP_DISCOVERY_INTERVAL" in body
+    assert 'dispatch_scanner_task("ema9_vwap_discovery", run_fast_ema9_vwap_discovery)' in body
