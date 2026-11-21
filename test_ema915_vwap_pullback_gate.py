@@ -145,7 +145,9 @@ def test_stale_closed_candles_cannot_authorize_entry(monkeypatch):
 def test_all_execution_paths_use_primary_gate_and_live_last_mile_revalidates():
     from pathlib import Path
     source = Path("ggpbot.py").read_text(encoding="utf-8")
-    execute = source[source.index("def execute_entry("):]
+    execute_start = source.index("def execute_entry(")
+    execute_end = source.find("\\ndef ", execute_start + 1)
+    execute = source[execute_start:execute_end]
     assert "_validate_ema915_vwap_pullback_entry_gate(" in execute
     assert "_validate_dual_ema_vwap_entry_gate(" not in execute
     open_position = source[source.index("def open_position("):]
