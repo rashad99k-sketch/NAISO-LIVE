@@ -97,7 +97,7 @@ def test_vwap_direction_must_agree_with_ema_cross(monkeypatch):
 
 def test_pullback_is_mandatory_after_cross(monkeypatch):
     frame = _frame("BUY")
-    frame.loc[len(frame) - 2, ["high", "low", "close"]] = [100.60, 100.45, 100.50]
+    frame.loc[len(frame) - 2, ["open", "high", "low", "close"]] = [100.50, 100.60, 100.45, 100.50]
     frame.loc[len(frame) - 1, ["open", "high", "low", "close"]] = [100.50, 100.80, 100.45, 100.70]
     result = _run(monkeypatch, "BUY", frame=frame)
     assert result["ready"] is False
