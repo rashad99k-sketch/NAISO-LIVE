@@ -222,6 +222,17 @@ def validate_dual_ema_vwap_entry_gate(
             cross_idx, cross_direction = idx, crossed
             break
 
+    stale_cross = False
+    cross_age_seconds = None
+    if cross_idx is not None:
+        cross_closed_at_ms = int(closed["timestamp"].iloc[cross_idx]) + timeframe_seconds * 1000
+        cross_age_seconds = (now_value_ms - cross_closed_at_ms) / 1000.0
+        result["cross_age_seconds"] = cross_age_seconds
+        if cross_age_seconds < 0.0 or cross_age_seconds > max_data_age_seconds:
+            cross_idx = None
+            cross_direction = None
+            stale_cross = True
+
     e9 = float(ema9.iloc[-1])
     vw = float(vwap.iloc[-1])
     e50 = float(ema50.iloc[-1]) if ema50 is not None else None
@@ -330,7 +341,10 @@ def validate_dual_ema_vwap_entry_gate(
         },
     })
     if cross_idx is None or cross_direction != expected:
-        result["reason"] = "missing_fresh_directional_ema9_vwap_cross"
+        result["reason"] = (
+            "stale_ema9_vwap_cross" if stale_cross
+            else "missing_fresh_directional_ema9_vwap_cross"
+        )
         return result
     result.update({
         "ready": True,
