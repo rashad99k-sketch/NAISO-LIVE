@@ -113,3 +113,23 @@ def test_missing_fresh_ema9_cross_is_rejected_even_if_ema50_is_above_vwap():
     )
     assert result["ready"] is False
     assert result["reason"] == "missing_fresh_directional_ema9_vwap_cross"
+
+def test_cross_candle_age_is_checked_separately_from_latest_data_age():
+    frame, now_ms = _frame()
+
+    def older_cross(values, period):
+        out = pd.Series(99.8 if period == 9 else 100.2, index=values.index, dtype=float)
+        if period == 9:
+            out.iloc[-2:] = 100.2
+        return out
+
+    # The latest closed candle is only 20 minutes old (within the 30-minute
+    # data freshness limit), but the cross candle itself is 35 minutes old.
+    result = validate_dual_ema_vwap_entry_gate(
+        frame, "BUY", older_cross, timeframe_seconds=900,
+        now_ms=now_ms + 20 * 60_000,
+    )
+    assert result["ready"] is False
+    assert result["reason"] == "stale_ema9_vwap_cross"
+    assert result["data_age_seconds"] <= result["max_data_age_seconds"]
+    assert result["cross_age_seconds"] > result["max_data_age_seconds"]
