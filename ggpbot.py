@@ -820,8 +820,10 @@ INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS = _env_int_range("INSTITUTIONAL_WATCHLIST_MA
 # enabled by default and is the routine decision authority. The legacy Board
 # remains available only as an explicit fallback by setting the flag to false.
 # Shadow Mode remains available for diagnostics but is disabled by default.
-ENABLE_UNIFIED_PROFIT_BRAIN = _env_bool("ENABLE_UNIFIED_PROFIT_BRAIN", True)
-PROFIT_BRAIN_SHADOW_MODE = _env_bool("PROFIT_BRAIN_SHADOW_MODE", False)
+# Keep the new profit Brain observational until dedicated exchange PAPER validation.
+# Existing execution/management remains authoritative unless explicitly enabled.
+ENABLE_UNIFIED_PROFIT_BRAIN = _env_bool("ENABLE_UNIFIED_PROFIT_BRAIN", False)
+PROFIT_BRAIN_SHADOW_MODE = _env_bool("PROFIT_BRAIN_SHADOW_MODE", True)
 PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES = _env_int_range(
     "PROFIT_BRAIN_MODE_HYSTERESIS_CANDLES", 2, 1, 5)
 
@@ -9511,7 +9513,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="section smart-layer"><div class="title">🌐 SCANNER 1 — PROFESSIONAL GLOBAL DISCOVERY (RF + SMART SCANNER V2)</div>
 <div id="discovery-scanner-panel" class="card" style="font-size:12px;">Waiting for initial market scan...</div>
 </div>
-<div class="section smart-layer"><div class="title">🧭 EMA9 + EMA50 / SESSION VWAP (CLOSED CANDLES · ENTRY GATE)</div>
+<div class="section smart-layer"><div class="title">🧭 EMA9 + EMA15 / SESSION VWAP — CROSS → PULLBACK → REJECTION → BREAK</div>
 <div id="proximity-scanner-panel" class="card" style="font-size:12px;max-height:320px;overflow-y:auto;">Waiting for first rotating batch...</div>
 </div>
 {supervisor_panel_html}
@@ -9698,7 +9700,20 @@ function updateUI(d) {{
         let pHtml = "";
         d.ema9_vwap_proximity_scanner.forEach(item => {{
             let icon = item.cross ? "⚡" : (item.state === "NEAR_CROSS" || item.state === "CONVERGING" ? "🟡" : item.direction === "BUY" ? "📈" : item.direction === "SELL" ? "📉" : "⚪");
-            pHtml += `<div style="padding:6px;border-bottom:1px solid #26364a;">${{icon}} <b>${{item.symbol}}</b> | ${{item.direction || "UNKNOWN"}} | ${{item.state || "UNKNOWN"}} | Score: ${{item.score ?? "-"}} | Gap ATR: ${{item.gap_atr ?? "-"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}} | Cross: ${{item.cross_trigger || "NONE"}} <small>· Closed candle · Ranking only</small></div>`;
+            let st = item.ema915_vwap_strategy || {};
+            let stage = st.stage || "WAITING_FOR_SCAN";
+            let stageColor = stage === "ENTRY_READY" ? "#2ecc71" :
+                (stage === "ENTRY_WINDOW_MISSED" || stage === "CHOP_FILTER" || stage === "STALE_DATA" ? "#e74c3c" :
+                (stage === "NO_FRESH_CROSS" ? "#95a5a6" : "#f1c40f"));
+            let active = st.active_side || "NONE";
+            let sideCheck = st[active.toLowerCase()] || {};
+            pHtml += `<div style="padding:8px;border-bottom:1px solid #26364a;">
+              ${{icon}} <b>${{item.symbol}}</b> | <span style="color:${{stageColor}};font-weight:bold;">${{stage}}</span> | Side: ${{active}}
+              <br><small>EMA9/VWAP context: ${{item.state || "UNKNOWN"}} · ${{item.cross_trigger || "No EMA9/VWAP cross"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}}</small>
+              <br><small>EMA9/EMA15/VWAP: ${{st.trigger || "NOT_EVALUATED"}} | Cross: ${{sideCheck.cross_direction || "-"}} | Cross age: ${{sideCheck.cross_age_bars ?? "-"}} bars | EMA9: ${{sideCheck.ema9 ?? "-"}} | EMA15: ${{sideCheck.ema15 ?? "-"}} | VWAP: ${{sideCheck.vwap ?? "-"}}</small>
+              <br><small>Pullback: ${{sideCheck.pullback_touch ? "CONFIRMED" : "WAITING"}} | Rejection: ${{sideCheck.rejection_confirmed ? "CONFIRMED" : "WAITING"}} | Continuation break: ${{sideCheck.continuation_break ? "CONFIRMED" : "WAITING"}} | No-chase: ${{stage === "ENTRY_WINDOW_MISSED" ? "BLOCKED" : "OK"}}</small>
+              <br><small>Reason: ${{st.reason || "Waiting for closed-candle setup"}} · Closed candles · Watchlist only; final live entry revalidation required</small>
+            </div>`;
         }});
         let pm = d.ema9_vwap_proximity_scanner_meta || {{}};
         document.getElementById("proximity-scanner-panel").innerHTML = (pHtml || "No proximity candidates") + `<small>Batch: ${{pm.observed_this_batch ?? 0}} | Pool: ${{pm.symbols ?? 0}} | Updated: ${{pm.updated_at ? new Date(pm.updated_at*1000).toLocaleTimeString() : "-"}} | Role: ${{pm.role || "RANKING_ONLY"}}</small>`;
@@ -11319,9 +11334,67 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                         if _proximity_cross_event else None
                     )
                     _proximity_cross_max_age = 2.0 * _proximity_frame_seconds
+                    # Evaluate the actual EMA9/EMA15 + session VWAP entry sequence
+                    # for both directions. Watchlist-only: execute_entry remains the
+                    # sole order authorization path and revalidates the live ticker.
+                    _ema915_checks = {}
+                    _watch_price = float(closed["close"].iloc[-1])
+                    for _watch_side in ("BUY", "SELL"):
+                        try:
+                            _check = _validate_ema915_vwap_pullback_entry_gate(
+                                closed, _watch_side, ema,
+                                timeframe_seconds=int(_proximity_frame_seconds),
+                                now_ms=now_ms, cross_lookback_candles=8,
+                                pullback_lookback_candles=5, current_price=_watch_price,
+                            )
+                        except Exception as _check_exc:
+                            _check = {"ready": False, "side": _watch_side,
+                                      "reason": f"gate_error:{type(_check_exc).__name__}"}
+                        _reason = str(_check.get("reason") or "unknown")
+                        _stage_map = {
+                            "ema915_cross_vwap_pullback_rejection_continuation_confirmed": "ENTRY_READY",
+                            "waiting_for_post_cross_pullback": "WAITING_FOR_PULLBACK",
+                            "waiting_for_ema_band_pullback": "WAITING_FOR_PULLBACK",
+                            "waiting_for_directional_rejection": "WAITING_FOR_REJECTION",
+                            "waiting_for_continuation_break": "WAITING_FOR_CONTINUATION_BREAK",
+                            "entry_window_missed_no_chase": "ENTRY_WINDOW_MISSED",
+                            "pullback_window_expired": "CROSS_EXPIRED",
+                            "missing_fresh_ema9_ema15_cross": "NO_FRESH_CROSS",
+                            "ema9_ema15_cross_direction_mismatch": "OPPOSITE_CROSS",
+                            "ema915_or_vwap_direction_not_aligned": "WAITING_FOR_ALIGNMENT",
+                            "excessive_ema915_whipsaw": "CHOP_FILTER",
+                            "excessive_vwap_whipsaw": "CHOP_FILTER",
+                            "stale_closed_candle_data": "STALE_DATA",
+                        }
+                        _check["stage"] = ("ENTRY_READY" if _check.get("ready") else _stage_map.get(_reason, "WAITING"))
+                        _ema915_checks[_watch_side] = _check
+                    _ready_sides = [s for s, v in _ema915_checks.items() if v.get("ready")]
+                    _active_side = _ready_sides[0] if _ready_sides else None
+                    if _active_side is None:
+                        for _side_name, _side_check in _ema915_checks.items():
+                            _cross = str(_side_check.get("cross_direction") or "").upper()
+                            if _cross == ("BULLISH" if _side_name == "BUY" else "BEARISH"):
+                                _active_side = _side_name
+                                break
+                    if _active_side is None:
+                        _active_side = "BUY" if proximity.get("cross_any") == "BULLISH" else "SELL" if proximity.get("cross_any") == "BEARISH" else None
+                    _active_check = _ema915_checks.get(_active_side, {}) if _active_side else {}
+                    _strategy_snapshot = {
+                        "trigger": "EMA9_EMA15_SESSION_VWAP",
+                        "active_side": _active_side or "NONE",
+                        "stage": _active_check.get("stage", "NO_FRESH_CROSS"),
+                        "reason": _active_check.get("reason", "no_directional_setup"),
+                        "entry_ready": bool(_active_check.get("ready")),
+                        "buy": _ema915_checks["BUY"],
+                        "sell": _ema915_checks["SELL"],
+                        "observed_price": _watch_price,
+                        "timeframe_seconds": int(_proximity_frame_seconds),
+                        "observed_at": _observed_at,
+                    }
                     proximity_item = {
                         "symbol": symbol_key, "exchange_symbol": roro_exchange_symbol(symbol_for_proximity),
                         **proximity,
+                        "ema915_vwap_strategy": _strategy_snapshot,
                         "updated_at": _observed_at,
                         "observation_age_seconds": 0.0,
                         "timeframe_seconds": _proximity_frame_seconds,

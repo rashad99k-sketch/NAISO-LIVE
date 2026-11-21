@@ -605,7 +605,7 @@ def test_board_brain_decision_exposes_vwap_ema_context(monkeypatch):
     assert decision.vwap_ema_context["ema9"] == pytest.approx(100.1)
 
 
-def test_production_defaults_enable_brain_without_shadow(tmp_path):
+def test_production_defaults_keep_brain_in_safe_shadow_mode(tmp_path):
     env = os.environ.copy()
     env.update({
         "PAPER_MODE": "true",
@@ -627,8 +627,8 @@ def test_production_defaults_enable_brain_without_shadow(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload["brain"] is True
-    assert payload["shadow"] is False
+    assert payload["brain"] is False
+    assert payload["shadow"] is True
 
 
 def test_isolated_normal_pullback_and_liquidity_sweep_are_not_defensive(monkeypatch):
