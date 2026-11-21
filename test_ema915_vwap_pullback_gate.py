@@ -22,7 +22,7 @@ def _frame(side="BUY", count=80):
         frame.loc[count - 2, ["open", "high", "low", "close"]] = [100.15, 100.30, 99.95, 100.10]
         frame.loc[count - 1, ["open", "high", "low", "close"]] = [100.15, 100.60, 100.05, 100.50]
     else:
-        frame.loc[count - 2, ["open", "high", "low", "close"]] = [99.85, 100.25, 99.70, 100.05]
+        frame.loc[count - 2, ["open", "high", "low", "close"]] = [99.85, 100.20, 99.70, 100.05]
         frame.loc[count - 1, ["open", "high", "low", "close"]] = [99.85, 100.00, 99.40, 99.50]
     return frame
 
@@ -97,7 +97,7 @@ def test_vwap_direction_must_agree_with_ema_cross(monkeypatch):
 
 def test_pullback_is_mandatory_after_cross(monkeypatch):
     frame = _frame("BUY")
-    frame.loc[len(frame) - 2, ["low", "close"]] = [100.45, 100.50]
+    frame.loc[len(frame) - 2, ["high", "low", "close"]] = [100.60, 100.45, 100.50]
     frame.loc[len(frame) - 1, ["open", "high", "low", "close"]] = [100.50, 100.80, 100.45, 100.70]
     result = _run(monkeypatch, "BUY", frame=frame)
     assert result["ready"] is False
