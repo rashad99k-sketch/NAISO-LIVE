@@ -6209,6 +6209,30 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             debounce_sec=5,
         )
         return False
+    # Consume the current signal identity only after this call has computed it,
+    # and before sizing/order submission. Fail closed if durable state is unreadable.
+    entry_event_id = str(gate_result.get("signal_candle_id") or "").strip()
+    entry_event_journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not entry_event_id and not PAPER_MODE and MODE_LIVE:
+        log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: missing signal candle identity for {symbol}", "ERROR")
+        return False
+    if entry_event_id and entry_event_journal is None and not PAPER_MODE and MODE_LIVE:
+        log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: durable journal unavailable for {entry_event_id}", "ERROR")
+        return False
+    if entry_event_id and entry_event_journal is not None:
+        try:
+            if entry_event_journal.is_event_consumed(entry_event_id):
+                log_execution(
+                    f"[ENTRY_EVENT_GUARD] BLOCKED duplicate closed-candle signal {entry_event_id}",
+                    "WARN", debounce_key=f"entry_event_consumed:{entry_event_id}", debounce_sec=30,
+                )
+                return False
+        except Exception as event_exc:
+            log_execution(
+                f"[ENTRY_EVENT_GUARD] BLOCKED: cannot verify durable event state "
+                f"for {entry_event_id}: {type(event_exc).__name__}: {event_exc}", "ERROR",
+            )
+            return False
     log_execution(
         f"[VWAP_ENTRY_GATE] PASSED {symbol} {side} "
         f"EMA9_cross_ts={gate_result.get('ema9_cross_timestamp')} "
@@ -12674,39 +12698,17 @@ def sync_all_states():
 
 
 # Serialize final entry authorization so one closed-candle trigger cannot
-# submit two orders from concurrent scanner paths. Durable consumption occurs
-# only after the existing execution path verifies the fill and opens STATE.
+# submit two orders from concurrent scanner paths. The current signal is checked
+# inside the original entry function after gate calculation and before any order.
 _ENTRY_EVENT_EXECUTION_LOCK = threading.RLock()
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
     with _ENTRY_EVENT_EXECUTION_LOCK:
+        globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
+        result = _original_execute_entry_for_journal(*args, **kwargs)
         gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
         event_id = str(gate.get("signal_candle_id") or "").strip()
         journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
-        if event_id:
-            if journal is None:
-                if not PAPER_MODE and MODE_LIVE:
-                    log_execution(
-                        f"[ENTRY_EVENT_GUARD] BLOCKED live entry: durable journal unavailable for {event_id}",
-                        "ERROR",
-                    )
-                    return False
-            else:
-                try:
-                    if journal.is_event_consumed(event_id):
-                        log_execution(
-                            f"[ENTRY_EVENT_GUARD] BLOCKED duplicate closed-candle signal {event_id}",
-                            "WARN", debounce_key=f"entry_event_consumed:{event_id}", debounce_sec=30,
-                        )
-                        return False
-                except Exception as exc:
-                    log_execution(
-                        f"[ENTRY_EVENT_GUARD] BLOCKED: cannot verify durable event state "
-                        f"for {event_id}: {type(exc).__name__}: {exc}", "ERROR",
-                    )
-                    return False
-
-        result = _original_execute_entry_for_journal(*args, **kwargs)
         if result and STATE.get("open"):
             ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
             _persist_trade_journal_start(ctx.get("setup_type"))
