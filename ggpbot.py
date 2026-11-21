@@ -6179,7 +6179,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     trade_id = uuid.uuid4().hex
     institutional_entry_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
     # Final execution-boundary gate: no institutional, sniper, RF or legacy
-    # setup can bypass the dual EMA9/EMA50-to-session-VWAP closed-candle cross.
+    # setup can bypass the mandatory EMA9-to-session-VWAP closed-candle cross.
     gate_frame = institutional_entry_ctx.get("closed_candle_frame")
     gate_frame_source = institutional_entry_ctx.get("closed_candle_source") or "ENTRY_CONTEXT"
     gate_tf = str(institutional_entry_ctx.get("candle_timeframe") or INTERVAL)
@@ -6196,7 +6196,16 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         gate_result["frame_source"] = gate_frame_source
     except Exception as gate_exc:
         gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
+    raw_signal_id = str(gate_result.get("signal_candle_id") or "").strip()
+    if raw_signal_id:
+        try:
+            event_symbol = normalize_symbol(symbol)
+        except Exception:
+            event_symbol = str(symbol or "").strip().upper()
+        gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"
     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
+    # Preserve the exact gate snapshot for the serialized final execution wrapper.
+    globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
     if not gate_result.get("ready"):
         log_execution(
             f"[VWAP_ENTRY_GATE] BLOCKED {symbol} {side} reason={gate_result.get('reason')} "
@@ -6207,6 +6216,30 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             debounce_sec=5,
         )
         return False
+    # Consume the current signal identity only after this call has computed it,
+    # and before sizing/order submission. Fail closed if durable state is unreadable.
+    entry_event_id = str(gate_result.get("durable_event_id") or "").strip()
+    entry_event_journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not entry_event_id and not PAPER_MODE and MODE_LIVE:
+        log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: missing signal candle identity for {symbol}", "ERROR")
+        return False
+    if entry_event_id and entry_event_journal is None and not PAPER_MODE and MODE_LIVE:
+        log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: durable journal unavailable for {entry_event_id}", "ERROR")
+        return False
+    if entry_event_id and entry_event_journal is not None:
+        try:
+            if entry_event_journal.is_event_consumed(entry_event_id):
+                log_execution(
+                    f"[ENTRY_EVENT_GUARD] BLOCKED duplicate closed-candle signal {entry_event_id}",
+                    "WARN", debounce_key=f"entry_event_consumed:{entry_event_id}", debounce_sec=30,
+                )
+                return False
+        except Exception as event_exc:
+            log_execution(
+                f"[ENTRY_EVENT_GUARD] BLOCKED: cannot verify durable event state "
+                f"for {entry_event_id}: {type(event_exc).__name__}: {event_exc}", "ERROR",
+            )
+            return False
     log_execution(
         f"[VWAP_ENTRY_GATE] PASSED {symbol} {side} "
         f"EMA9_cross_ts={gate_result.get('ema9_cross_timestamp')} "
@@ -12671,14 +12704,41 @@ def sync_all_states():
         pass
 
 
-# Journal start/snapshot is tied to the existing GGP trade lifecycle, not a second manager.
+# Serialize final entry authorization so one closed-candle trigger cannot
+# submit two orders from concurrent scanner paths. The current signal is checked
+# inside the original entry function after gate calculation and before any order.
+_ENTRY_EVENT_EXECUTION_LOCK = threading.RLock()
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
-    result = _original_execute_entry_for_journal(*args, **kwargs)
-    if result and STATE.get("open"):
-        ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-        _persist_trade_journal_start(ctx.get("setup_type"))
-    return result
+    with _ENTRY_EVENT_EXECUTION_LOCK:
+        globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
+        result = _original_execute_entry_for_journal(*args, **kwargs)
+        gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
+        event_id = str(gate.get("durable_event_id") or "").strip()
+        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        if result and STATE.get("open"):
+            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+            _persist_trade_journal_start(ctx.get("setup_type"))
+            if event_id and journal is not None:
+                trade_id = str(STATE.get("trade_id") or "")
+                try:
+                    if not trade_id or not journal.consume_event(event_id, trade_id):
+                        STATE["entry_event_persistence_failed"] = True
+                        globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                        log_execution(
+                            f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                            f"but could not durably consume signal {event_id}; new entries blocked",
+                            "ERROR",
+                        )
+                except Exception as exc:
+                    STATE["entry_event_persistence_failed"] = True
+                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                    log_execution(
+                        f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
+                        f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
+                        "ERROR",
+                    )
+        return result
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):
