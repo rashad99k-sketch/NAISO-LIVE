@@ -761,7 +761,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 result["discovery_score"] = candidate.get("score", 0)
                 result["side_hints"] = list(candidate.get("sides", []))
             proximity_event = candidate.get("ema9_vwap_proximity") if isinstance(candidate.get("ema9_vwap_proximity"), dict) else {}
-            cross_dir = str(proximity_event.get("cross_ema9") or "").upper()
+            cross_dir = str(proximity_event.get("signal") or "").upper() if bool(proximity_event.get("cross_ema9")) else ""
             cross_ts = int(proximity_event.get("candle_timestamp") or candidate.get("closed_candle_timestamp") or 0)
             cross_tf = max(1, int(proximity_event.get("timeframe_seconds") or 900))
             cross_age = max(0.0, time.time() - (cross_ts / 1000.0 + cross_tf)) if cross_ts > 0 else float("inf")
