@@ -11,7 +11,12 @@ from math import isfinite
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
+# Price-move percentages (not leveraged ROE percentages).
+# At 20x these correspond approximately to 5%, 10%, 20% and 60% ROE,
+# before fees, funding and slippage.
 RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
+TREND_TP1_MOVE_PCT = 1.00
+TREND_TP2_MOVE_PCT = 3.00
 RANGE_MODE = "RANGE_SCALP"
 TREND_MODE = "TREND_RIDE"
 STANDARD_MODE = "TWO_STAGE_50_50"
@@ -226,6 +231,22 @@ def range_target_price(side: str, entry_price: float, target_move_pct: float) ->
     factor = move / 100.0
     target = entry * (1.0 + factor) if side == "BUY" else entry * (1.0 - factor)
     return round(target, 12)
+
+
+def trend_target_prices(side: str, entry_price: float) -> Tuple[float, float]:
+    """Return the fixed two-stage trend targets: TP1 +1%, TP2 +3% price move.
+
+    These are price movement percentages, not leveraged ROE. The execution
+    layer remains responsible for quantity, reduce-only orders and fill checks.
+    """
+    direction = str(side or "").upper()
+    entry = _number(entry_price, 0.0) or 0.0
+    if direction not in {"BUY", "SELL"} or entry <= 0:
+        return 0.0, 0.0
+    sign = 1.0 if direction == "BUY" else -1.0
+    tp1 = entry * (1.0 + sign * TREND_TP1_MOVE_PCT / 100.0)
+    tp2 = entry * (1.0 + sign * TREND_TP2_MOVE_PCT / 100.0)
+    return round(tp1, 12), round(tp2, 12)
 
 
 def target_reached(side: str, current_price: float, target_price: float) -> bool:
