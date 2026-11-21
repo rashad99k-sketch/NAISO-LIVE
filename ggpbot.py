@@ -8433,16 +8433,80 @@ def scaling_logic(symbol, df, ind):
             market = ex.market(sym_norm)
             precision = market['precision']['amount']
             qty = math.floor(additional_qty / precision) * precision
-        except:
+        except Exception:
             qty = additional_qty
-        if qty > 0:
-            order = open_position(STATE["side"], qty, symbol, stop_loss=STATE.get("synthetic_sl", STATE.get("sl")))
-            if order:
-                STATE["qty"] += qty
-                STATE["remaining_qty"] += qty
-                STATE["scale_ins"] = STATE.get("scale_ins", 0) + 1
-                log_execution(f"Scaled in {qty:.6f} at {df['close'].iloc[-1]:.4f}", "SUCCESS")
-                return True
+        if qty <= 0:
+            return False
+
+        # Scale-ins are additional exposure, not a bypass around the primary
+        # strategy. They require a NEW closed-candle EMA9/EMA15 + VWAP +
+        # pullback/rejection/continuation event and the same live last-mile gate.
+        scale_frame = _integration_fetch_frame(sym_norm)
+        scale_price = safe_float(df['close'].iloc[-1], 0.0)
+        scale_gate = _validate_ema915_vwap_pullback_entry_gate(
+            scale_frame, STATE["side"], ema,
+            timeframe_seconds=_roro_timeframe_seconds(INTERVAL),
+            now_ms=int(time.time() * 1000), cross_lookback_candles=8,
+            pullback_lookback_candles=5, current_price=scale_price,
+        )
+        if not scale_gate.get("ready"):
+            log_execution(
+                f"[EMA915_SCALE_IN_BLOCK] {sym_norm} {STATE['side']} "
+                f"reason={scale_gate.get('reason')}; no additional exposure",
+                "WARN", debounce_key=f"ema915_scale_block:{sym_norm}:{scale_gate.get('reason')}",
+                debounce_sec=15,
+            )
+            return False
+        event_id = f"{sym_norm}:{INTERVAL}:{scale_gate.get('signal_candle_id')}"
+        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        if journal is None:
+            log_execution(f"[EMA915_SCALE_IN_BLOCK] {sym_norm}: durable event journal unavailable", "ERROR")
+            return False
+        try:
+            if journal.is_event_consumed(event_id):
+                log_execution(f"[EMA915_SCALE_IN_BLOCK] {sym_norm}: signal event already consumed", "WARN")
+                return False
+        except Exception as exc:
+            log_execution(f"[EMA915_SCALE_IN_BLOCK] {sym_norm}: event state unreadable: {exc}", "ERROR")
+            return False
+
+        scale_trade_id = f"{STATE.get('trade_id') or 'trade'}-scale-{uuid.uuid4().hex}"
+        scale_management = {
+            "trade_id": scale_trade_id, "current_symbol": symbol, "side": STATE["side"],
+            "synthetic_sl": STATE.get("synthetic_sl", STATE.get("sl")),
+            "sl": STATE.get("synthetic_sl", STATE.get("sl")),
+            "native_sl_original_price": STATE.get("native_sl_original_price", STATE.get("sl")),
+            "tp1_price": STATE.get("tp1_price"), "tp2_price": STATE.get("tp2_price"),
+            "entry_gate_snapshot": dict(scale_gate), "entry_gate_timeframe": INTERVAL,
+        }
+        order = open_position(
+            STATE["side"], qty, symbol,
+            stop_loss=STATE.get("synthetic_sl", STATE.get("sl")),
+            trade_id=scale_trade_id, management_state=scale_management,
+        )
+        if order:
+            try:
+                if not journal.consume_event(event_id, scale_trade_id):
+                    STATE.update({"recovery_hold": True, "execution_unresolved": True})
+                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                    log_execution(
+                        f"[EMA915_SCALE_IN_RECOVERY_HOLD] {sym_norm}: fill accepted but event persistence conflicted",
+                        "ERROR",
+                    )
+                    return False
+            except Exception as exc:
+                STATE.update({"recovery_hold": True, "execution_unresolved": True})
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                log_execution(
+                    f"[EMA915_SCALE_IN_RECOVERY_HOLD] {sym_norm}: fill accepted but event persistence failed: {exc}",
+                    "ERROR",
+                )
+                return False
+            STATE["qty"] += qty
+            STATE["remaining_qty"] += qty
+            STATE["scale_ins"] = STATE.get("scale_ins", 0) + 1
+            log_execution(f"Scaled in {qty:.6f} at {df['close'].iloc[-1]:.4f}", "SUCCESS")
+            return True
     return False
 
 def council_exit(df, price):
