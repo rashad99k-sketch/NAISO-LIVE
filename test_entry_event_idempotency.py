@@ -41,7 +41,7 @@ def test_entry_checks_current_event_before_order_and_persists_after_verified_fil
                       and node.func.id == "calculate_position_size")
     submit_line = min(node.lineno for node in ast.walk(core_entry)
                       if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                      and node.func.attr == "submit_market_entry")
+                      and node.func.id == "open_position")
     assert guard_line < sizing_line < submit_line
 
     wrapper_calls = [node.func.attr if isinstance(node.func, ast.Attribute)
