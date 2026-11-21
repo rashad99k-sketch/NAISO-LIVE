@@ -6232,6 +6232,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             event_symbol = str(symbol or "").strip().upper()
         gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"
     institutional_entry_ctx["ema915_vwap_pullback_gate"] = dict(gate_result)
+    institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)  # compatibility snapshot for existing diagnostics
     # Preserve the exact gate snapshot for the serialized final execution wrapper.
     globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
     if not gate_result.get("ready"):
