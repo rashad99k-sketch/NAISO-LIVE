@@ -146,18 +146,24 @@ def validate_dual_ema_vwap_entry_gate(
     timeframe_seconds: int = 900, now_ms: Optional[int] = None,
     lookback_candles: int = 2,
 ) -> Dict[str, Any]:
-    """Fail-closed gate: EMA9/VWAP and EMA50/VWAP must both cross freshly
-    in the requested direction on closed candles, with directional EMA stacking.
-    The two crosses may occur on either of the last two closed candles.
+    """Authorize only a fresh closed-candle EMA9/VWAP cross.
+
+    EMA50 is deliberately a soft directional diagnostic. Its absence, lack of
+    a fresh cross, or non-alignment never vetoes a valid EMA9/VWAP trigger.
+    This function does not place orders and does not invent calibrated quality
+    weights; it returns observable features for the downstream authority.
     """
     direction = str(side or "").upper()
     lookback = max(1, min(3, int(lookback_candles)))
+    expected = "BULLISH" if direction == "BUY" else "BEARISH"
     result: Dict[str, Any] = {
         "ready": False, "side": direction, "reason": "invalid_side",
-        "ema9_cross": None, "ema50_cross": None,
+        "trigger": "EMA9_VWAP", "ema9_cross": None, "ema50_cross": None,
         "ema9_cross_timestamp": None, "ema50_cross_timestamp": None,
         "ema9": None, "ema50": None, "vwap": None,
-        "lookback_candles": lookback,
+        "ema50_alignment": "UNAVAILABLE", "ema50_distance_atr": None,
+        "ema50_slope_atr": None, "cross_quality": "UNRATED_PENDING_CALIBRATION",
+        "quality_features": {}, "lookback_candles": lookback,
     }
     if direction not in {"BUY", "SELL"}:
         return result
@@ -165,8 +171,8 @@ def validate_dual_ema_vwap_entry_gate(
         result["reason"] = "invalid_ohlcv"
         return result
     closed = closed_candles(df, timeframe_seconds, now_ms=now_ms)
-    if len(closed) < 55:
-        result["reason"] = "insufficient_closed_candles_for_ema50"
+    if len(closed) < 15:
+        result["reason"] = "insufficient_closed_candles_for_ema9_and_atr"
         return result
     vwap = compute_session_vwap(closed, timeframe_seconds, now_ms=now_ms)
     if vwap is None:
@@ -174,48 +180,150 @@ def validate_dual_ema_vwap_entry_gate(
         return result
     try:
         close = closed["close"].astype(float)
-        ema9, ema50 = ema_fn(close, 9), ema_fn(close, 50)
-        if len(ema9) != len(closed) or len(ema50) != len(closed):
-            raise ValueError("EMA length mismatch")
-        if not all(np.isfinite(float(s.iloc[-1])) for s in (ema9, ema50, vwap)):
-            raise ValueError("non-finite latest indicator")
+        ema9 = pd.Series(ema_fn(close, 9), index=closed.index, dtype=float)
+        if len(ema9) != len(closed):
+            raise ValueError("EMA9 length mismatch")
+        if not np.isfinite(float(ema9.iloc[-1])) or not np.isfinite(float(vwap.iloc[-1])):
+            raise ValueError("non-finite EMA9/VWAP")
+        ema50 = None
+        if len(closed) >= 50:
+            candidate = pd.Series(ema_fn(close, 50), index=closed.index, dtype=float)
+            if len(candidate) == len(closed) and np.isfinite(float(candidate.iloc[-1])):
+                ema50 = candidate
     except Exception as exc:
         result["reason"] = f"indicator_calculation_failed:{type(exc).__name__}"
         return result
 
-    expected = "BULLISH" if direction == "BUY" else "BEARISH"
-    first_idx = max(1, len(closed) - lookback)
-    found: Dict[str, Tuple[str, int]] = {}
-    for name, series in (("ema9", ema9), ("ema50", ema50)):
-        for idx in range(len(closed) - 1, first_idx - 1, -1):
-            prev_gap = float(series.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
-            gap = float(series.iloc[idx]) - float(vwap.iloc[idx])
-            crossed = ("BULLISH" if prev_gap <= 0.0 < gap else
-                       "BEARISH" if prev_gap >= 0.0 > gap else None)
-            if crossed:
-                found[name] = (crossed, int(closed["timestamp"].iloc[idx]))
-                break
+    latest_gap = float(ema9.iloc[-1]) - float(vwap.iloc[-1])
+    if (direction == "BUY" and latest_gap <= 0.0) or (direction == "SELL" and latest_gap >= 0.0):
+        result["reason"] = "latest_closed_ema9_vwap_relationship_not_directional"
+        return result
 
-    e9, e50, vw = float(ema9.iloc[-1]), float(ema50.iloc[-1]), float(vwap.iloc[-1])
+    first_idx = max(1, len(closed) - lookback)
+    cross_idx = None
+    cross_direction = None
+    for idx in range(len(closed) - 1, first_idx - 1, -1):
+        prev_gap = float(ema9.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
+        gap = float(ema9.iloc[idx]) - float(vwap.iloc[idx])
+        crossed = ("BULLISH" if prev_gap < 0.0 < gap else
+                   "BEARISH" if prev_gap > 0.0 > gap else None)
+        if crossed is not None:
+            cross_idx, cross_direction = idx, crossed
+            break
+
+    e9 = float(ema9.iloc[-1])
+    vw = float(vwap.iloc[-1])
+    e50 = float(ema50.iloc[-1]) if ema50 is not None else None
+    atr_series = pd.concat([
+        (closed["high"] - closed["low"]).rename("hl"),
+        (closed["high"] - closed["close"].shift(1)).abs().rename("hc"),
+        (closed["low"] - closed["close"].shift(1)).abs().rename("lc"),
+    ], axis=1).max(axis=1)
+    atr = float(atr_series.rolling(14, min_periods=14).mean().iloc[-1])
+    if not np.isfinite(atr) or atr <= 0:
+        result["reason"] = "atr_unavailable_for_normalized_cross_context"
+        return result
+
+    ema50_cross = None
+    ema50_cross_ts = None
+    ema50_distance_atr = None
+    ema50_slope_atr = None
+    ema50_alignment = "UNAVAILABLE"
+    if ema50 is not None:
+        e50_gap = float(ema50.iloc[-1]) - float(vwap.iloc[-1])
+        for idx in range(len(closed) - 1, first_idx - 1, -1):
+            prev_gap = float(ema50.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
+            gap = float(ema50.iloc[idx]) - float(vwap.iloc[idx])
+            crossed = ("BULLISH" if prev_gap < 0.0 < gap else
+                       "BEARISH" if prev_gap > 0.0 > gap else None)
+            if crossed:
+                ema50_cross = crossed
+                ema50_cross_ts = int(closed["timestamp"].iloc[idx])
+                break
+        ema50_distance_atr = abs(float(close.iloc[-1]) - e50) / atr
+        if len(ema50) >= 4:
+            ema50_slope_atr = (e50 - float(ema50.iloc[-4])) / (3.0 * atr)
+        slope = ema50_slope_atr if ema50_slope_atr is not None else 0.0
+        price_above = float(close.iloc[-1]) > e50
+        if direction == "BUY":
+            if price_above and slope >= 0.0:
+                ema50_alignment = "SUPPORTIVE"
+            elif not price_above and slope < 0.0:
+                ema50_alignment = "OPPOSED"
+            else:
+                ema50_alignment = "NEUTRAL"
+        else:
+            if (not price_above) and slope <= 0.0:
+                ema50_alignment = "SUPPORTIVE"
+            elif price_above and slope > 0.0:
+                ema50_alignment = "OPPOSED"
+            else:
+                ema50_alignment = "NEUTRAL"
+
+    signal_idx = cross_idx if cross_idx is not None else len(closed) - 1
+    candle = closed.iloc[signal_idx]
+    candle_range = float(candle["high"] - candle["low"])
+    body = abs(float(candle["close"]) - float(candle["open"]))
+    body_ratio = body / candle_range if candle_range > 0 else 0.0
+    close_location = ((float(candle["close"]) - float(candle["low"])) / candle_range
+                      if candle_range > 0 else 0.5)
+    upper_wick = float(candle["high"]) - max(float(candle["open"]), float(candle["close"]))
+    lower_wick = min(float(candle["open"]), float(candle["close"])) - float(candle["low"])
+    rel_volume = None
+    if signal_idx >= 20:
+        baseline = float(closed["volume"].iloc[signal_idx - 20:signal_idx].mean())
+        if baseline > 0:
+            rel_volume = float(candle["volume"]) / baseline
+    prev_gap = float(ema9.iloc[signal_idx - 1]) - float(vwap.iloc[signal_idx - 1]) if signal_idx > 0 else 0.0
+    signal_gap = float(ema9.iloc[signal_idx]) - float(vwap.iloc[signal_idx])
+    gap_atr = abs(signal_gap) / atr
+    ema9_slope_atr = (e9 - float(ema9.iloc[-4])) / (3.0 * atr) if len(ema9) >= 4 else None
+    vwap_slope_atr = (vw - float(vwap.iloc[-4])) / (3.0 * atr) if len(vwap) >= 4 and np.isfinite(float(vwap.iloc[-4])) else None
+    whipsaw_count = 0
+    for idx in range(max(1, len(closed) - 8), len(closed)):
+        a = float(ema9.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
+        b = float(ema9.iloc[idx]) - float(vwap.iloc[idx])
+        if (a < 0 < b) or (a > 0 > b):
+            whipsaw_count += 1
+
     result.update({
         "ema9": e9, "ema50": e50, "vwap": vw,
-        "ema9_cross": found.get("ema9", (None, None))[0],
-        "ema50_cross": found.get("ema50", (None, None))[0],
-        "ema9_cross_timestamp": found.get("ema9", (None, None))[1],
-        "ema50_cross_timestamp": found.get("ema50", (None, None))[1],
+        "ema9_cross": cross_direction,
+        "ema50_cross": ema50_cross,
+        "ema9_cross_timestamp": int(closed["timestamp"].iloc[cross_idx]) if cross_idx is not None else None,
+        "ema50_cross_timestamp": ema50_cross_ts,
         "latest_closed_timestamp": int(closed["timestamp"].iloc[-1]),
+        "signal_candle_timestamp": int(closed["timestamp"].iloc[signal_idx]),
+        "ema50_alignment": ema50_alignment,
+        "ema50_distance_atr": ema50_distance_atr,
+        "ema50_slope_atr": ema50_slope_atr,
+        "ema9_vwap_gap_atr": gap_atr,
+        "quality_features": {
+            "signal_candle_direction": "BULLISH" if float(candle["close"]) > float(candle["open"]) else "BEARISH" if float(candle["close"]) < float(candle["open"]) else "DOJI",
+            "body_ratio": body_ratio,
+            "close_location": close_location,
+            "upper_wick_ratio": upper_wick / candle_range if candle_range > 0 else 0.0,
+            "lower_wick_ratio": lower_wick / candle_range if candle_range > 0 else 0.0,
+            "ema9_vwap_gap_atr": gap_atr,
+            "ema9_slope_atr": ema9_slope_atr,
+            "vwap_slope_atr": vwap_slope_atr,
+            "relative_volume": rel_volume,
+            "ema50_alignment": ema50_alignment,
+            "ema50_distance_atr": ema50_distance_atr,
+            "ema50_slope_atr": ema50_slope_atr,
+            "whipsaw_crosses_last_8_closed": whipsaw_count,
+            "signal_candle_timestamp": int(closed["timestamp"].iloc[signal_idx]),
+        },
     })
-    if "ema9" not in found or found["ema9"][0] != expected:
+    if cross_idx is None or cross_direction != expected:
         result["reason"] = "missing_fresh_directional_ema9_vwap_cross"
         return result
-    if "ema50" not in found or found["ema50"][0] != expected:
-        result["reason"] = "missing_fresh_directional_ema50_vwap_cross"
-        return result
-    aligned = (e9 > e50 > vw) if direction == "BUY" else (e9 < e50 < vw)
-    if not aligned:
-        result["reason"] = "ema9_ema50_vwap_alignment_not_confirmed"
-        return result
-    result.update({"ready": True, "reason": "dual_ema_vwap_cross_confirmed"})
+    result.update({
+        "ready": True,
+        "reason": "fresh_closed_ema9_vwap_cross_ema50_soft_confirmation",
+        "cross_quality": "UNRATED_PENDING_CALIBRATION",
+        "authorization_state": "EMA9_TRIGGER_VALID",
+    })
     return result
 
 
