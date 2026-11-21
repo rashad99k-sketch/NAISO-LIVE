@@ -422,6 +422,35 @@ def validate_ema915_vwap_pullback_entry_gate(
         result["reason"] = "non_finite_indicator"
         return result
 
+    # Repeated EMA/VWAP or EMA9/EMA15 flips indicate a choppy regime.
+    # Three or more flips in the recent closed-candle window invalidate the setup.
+    ema915_crosses = 0
+    ema9_vwap_crosses = 0
+    whipsaw_start = max(1, len(closed) - 8)
+    for idx in range(whipsaw_start, len(closed)):
+        prev_915 = float(ema9.iloc[idx - 1] - ema15.iloc[idx - 1])
+        curr_915 = float(ema9.iloc[idx] - ema15.iloc[idx])
+        if np.isfinite(prev_915) and np.isfinite(curr_915) and (
+            (prev_915 < 0.0 < curr_915) or (prev_915 > 0.0 > curr_915)
+        ):
+            ema915_crosses += 1
+        prev_vwap = float(ema9.iloc[idx - 1] - vwap.iloc[idx - 1])
+        curr_vwap = float(ema9.iloc[idx] - vwap.iloc[idx])
+        if np.isfinite(prev_vwap) and np.isfinite(curr_vwap) and (
+            (prev_vwap < 0.0 < curr_vwap) or (prev_vwap > 0.0 > curr_vwap)
+        ):
+            ema9_vwap_crosses += 1
+    result.update({
+        "ema915_crosses_last_8": ema915_crosses,
+        "ema9_vwap_crosses_last_8": ema9_vwap_crosses,
+    })
+    if ema915_crosses >= 3:
+        result["reason"] = "excessive_ema915_whipsaw"
+        return result
+    if ema9_vwap_crosses >= 3:
+        result["reason"] = "excessive_vwap_whipsaw"
+        return result
+
     cross_idx = None
     cross_direction = None
     first_idx = max(1, len(closed) - cross_window)
