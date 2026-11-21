@@ -6,9 +6,12 @@ remain in the existing GGP execution layer.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from math import isfinite
-from typing import Any, Dict, Iterable, Optional, Tuple
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+import uuid
 
 
 # Price-move percentages (not leveraged ROE percentages).
@@ -546,3 +549,862 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         "groups": tuple(sorted(groups)), "reasons": tuple(reasons),
         "roe": roe, "hard_exit": hard_exit,
     }
+
+
+# ===========================================================================
+# Unified Intelligent Profit Management Brain
+# ===========================================================================
+# This section is pure policy: it never touches the exchange, never submits or
+# modifies an order, and never authorizes an entry. The existing
+# TradeManagementBoard remains the sole routine authority; it delegates to this
+# policy and maps the result back to its existing TradeDecision execution path.
+
+
+class TradeMode(str, Enum):
+    SCALP_MODE = "SCALP_MODE"
+    MOMENTUM_MODE = "MOMENTUM_MODE"
+    EXTENDED_MODE = "EXTENDED_MODE"
+    TREND_RIDING_MODE = "TREND_RIDING_MODE"
+    DEFENSIVE_MODE = "DEFENSIVE_MODE"
+
+
+class BrainAction(str, Enum):
+    NO_ACTION = "NO_ACTION"
+    HOLD = "HOLD"
+    MOVE_SL = "MOVE_SL"
+    BREAKEVEN = "BREAKEVEN"
+    LOCK_PROFITS = "LOCK_PROFITS"
+    PARTIAL_CLOSE = "PARTIAL_CLOSE"
+    TRAIL = "TRAIL"
+    FULL_CLOSE = "FULL_CLOSE"
+    THESIS_FAILURE_EXIT = "THESIS_FAILURE_EXIT"
+    EMERGENCY_EXIT = "EMERGENCY_EXIT"
+
+
+@dataclass
+class ProfitBrainDecision:
+    decision_id: str
+    created_at: float
+    symbol: str
+    side: str
+    mode: str
+    mode_candidate: str
+    execution_plan: str
+    action: str
+    params: Dict[str, Any] = field(default_factory=dict)
+    reason: str = ""
+    evidence_for: Tuple[str, ...] = ()
+    evidence_against: Tuple[str, ...] = ()
+    missing_evidence: Tuple[str, ...] = ()
+    confidence: float = 0.0
+    data_quality: str = "UNKNOWN"
+    next_action: str = "none"
+    confirmed_danger: bool = False
+    thesis_snapshot: Dict[str, Any] = field(default_factory=dict)
+    vwap_ema_context: Dict[str, Any] = field(default_factory=dict)
+    entry_authorized: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "created_at": self.created_at,
+            "symbol": self.symbol,
+            "side": self.side,
+            "mode": self.mode,
+            "mode_candidate": self.mode_candidate,
+            "execution_plan": self.execution_plan,
+            "action": self.action,
+            "params": dict(self.params),
+            "reason": self.reason,
+            "evidence_for": list(self.evidence_for),
+            "evidence_against": list(self.evidence_against),
+            "missing_evidence": list(self.missing_evidence),
+            "confidence": self.confidence,
+            "data_quality": self.data_quality,
+            "next_action": self.next_action,
+            "confirmed_danger": self.confirmed_danger,
+            "thesis_snapshot": dict(self.thesis_snapshot),
+            "vwap_ema_context": dict(self.vwap_ema_context),
+            "entry_authorized": False,
+        }
+
+
+def _data_quality(context: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Classify data sufficiency separately from trade risk.
+
+    GOOD          -> analytical decisions are allowed.
+    UNKNOWN_DATA  -> not enough trusted evidence for an analytical decision.
+    INVALID       -> stale/invalid/insufficient market data.
+    UNKNOWN_DATA is not DEFENSIVE_MODE and must never be treated as confirmed
+    danger. It only disables indicator-driven protection changes.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    freshness = str(ctx.get("data_freshness") or "UNKNOWN").upper()
+    if freshness in {"STALE", "INVALID", "INSUFFICIENT"}:
+        return "INVALID", [f"market_data:{freshness}"]
+    missing: List[str] = []
+    for name in ("adx", "di_plus", "di_minus", "continuation_probability", "atr", "entry", "current_price"):
+        if _number(ctx.get(name)) is None:
+            missing.append(name)
+    regime = str(ctx.get("regime") or "UNKNOWN").upper()
+    if regime == "UNKNOWN":
+        missing.append("regime")
+    if not bool(ctx.get("indicator_decisions_allowed", True)):
+        missing.insert(0, "indicator_decisions_disabled")
+    if missing:
+        return "UNKNOWN_DATA", missing
+    return "GOOD", []
+
+
+def build_trade_thesis_snapshot(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the entry-thesis snapshot from STATE/context evidence only.
+
+    Missing fields are explicitly marked UNKNOWN. This function never mutates
+    STATE and never fabricates entry context that the caller did not provide.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    thesis = ctx.get("thesis") if isinstance(ctx.get("thesis"), dict) else {}
+    market_context = thesis.get("market_context") if isinstance(thesis.get("market_context"), dict) else {}
+    gate = ctx.get("entry_gate_snapshot") if isinstance(ctx.get("entry_gate_snapshot"), dict) else {}
+    entry = _number(ctx.get("entry"))
+    entry_atr = _number(ctx.get("entry_atr"))
+    entry_ema9 = _number(gate.get("ema9"))
+    entry_ema15 = _number(gate.get("ema15"))
+    entry_vwap = _number(gate.get("vwap"))
+    entry_extension = None
+    if entry is not None and entry_ema9 is not None and entry_atr is not None and entry_atr > 0:
+        entry_extension = abs(entry - entry_ema9) / entry_atr
+    snapshot: Dict[str, Any] = {
+        "thesis_id": thesis.get("thesis_id") or "UNKNOWN",
+        "symbol": ctx.get("symbol") or "UNKNOWN",
+        "side": ctx.get("side") or "UNKNOWN",
+        "entry_price": entry if entry is not None else "UNKNOWN",
+        "entry_atr": entry_atr if entry_atr is not None else "UNKNOWN",
+        "entry_time": ctx.get("entry_time") or "UNKNOWN",
+        "entry_reason": list(thesis.get("entry_reason") or ctx.get("entry_reasons") or []),
+        "entry_mode": ctx.get("entry_mode") or "UNKNOWN",
+        "entry_behavior": ctx.get("entry_behavior") or "UNKNOWN",
+        "entry_behavior_confidence": _number(ctx.get("entry_mode_confidence")),
+        "entry_regime": market_context.get("regime") or "UNKNOWN",
+        "entry_ema9": entry_ema9 if entry_ema9 is not None else "UNKNOWN",
+        "entry_ema15": entry_ema15 if entry_ema15 is not None else "UNKNOWN",
+        "entry_vwap": entry_vwap if entry_vwap is not None else "UNKNOWN",
+        "entry_extension_atr": entry_extension if entry_extension is not None else "UNKNOWN",
+        "entry_zone_low": _number(ctx.get("entry_zone_low")),
+        "entry_zone_high": _number(ctx.get("entry_zone_high")),
+        "entry_order_block": ctx.get("entry_order_block") or "UNKNOWN",
+        "entry_fvg": ctx.get("entry_fvg") or "UNKNOWN",
+        "entry_liquidity": ctx.get("entry_liquidity") or "UNKNOWN",
+        "entry_golden_zone": ctx.get("entry_golden_zone") or "UNKNOWN",
+        "entry_spread_pct": _number(ctx.get("entry_spread_pct")),
+        "entry_liquidity_quality": ctx.get("liquidity_quality") or "UNKNOWN",
+        "entry_orderbook_depth_usdt": _number(ctx.get("orderbook_depth_usdt")),
+        "signal_candle_id": gate.get("signal_candle_id") or ctx.get("signal_candle_id") or "UNKNOWN",
+        "entry_gate_timeframe": gate.get("candle_timeframe") or ctx.get("entry_gate_timeframe") or "UNKNOWN",
+        "entry_cross_direction": gate.get("cross_direction") or "UNKNOWN",
+        "entry_pullback_timestamp": gate.get("pullback_timestamp") or "UNKNOWN",
+        "entry_signal_candle_timestamp": gate.get("signal_candle_timestamp") or "UNKNOWN",
+    }
+    unknown = []
+    for key, value in snapshot.items():
+        if value is None or value == "" or value == "UNKNOWN":
+            unknown.append(key)
+    snapshot["unknown_fields"] = unknown
+    return snapshot
+
+
+def _confirmed_failed_breakout(context: Dict[str, Any], side: str) -> bool:
+    """Match the existing confirmed failed-breakout evidence gate exactly."""
+    mi = context.get("market_intelligence") if isinstance(context.get("market_intelligence"), dict) else {}
+    confidence = _number(mi.get("zone_event_confidence"))
+    streak = _number(mi.get("failed_breakout_streak"))
+    expected_side = str(side or "").upper()
+    return bool(
+        expected_side in {"BUY", "SELL"}
+        and str(mi.get("zone_event") or "").upper() == "FAILED_BREAKOUT"
+        and mi.get("zone_event_confirmed") is True
+        and mi.get("zone_event_fresh") is True
+        and str(mi.get("zone_side") or "").upper() == expected_side
+        and confidence is not None and confidence >= 0.75
+        and streak is not None and int(streak) >= 2
+        and not bool(mi.get("failed_breakout_thesis_credit_applied", False))
+    )
+
+
+def classify_trade_mode(context: Dict[str, Any]) -> Tuple[TradeMode, str, Tuple[str, ...], bool]:
+    """Classify the five-mode management state from multi-source evidence.
+
+    Hysteresis is applied by the Board, not here. This function returns the
+    candidate mode and whether confirmed danger requires immediate DEFENSIVE.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    side = str(ctx.get("side") or "").upper()
+    plan_mode, plan_reason, plan_evidence = classify_profit_mode(ctx)
+    evidence = list(plan_evidence)
+    trade_state = str(ctx.get("trade_state") or "UNKNOWN").upper()
+    regime = str(ctx.get("regime") or "UNKNOWN").upper()
+    adx = _number(ctx.get("adx"))
+    adx_slope = _number(ctx.get("adx_slope"))
+    continuation = _number(ctx.get("continuation_probability"))
+    plus = _number(ctx.get("di_plus"))
+    minus = _number(ctx.get("di_minus"))
+    volume_ratio = _number(ctx.get("volume_ratio"))
+    momentum_strength = _number(ctx.get("momentum_strength"))
+    structure_broken = bool(ctx.get("structure_broken") or ctx.get("structural_invalidation"))
+    failure_score = _number(ctx.get("thesis_failure_score"), 0.0) or 0.0
+    roe = _number(ctx.get("roe"), 0.0) or 0.0
+    failure_reasons = list(ctx.get("thesis_failure_reasons") or [])
+    if _confirmed_failed_breakout(ctx, side):
+        failure_score = min(100.0, failure_score + 18.0)
+        failure_reasons.append("confirmed_failed_breakout_reentry")
+        evidence.append("confirmed_failed_breakout_reentry")
+
+    exit_risk = evaluate_exit_risk(ctx)
+    thesis_action, thesis_reason = thesis_failure_action(
+        side, roe, failure_score, failure_reasons,
+        structural_invalidation=bool(ctx.get("structural_invalidation")),
+    )
+    hard_states = {"PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"}
+    confirmed_danger = bool(
+        ctx.get("structural_invalidation")
+        or ctx.get("structure_broken")
+        or trade_state in hard_states
+        or failure_score >= 70.0
+        or exit_risk.get("action") == "HARD_EXIT"
+        or thesis_action == "EXIT"
+    )
+    if confirmed_danger:
+        danger_reasons = list(exit_risk.get("reasons") or []) + [thesis_reason]
+        return (
+            TradeMode.DEFENSIVE_MODE,
+            "confirmed_danger:" + ",".join(dict.fromkeys(r for r in danger_reasons if r)),
+            tuple(dict.fromkeys(evidence + ["confirmed_danger"])),
+            True,
+        )
+
+    defensive_soft = bool(
+        exit_risk.get("action") in {"CLOSE_PROFIT", "LOCK_PROFIT"}
+        or thesis_action == "PROTECT"
+        or trade_state in {"DISTRIBUTION", "PROFIT_DEFENSE", "EXHAUSTION"}
+    )
+    if defensive_soft:
+        soft_reasons = list(exit_risk.get("reasons") or []) + [thesis_reason]
+        return (
+            TradeMode.DEFENSIVE_MODE,
+            "defensive_evidence:" + ",".join(dict.fromkeys(r for r in soft_reasons if r)),
+            tuple(dict.fromkeys(evidence + ["defensive_evidence"])),
+            False,
+        )
+
+    di_aligned = False
+    if plus is not None and minus is not None:
+        di_aligned = (plus > minus) if side == "BUY" else (minus > plus) if side == "SELL" else False
+    if plan_mode == TREND_MODE:
+        expansion = bool(
+            regime in {"EXPANSION", "STRONG_TREND", "VERY_STRONG"}
+            or ctx.get("trend_expansion")
+            or (volume_ratio is not None and volume_ratio >= 1.20)
+        )
+        if expansion and (continuation is None or continuation >= 0.62):
+            return (
+                TradeMode.EXTENDED_MODE,
+                "trend_expansion_with_continuation",
+                tuple(dict.fromkeys(evidence + ["trend_expansion"])),
+                False,
+            )
+        return (
+            TradeMode.TREND_RIDING_MODE,
+            "confirmed_trend_structure",
+            tuple(dict.fromkeys(evidence + ["confirmed_trend_structure"])),
+            False,
+        )
+    if plan_mode == RANGE_MODE:
+        return (
+            TradeMode.SCALP_MODE,
+            "confirmed_range_or_thin_market",
+            tuple(dict.fromkeys(evidence)),
+            False,
+        )
+    momentum_support = bool(
+        (momentum_strength is not None and momentum_strength >= 55.0)
+        or ctx.get("trend_expansion")
+    )
+    if (continuation is not None and continuation >= 0.55
+            and adx is not None and adx >= 20.0
+            and di_aligned and not structure_broken and momentum_support):
+        return (
+            TradeMode.MOMENTUM_MODE,
+            "momentum_support_without_confirmed_trend",
+            tuple(dict.fromkeys(evidence + ["momentum_support"])),
+            False,
+        )
+    # The canonical 50/50 plan is the safe default when trend/range evidence is
+    # not strong enough. It is NOT a forced scalp and never a full close.
+    return (
+        TradeMode.MOMENTUM_MODE,
+        "standard_two_stage_default",
+        tuple(dict.fromkeys(evidence + ["standard_two_stage_default"])),
+        False,
+    )
+
+
+def _mode_trail_factor(mode: str) -> float:
+    """Mode-specific trailing multipliers are not adopted without approval.
+
+    Shadow analysis can compare hypothetical factors with trailing_comparison();
+    the live policy keeps the legacy multiplier (1.0) until the comparison is
+    reviewed and explicitly approved.
+    """
+    return 1.0
+
+
+def trailing_comparison(context: Dict[str, Any], mode_factor: float = 1.0) -> Dict[str, Any]:
+    """Pure analysis helper for Legacy-vs-mode trailing comparisons.
+
+    Returns stop distance, locked profit, room for a normal pullback and an
+    early-exit proxy for 0.5/0.8/1.0/1.2/1.5 ATR retracements. It never sends
+    orders and never mutates STATE. The live policy does not use mode factors
+    other than 1.0 until they are approved.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    side = str(ctx.get("side") or "").upper()
+    entry = _number(ctx.get("entry"))
+    current = _number(ctx.get("current_price"))
+    atr = _number(ctx.get("atr"))
+    if side not in {"BUY", "SELL"} or entry is None or current is None or atr is None or atr <= 0:
+        return {"valid": False, "reason": "insufficient_trailing_evidence"}
+    base_mult = _number(ctx.get("smart_trail_mult"), 1.5) or 1.5
+    trail_mult = adaptive_trail_multiplier(
+        base_mult * float(mode_factor),
+        _number(ctx.get("continuation_probability"), 0.5) or 0.5,
+        _number(ctx.get("adx"), 20.0) or 20.0,
+        _number(ctx.get("distribution_risk"), 0.0) or 0.0,
+        int(_number(ctx.get("exit_warning"), 0.0) or 0.0),
+        str(ctx.get("ema_state") or "UNKNOWN"),
+        _number(ctx.get("peak_drawdown_roe"), 0.0) or 0.0,
+        tp1_verified=True,
+    )
+    favourable = _number(ctx.get("max_price"), entry) if side == "BUY" else _number(ctx.get("min_price"), entry)
+    favourable = favourable if favourable is not None else entry
+    synthetic_sl = _number(ctx.get("synthetic_sl"), 0.0) or 0.0
+    previous = _number(ctx.get("trail_stop"), 0.0) or 0.0
+    be_buffer = max(entry * 0.0010, atr * 0.10)
+    floor_stop = entry + be_buffer if side == "BUY" else entry - be_buffer
+    raw_stop = favourable - trail_mult * atr if side == "BUY" else favourable + trail_mult * atr
+    if side == "BUY":
+        new_stop = max(raw_stop, floor_stop, previous)
+        current_stop = max(synthetic_sl, previous)
+    else:
+        new_stop = min(raw_stop, floor_stop, previous if previous > 0 else float("inf"))
+        current_stop = min(synthetic_sl if synthetic_sl > 0 else float("inf"),
+                           previous if previous > 0 else float("inf"))
+    stop_distance_atr = abs(favourable - new_stop) / atr
+    locked_profit_price = (new_stop - entry) if side == "BUY" else (entry - new_stop)
+    early_exit = {}
+    for depth in (0.5, 0.8, 1.0, 1.2, 1.5):
+        retrace_price = favourable - depth * atr if side == "BUY" else favourable + depth * atr
+        early_exit[f"{depth:.1f}"] = (
+            retrace_price <= new_stop if side == "BUY" else retrace_price >= new_stop
+        )
+    return {
+        "valid": True,
+        "side": side,
+        "mode_factor": float(mode_factor),
+        "multiplier": trail_mult,
+        "favourable": favourable,
+        "new_stop": new_stop,
+        "floor_stop": floor_stop,
+        "current_stop": current_stop,
+        "stop_distance_atr": stop_distance_atr,
+        "locked_profit_price": locked_profit_price,
+        "locked_profit_pct": (locked_profit_price / entry * 100.0) if entry > 0 else None,
+        "room_for_pullback_atr": stop_distance_atr,
+        "early_exit_proxy": early_exit,
+        "be_floor_respected": (
+            new_stop >= floor_stop - 1e-12 if side == "BUY" else new_stop <= floor_stop + 1e-12
+        ),
+    }
+
+
+def _next_action_for(action: str) -> str:
+    return {
+        BrainAction.HOLD.value: "hold",
+        BrainAction.NO_ACTION.value: "none",
+        BrainAction.BREAKEVEN.value: "move_synthetic_stop_to_breakeven",
+        BrainAction.LOCK_PROFITS.value: "lock_profits_with_synthetic_stop",
+        BrainAction.TRAIL.value: "ratchet_synthetic_trail",
+        BrainAction.PARTIAL_CLOSE.value: "close_partial_tp1",
+        BrainAction.FULL_CLOSE.value: "close_full",
+        BrainAction.THESIS_FAILURE_EXIT.value: "exit_thesis_failure",
+        BrainAction.EMERGENCY_EXIT.value: "emergency_exit",
+    }.get(action, "hold")
+
+
+def evaluate_profit_brain(context: Dict[str, Any]) -> ProfitBrainDecision:
+    """Pure unified profit-management policy.
+
+    The caller (TradeManagementBoard) remains the sole execution authority.
+    Missing data is marked in `missing_evidence` and never replaced with fake
+    positive evidence. Single indicators cannot close a trade on their own.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    decision_id = uuid.uuid4().hex
+    now = time.time()
+    symbol = str(ctx.get("symbol") or "UNKNOWN")
+    side = str(ctx.get("side") or "").upper()
+    entry = _number(ctx.get("entry"))
+    current = _number(ctx.get("current_price"))
+    atr = _number(ctx.get("atr"))
+    roe = _number(ctx.get("roe"), 0.0) or 0.0
+    remaining = _number(ctx.get("remaining_qty"), 0.0) or 0.0
+    initial = _number(ctx.get("initial_qty"), remaining) or remaining
+    data_quality, missing = _data_quality(ctx)
+    plan_mode, plan_reason, plan_evidence = classify_profit_mode(ctx)
+    current_plan = str(ctx.get("profit_mode") or "").upper()
+    # Preserve the existing execution plan (and therefore TP1/TP2 50/50 or the
+    # existing RANGE_SCALP single-target behavior). The five-mode Brain state is
+    # an analytical/protection layer, not a silent rewrite of the TP plan.
+    execution_plan = current_plan if current_plan in {RANGE_MODE, TREND_MODE, STANDARD_MODE} else plan_mode
+    # Only GOOD data may produce analytical decisions or protection changes.
+    # UNKNOWN_DATA/INVALID are not DEFENSIVE_MODE and are never treated as
+    # confirmed danger.
+    indicator_allowed = data_quality == "GOOD"
+
+    if indicator_allowed:
+        mode, mode_reason, mode_evidence, confirmed_danger = classify_trade_mode(ctx)
+    else:
+        current_mode = str(ctx.get("current_mode") or TradeMode.MOMENTUM_MODE.value).upper()
+        if current_mode not in {item.value for item in TradeMode}:
+            current_mode = TradeMode.MOMENTUM_MODE.value
+        mode = TradeMode(current_mode)
+        mode_reason = "data_insufficient_mode_unchanged"
+        mode_evidence = ()
+        confirmed_danger = False
+
+    mode_candidate = mode
+    # Keep the effective five-mode state consistent with the existing execution
+    # plan. A RANGE_SCALP execution plan must not be labelled TREND_RIDING just
+    # because current evidence is trend-like; the candidate is still exposed.
+    if execution_plan == RANGE_MODE and mode != TradeMode.SCALP_MODE:
+        mode_candidate = mode
+        mode = TradeMode.SCALP_MODE
+        mode_reason = f"effective_scalp_for_range_plan;candidate={mode_candidate.value}"
+        mode_evidence = tuple(dict.fromkeys(list(mode_evidence) + ["mode_aligned_to_range_execution_plan"]))
+    elif execution_plan == TREND_MODE and mode == TradeMode.SCALP_MODE:
+        mode_candidate = mode
+        mode = TradeMode.TREND_RIDING_MODE
+        mode_reason = f"effective_trend_riding_for_trend_plan;candidate={mode_candidate.value}"
+        mode_evidence = tuple(dict.fromkeys(list(mode_evidence) + ["mode_aligned_to_trend_execution_plan"]))
+    effective_override = str(ctx.get("effective_mode_override") or "").upper()
+    if effective_override in {item.value for item in TradeMode}:
+        mode = TradeMode(effective_override)
+
+    evidence_for: List[str] = list(dict.fromkeys(list(mode_evidence) + list(plan_evidence)))
+    if mode_reason:
+        evidence_for.append(f"mode:{mode_reason}")
+    if plan_reason:
+        evidence_for.append(f"plan:{plan_reason}")
+    evidence_for = list(dict.fromkeys(evidence_for))
+    evidence_against: List[str] = []
+    missing_evidence: List[str] = list(dict.fromkeys(missing))
+    thesis_snapshot = ctx.get("thesis_snapshot") if isinstance(ctx.get("thesis_snapshot"), dict) else build_trade_thesis_snapshot(ctx)
+    for field_name in (thesis_snapshot.get("unknown_fields") or [])[:12]:
+        missing_evidence.append(f"entry_thesis:{field_name}")
+
+    # VWAP + EMA management context. This is evidence only; it never authorizes
+    # an entry and never closes a trade on its own.
+    cross_snapshot = ctx.get("vwap_cross_snapshot") if isinstance(ctx.get("vwap_cross_snapshot"), dict) else {}
+    gate_snapshot = ctx.get("entry_gate_snapshot") if isinstance(ctx.get("entry_gate_snapshot"), dict) else {}
+    ema9 = _number(cross_snapshot.get("ema9"))
+    if ema9 is None:
+        ema9 = _number(gate_snapshot.get("ema9"))
+    ema15 = _number(gate_snapshot.get("ema15"))
+    vwap = _number(cross_snapshot.get("vwap"))
+    if vwap is None:
+        vwap = _number(gate_snapshot.get("vwap"))
+    cross_state = str(cross_snapshot.get("state") or "UNKNOWN")
+    cross_direction = str(cross_snapshot.get("cross_any") or cross_snapshot.get("signal") or "UNKNOWN")
+    fresh_cross = bool(ctx.get("fresh_ema9_vwap_cross") or ctx.get("fresh_ema50_vwap_cross"))
+    price_vwap_atr = None
+    ema9_vwap_atr = None
+    ema9_ema15_atr = None
+    if atr and atr > 0:
+        if current is not None and vwap is not None:
+            price_vwap_atr = abs(current - vwap) / atr
+        if ema9 is not None and vwap is not None:
+            ema9_vwap_atr = abs(ema9 - vwap) / atr
+        if ema9 is not None and ema15 is not None:
+            ema9_ema15_atr = abs(ema9 - ema15) / atr
+    alignment = "UNKNOWN"
+    if ema9 is not None and vwap is not None:
+        if side == "BUY":
+            alignment = "ALIGNED" if ema9 > vwap and (ema15 is None or ema9 > ema15) else "OPPOSED"
+        elif side == "SELL":
+            alignment = "ALIGNED" if ema9 < vwap and (ema15 is None or ema9 < ema15) else "OPPOSED"
+    no_chase_risk = bool(price_vwap_atr is not None and price_vwap_atr > 1.5)
+    vwap_ema_context = {
+        "ema9": ema9,
+        "ema15": ema15,
+        "vwap": vwap,
+        "cross_state": cross_state,
+        "cross_direction": cross_direction,
+        "fresh_cross": fresh_cross,
+        "alignment": alignment,
+        "price_vwap_atr": price_vwap_atr,
+        "ema9_vwap_atr": ema9_vwap_atr,
+        "ema9_ema15_atr": ema9_ema15_atr,
+        "no_chase_risk": no_chase_risk,
+        "source": "CLOSED_CANDLE_VWAP_EMA_MANAGEMENT_CONTEXT",
+    }
+    if alignment == "ALIGNED":
+        evidence_for.append("vwap_ema_aligned")
+    elif alignment == "OPPOSED":
+        evidence_against.append("vwap_ema_opposed")
+    if fresh_cross:
+        evidence_for.append(f"vwap_ema_fresh_cross:{cross_direction}")
+    if no_chase_risk and price_vwap_atr is not None:
+        evidence_against.append(f"price_vwap_extension_atr:{price_vwap_atr:.2f}")
+    if ema9_vwap_atr is not None and ema9_vwap_atr > 1.0:
+        evidence_against.append(f"ema9_vwap_distance_atr:{ema9_vwap_atr:.2f}")
+
+    def make(action: BrainAction, reason: str, params: Optional[Dict[str, Any]] = None,
+             confidence: Optional[float] = None, next_action: Optional[str] = None,
+             extra_for: Iterable[str] = (), extra_against: Iterable[str] = ()) -> ProfitBrainDecision:
+        local_for = list(dict.fromkeys(evidence_for + list(extra_for)))
+        local_against = list(dict.fromkeys(evidence_against + list(extra_against)))
+        if confidence is None:
+            conf = 0.55
+            if data_quality == "GOOD":
+                conf += 0.15
+            elif data_quality == "UNKNOWN_DATA":
+                conf = 0.30
+            elif data_quality == "INVALID":
+                conf = 0.20
+            conf += min(0.20, 0.03 * len(local_for))
+            conf -= min(0.20, 0.03 * len(local_against))
+            confidence = max(0.0, min(1.0, conf))
+        return ProfitBrainDecision(
+            decision_id=decision_id,
+            created_at=now,
+            symbol=symbol,
+            side=side,
+            mode=mode.value if isinstance(mode, TradeMode) else str(mode),
+            mode_candidate=(mode_candidate.value if isinstance(mode_candidate, TradeMode)
+                            else str(mode_candidate)),
+            execution_plan=execution_plan,
+            action=action.value,
+            params=dict(params or {}),
+            reason=reason,
+            evidence_for=tuple(local_for),
+            evidence_against=tuple(local_against),
+            missing_evidence=tuple(dict.fromkeys(missing_evidence)),
+            confidence=float(confidence),
+            data_quality=data_quality,
+            next_action=next_action or _next_action_for(action.value),
+            confirmed_danger=bool(confirmed_danger),
+            thesis_snapshot=dict(thesis_snapshot),
+            vwap_ema_context=dict(vwap_ema_context),
+            entry_authorized=False,
+        )
+
+    if side not in {"BUY", "SELL"}:
+        return make(BrainAction.HOLD, "invalid_side", confidence=0.0, next_action="hold")
+    if ctx.get("execution_unresolved") or ctx.get("close_reconciliation_required") or ctx.get("recovery_hold"):
+        return make(BrainAction.HOLD, "exchange_execution_or_recovery_unresolved", confidence=0.9)
+    if ctx.get("emergency_exit"):
+        return make(BrainAction.EMERGENCY_EXIT,
+                    str(ctx.get("emergency_reason") or "emergency_exit"),
+                    confidence=0.95)
+    if current is None or entry is None or current <= 0 or entry <= 0:
+        return make(BrainAction.HOLD, "missing_price_or_entry", confidence=0.2, next_action="hold")
+
+    # ------------------------------------------------------------------
+    # Indicator-driven risk and thesis evidence. Skipped entirely for
+    # price-only cycles so stale indicators cannot fabricate an exit.
+    # ------------------------------------------------------------------
+    if indicator_allowed:
+        exit_risk = evaluate_exit_risk(ctx)
+        if exit_risk.get("action") == "HARD_EXIT":
+            return make(
+                BrainAction.THESIS_FAILURE_EXIT,
+                "PROFIT_BRAIN_HARD_RISK:" + ",".join(exit_risk.get("reasons", ())),
+                params={"close_reason": "PROFIT_DANGER_HARD_EXIT",
+                        "risk_score": exit_risk.get("score"),
+                        "risk_groups": list(exit_risk.get("groups") or [])},
+                confidence=0.95,
+                extra_for=["hard_risk_fusion"],
+            )
+        if exit_risk.get("action") == "CLOSE_PROFIT":
+            return make(
+                BrainAction.FULL_CLOSE,
+                "PROFIT_DANGER_LOCK:" + ",".join(exit_risk.get("reasons", ())),
+                params={"close_reason": "PROFIT_DANGER_LOCK",
+                        "risk_score": exit_risk.get("score"),
+                        "risk_groups": list(exit_risk.get("groups") or [])},
+                confidence=0.9,
+                extra_for=["multi_group_profit_risk"],
+            )
+        if exit_risk.get("action") == "LOCK_PROFIT" and atr and atr > 0:
+            fee_buffer = max(entry * 0.0010, atr * 0.10)
+            candidate_stop = (
+                max(entry + fee_buffer, current - 0.50 * atr)
+                if side == "BUY" else
+                min(entry - fee_buffer, current + 0.50 * atr)
+            )
+            if (side == "BUY" and candidate_stop < current) or (side == "SELL" and candidate_stop > current):
+                return make(
+                    BrainAction.LOCK_PROFITS,
+                    "PROFIT_DANGER_TIGHTEN:" + ",".join(exit_risk.get("reasons", ())),
+                    params={"new_sl": candidate_stop,
+                            "risk_score": exit_risk.get("score"),
+                            "risk_groups": list(exit_risk.get("groups") or [])},
+                    confidence=0.85,
+                    extra_for=["profit_lock_evidence"],
+                )
+
+        failure_reasons = list(ctx.get("thesis_failure_reasons") or [])
+        failure_score = _number(ctx.get("thesis_failure_score"), 0.0) or 0.0
+        if _confirmed_failed_breakout(ctx, side):
+            failure_score = min(100.0, failure_score + 18.0)
+            failure_reasons.append("confirmed_failed_breakout_reentry")
+            evidence_for.append("confirmed_failed_breakout_reentry")
+        thesis_action, thesis_reason = thesis_failure_action(
+            side, roe, failure_score, failure_reasons,
+            structural_invalidation=bool(ctx.get("structural_invalidation")),
+        )
+        if thesis_action == "EXIT":
+            return make(
+                BrainAction.THESIS_FAILURE_EXIT,
+                str(ctx.get("thesis_failure_reason") or thesis_reason),
+                confidence=0.9,
+                extra_for=["thesis_failure_confirmed"],
+            )
+        if thesis_action == "PROTECT" and not ctx.get("be_done") and atr and atr > 0:
+            be_buffer = max(entry * 0.0010, atr * 0.10)
+            be_stop = entry + be_buffer if side == "BUY" else entry - be_buffer
+            return make(
+                BrainAction.BREAKEVEN,
+                thesis_reason,
+                params={"new_sl": be_stop},
+                confidence=0.8,
+                extra_for=["thesis_warning_positive_trade"],
+            )
+        trade_state = str(ctx.get("trade_state") or "").upper()
+        if trade_state in {"PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"}:
+            return make(
+                BrainAction.FULL_CLOSE,
+                f"hard_exit_state_{trade_state.lower()}",
+                confidence=0.9,
+                extra_for=["hard_state_multi_evidence"],
+            )
+
+    # ------------------------------------------------------------------
+    # Price-only protection: always active, including during data outages.
+    # ------------------------------------------------------------------
+    synthetic_sl = _number(ctx.get("synthetic_sl"))
+    if synthetic_sl is not None and synthetic_sl > 0:
+        if (side == "BUY" and current <= synthetic_sl) or (side == "SELL" and current >= synthetic_sl):
+            return make(BrainAction.FULL_CLOSE, "synthetic_structural_stop_triggered",
+                        confidence=0.95)
+    trail_stop = _number(ctx.get("trail_stop"))
+    if ctx.get("trail_active") and trail_stop is not None and trail_stop > 0:
+        if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
+            return make(BrainAction.FULL_CLOSE, "profit_trailing_stop_triggered",
+                        confidence=0.95)
+
+    # ------------------------------------------------------------------
+    # RANGE_SCALP remains a single-target mode, exactly as the existing Board.
+    # TP1/TP2 50/50 is untouched for the other execution plans.
+    # ------------------------------------------------------------------
+    if execution_plan == RANGE_MODE:
+        scalp_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
+        scalp_target = _number(ctx.get("scalp_target_price"), 0.0) or 0.0
+        range_target = _number(ctx.get("range_target_price"), 0.0) or (
+            scalp_target if scalp_status == "VALID" else 0.0
+        )
+        target_source = ("adaptive_price_target" if _number(ctx.get("range_target_price"), 0.0)
+                         else "opposing_liquidity_fallback")
+        if range_target > 0 and remaining > 0 and target_reached(side, current, range_target):
+            return make(
+                BrainAction.FULL_CLOSE,
+                f"range_scalp_{target_source}_single_target_full_exit",
+                params={"close_reason": "SCALP_TARGET",
+                        "target_price": range_target,
+                        "target_move_pct": _number(ctx.get("range_target_move_pct"), 0.0) or 0.0,
+                        "opposing_liquidity_level": _number(ctx.get("opposing_liquidity_level"), 0.0) or 0.0},
+                confidence=0.9,
+                extra_for=["range_single_target_reached"],
+            )
+        return make(
+            BrainAction.HOLD,
+            "range_scalp_waiting_for_single_target",
+            params={"target_price": range_target, "target_source": target_source,
+                    "target_move_pct": _number(ctx.get("range_target_move_pct"), 0.0) or 0.0},
+            confidence=0.6,
+        )
+
+    tp1_hit = bool(ctx.get("tp1_hit"))
+    tp2_hit = bool(ctx.get("tp2_hit"))
+    if not tp1_hit and remaining > 0 and initial > 0:
+        tp1_price = _number(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0) or 0.0
+        if tp1_price > 0 and target_reached(side, current, tp1_price):
+            target_remaining = initial * 0.5
+            tolerance = max(initial * 0.002, 1e-10)
+            qty_to_close = max(0.0, remaining - target_remaining)
+            if qty_to_close <= tolerance:
+                return make(BrainAction.HOLD,
+                            "tp1_quantity_already_at_50pct_wait_for_reconciliation",
+                            confidence=0.7)
+            ratio = min(1.0, qty_to_close / remaining)
+            return make(
+                BrainAction.PARTIAL_CLOSE,
+                "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
+                params={"ratio": ratio, "target_remaining_qty": target_remaining,
+                        "close_reason": "TP1"},
+                confidence=0.9,
+                extra_for=["tp1_fixed_50_50_plan"],
+            )
+
+    if tp1_hit and not tp2_hit and remaining > 0:
+        tp2_price = _number(ctx.get("tp2_price"), 0.0) or 0.0
+        if indicator_allowed:
+            legacy_tp2 = str(ctx.get("tp2_decision") or "HOLD")
+            evidence_for.append(
+                f"legacy_tp2:{legacy_tp2}:{str(ctx.get('tp2_decision_reason') or '')}"
+            )
+            # Mode-specific runner policy. TP1/TP2 prices and the 50/50 split are
+            # untouched; only the evidence threshold for closing the remaining
+            # runner early changes with the five-mode state.
+            mode_tp2_thresholds = {
+                TradeMode.SCALP_MODE.value: (2.0, 0.50),
+                TradeMode.MOMENTUM_MODE.value: (3.0, 0.45),
+                TradeMode.EXTENDED_MODE.value: (4.0, 0.55),
+                TradeMode.TREND_RIDING_MODE.value: (4.5, 0.55),
+                TradeMode.DEFENSIVE_MODE.value: (2.0, 0.50),
+            }
+            max_atr, min_continuation = mode_tp2_thresholds.get(mode.value, (3.0, 0.45))
+            brain_tp2_action, brain_tp2_reason = tp2_reassessment(
+                side, current, tp2_price, atr or 0.0,
+                _number(ctx.get("continuation_probability"), 0.5) or 0.5,
+                _number(ctx.get("adx"), 20.0) or 20.0,
+                _number(ctx.get("adx_slope"), 0.0) or 0.0,
+                bool(ctx.get("structure_aligned")),
+                max_atr_distance=max_atr,
+                min_continuation=min_continuation,
+            )
+            evidence_for.append(f"brain_tp2:{brain_tp2_action}:{brain_tp2_reason}")
+            if brain_tp2_action == "CLOSE":
+                return make(
+                    BrainAction.FULL_CLOSE,
+                    brain_tp2_reason,
+                    params={"close_reason": "TP2_ADAPTIVE_STRICT_EXIT",
+                            "mode_max_atr": max_atr,
+                            "mode_min_continuation": min_continuation},
+                    confidence=0.85,
+                    extra_for=[f"mode_tp2_policy:{mode.value}"],
+                )
+        if tp2_price > 0 and target_reached(side, current, tp2_price):
+            return make(
+                BrainAction.FULL_CLOSE,
+                "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
+                params={"close_reason": "TP2"},
+                confidence=0.9,
+                extra_for=["tp2_final_50_percent_target"],
+            )
+
+    if indicator_allowed and tp1_hit and not ctx.get("be_done") and atr and atr > 0:
+        be_buffer = max(entry * 0.0010, atr * 0.10)
+        be_stop = entry + be_buffer if side == "BUY" else entry - be_buffer
+        return make(BrainAction.BREAKEVEN, "TP1_verified_move_runner_to_BE_plus",
+                    params={"new_sl": be_stop}, confidence=0.9,
+                    extra_for=["tp1_verified_runner_protection"])
+
+    if indicator_allowed and tp1_hit and atr and atr > 0:
+        base_mult = _number(ctx.get("smart_trail_mult"), 1.5) or 1.5
+        mode_factor = _mode_trail_factor(mode.value if isinstance(mode, TradeMode) else str(mode))
+        trail_mult = adaptive_trail_multiplier(
+            base_mult * mode_factor,
+            _number(ctx.get("continuation_probability"), 0.5) or 0.5,
+            _number(ctx.get("adx"), 20.0) or 20.0,
+            _number(ctx.get("distribution_risk"), 0.0) or 0.0,
+            int(_number(ctx.get("exit_warning"), 0.0) or 0.0),
+            str(ctx.get("ema_state") or "UNKNOWN"),
+            _number(ctx.get("peak_drawdown_roe"), 0.0) or 0.0,
+            tp1_verified=True,
+        )
+        favourable = _number(ctx.get("max_price"), entry) if side == "BUY" else _number(ctx.get("min_price"), entry)
+        favourable = favourable if favourable is not None else entry
+        new_stop = favourable - trail_mult * atr if side == "BUY" else favourable + trail_mult * atr
+        be_buffer = max(entry * 0.0010, atr * 0.10)
+        floor_stop = entry + be_buffer if side == "BUY" else entry - be_buffer
+        previous = _number(ctx.get("trail_stop"), 0.0) or 0.0
+        if side == "BUY":
+            new_stop = max(new_stop, floor_stop, previous)
+            current_stop = max(synthetic_sl or 0.0, previous)
+            hit = current <= new_stop
+            improves = new_stop > current_stop + max(entry * 1e-8, 1e-10)
+        else:
+            new_stop = min(new_stop, floor_stop, previous if previous > 0 else float("inf"))
+            current_stop = min(synthetic_sl if synthetic_sl and synthetic_sl > 0 else float("inf"),
+                               previous if previous > 0 else float("inf"))
+            hit = current >= new_stop
+            improves = new_stop < current_stop - max(entry * 1e-8, 1e-10)
+        if hit:
+            return make(BrainAction.FULL_CLOSE, "runner_trailing_ratchet_triggered",
+                        params={"close_reason": "TRAILING_STOP"}, confidence=0.95)
+        if improves:
+            return make(BrainAction.TRAIL, "ratchet_runner_trailing_stop",
+                        params={"new_stop": new_stop, "multiplier": trail_mult},
+                        confidence=0.8,
+                        extra_for=["runner_trailing_evidence"])
+
+    return make(BrainAction.HOLD, "no_profit_management_trigger", confidence=0.5)
+
+
+def compare_profit_brain_decisions(legacy: Any, brain: ProfitBrainDecision,
+                                   context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Compare the legacy Board decision with the new Brain decision (shadow)."""
+    ctx = context if isinstance(context, dict) else {}
+    legacy_action_raw = getattr(legacy, "action", None)
+    legacy_action = getattr(legacy_action_raw, "value", legacy_action_raw)
+    legacy_params = dict(getattr(legacy, "params", {}) or {})
+    brain_params = dict(brain.params or {})
+    keys = ("new_sl", "new_stop", "ratio", "target_remaining_qty",
+            "close_reason", "target_price", "multiplier")
+    differences = {
+        key: {"legacy": legacy_params.get(key), "brain": brain_params.get(key)}
+        for key in keys
+        if legacy_params.get(key) != brain_params.get(key)
+    }
+    protection_actions = {"BREAKEVEN", "TRAIL", "LOCK_PROFITS", "MOVE_SL"}
+    risk_flags = []
+    if brain.data_quality in {"UNKNOWN_DATA", "INVALID"}:
+        if str(legacy_action) in protection_actions:
+            risk_flags.append("legacy_protection_change_on_invalid_data")
+        if str(brain.action) in protection_actions:
+            risk_flags.append("brain_protection_change_on_invalid_data")
+    return {
+        "match": str(legacy_action) == str(brain.action) and not differences,
+        "legacy_action": str(legacy_action),
+        "brain_action": str(brain.action),
+        "legacy_reason": str(getattr(legacy, "reason", "") or ""),
+        "brain_reason": str(brain.reason or ""),
+        "legacy_mode": str(ctx.get("profit_mode") or "UNKNOWN"),
+        "brain_mode": str(brain.mode),
+        "brain_mode_candidate": str(brain.mode_candidate),
+        "execution_plan": str(brain.execution_plan),
+        "legacy_params": legacy_params,
+        "brain_params": brain_params,
+        "differences": differences,
+        "data_quality": str(brain.data_quality),
+        "confirmed_danger": bool(brain.confirmed_danger),
+        "vwap_ema_context": dict(brain.vwap_ema_context),
+        "risk_flags": risk_flags,
+        "confidence": float(brain.confidence),
+        "evidence_for": list(brain.evidence_for),
+        "evidence_against": list(brain.evidence_against),
+        "missing_evidence": list(brain.missing_evidence),
+        "decision_id": str(brain.decision_id),
+        "entry_authorized": False,
+    }
+
