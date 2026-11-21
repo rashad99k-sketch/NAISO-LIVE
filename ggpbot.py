@@ -10550,6 +10550,7 @@ def main_loop_sniper():
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, RECOVERY_BLOCK_ENTRIES
     last_scan = 0
     last_candidate_scan = 0
+    last_ema9_vwap_scan = 0
     last_flow_update = 0
     try:
         ex.load_markets()
@@ -10598,6 +10599,9 @@ def main_loop_sniper():
                 if now - last_scan >= GLOBAL_SCAN_INTERVAL:
                     dispatch_scanner_task("global_discovery", run_global_discovery_scanner)
                     last_scan = now
+                if now - last_ema9_vwap_scan >= EMA9_VWAP_DISCOVERY_INTERVAL:
+                    dispatch_scanner_task("ema9_vwap_discovery", run_fast_ema9_vwap_discovery)
+                    last_ema9_vwap_scan = now
                 # Scanner 2 is the rotating institutional/proximity Watchlist pass.
                 # smart_opportunity_selection() refreshes it at the configured batch interval,
                 # sharing the exact OHLCV frame with OB/FVG/liquidity/structure analysis.
@@ -11271,6 +11275,98 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
     threading.Thread(target=runner, daemon=True, name=f"ggp_{name}").start()
     return True
 
+
+# Fast rotating EMA9/VWAP discovery. Ranking only; unified entry authority is unchanged.
+EMA9_VWAP_DISCOVERY_INTERVAL = _env_int_range("EMA9_VWAP_DISCOVERY_INTERVAL", 15, 10, 120)
+EMA9_VWAP_DISCOVERY_BATCH = _env_int_range("EMA9_VWAP_DISCOVERY_BATCH", 8, 4, 16)
+_EMA9_VWAP_UNIVERSE = []
+_EMA9_VWAP_CURSOR = 0
+_EMA9_VWAP_UNIVERSE_REFRESH_AT = 0.0
+_EMA9_VWAP_UNIVERSE_TTL = 300.0
+
+def run_fast_ema9_vwap_discovery():
+    """Rotate through USDT perpetuals and promote fresh closed-candle EMA9/VWAP events."""
+    global _EMA9_VWAP_UNIVERSE, _EMA9_VWAP_CURSOR, _EMA9_VWAP_UNIVERSE_REFRESH_AT
+    started = time.time()
+    meta = MEMORY.setdefault("ema9_vwap_global_discovery_meta", {})
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        meta.update({"state": "PAUSED_FOR_POSITION", "last_completed": time.time()})
+        return
+    if not _EMA9_VWAP_UNIVERSE or started - _EMA9_VWAP_UNIVERSE_REFRESH_AT >= _EMA9_VWAP_UNIVERSE_TTL:
+        try:
+            fresh = get_usdt_perp_symbols()
+            unique, seen = [], set()
+            for symbol in fresh or []:
+                key = roro_canonical_symbol(symbol)
+                if key and key not in seen:
+                    seen.add(key)
+                    unique.append(symbol)
+            if unique:
+                _EMA9_VWAP_UNIVERSE = unique[:SCANNER_UNIVERSE_MAX]
+                _EMA9_VWAP_CURSOR %= len(_EMA9_VWAP_UNIVERSE)
+                _EMA9_VWAP_UNIVERSE_REFRESH_AT = started
+        except Exception as exc:
+            meta.update({"state": "UNIVERSE_ERROR", "last_error": f"{type(exc).__name__}:{str(exc)[:120]}"})
+            return
+    universe = _EMA9_VWAP_UNIVERSE
+    if not universe:
+        meta.update({"state": "NO_SYMBOLS", "last_completed": time.time()})
+        return
+    count = min(EMA9_VWAP_DISCOVERY_BATCH, len(universe))
+    batch = [universe[(_EMA9_VWAP_CURSOR + offset) % len(universe)] for offset in range(count)]
+    _EMA9_VWAP_CURSOR = (_EMA9_VWAP_CURSOR + count) % len(universe)
+    timeframe_seconds = _roro_timeframe_seconds(INTERVAL)
+    now_ms = int(time.time() * 1000)
+    discovered, errors, stale = [], 0, 0
+    last_seen = MEMORY.setdefault("_ema9_vwap_discovery_candle_seen", {})
+    for symbol in batch:
+        if STATE.get("open") or TRADE_STATE.get("in_position"):
+            break
+        try:
+            frame = _get_scanner_frame(symbol, 150)
+            if frame is None or len(frame) < 55:
+                errors += 1
+                continue
+            proximity = _roro_ema9_vwap_proximity(frame, lambda values, length: values.ewm(span=length, adjust=False).mean(), ema_len=9, timeframe_seconds=timeframe_seconds, now_ms=now_ms)
+            if not isinstance(proximity, dict):
+                errors += 1
+                continue
+            candle_ts = int(proximity.get("candle_timestamp") or 0)
+            key = roro_canonical_symbol(symbol)
+            if not candle_ts or candle_ts <= int(last_seen.get(key, 0) or 0):
+                stale += 1
+                continue
+            state = str(proximity.get("state") or "UNKNOWN")
+            if state == "CROSS_CONFLICT":
+                last_seen[key] = candle_ts
+                continue
+            side = str(proximity.get("direction") or "NEUTRAL").upper()
+            if side not in ("BUY", "SELL"):
+                last_seen[key] = candle_ts
+                continue
+            base_rank = {"CROSS_CONFIRMED": 100.0, "NEAR_CROSS": 82.0, "CONVERGING": 68.0, "ALIGNED_NOT_CROSSING": 48.0}.get(state, 0.0)
+            if base_rank <= 0:
+                last_seen[key] = candle_ts
+                continue
+            ema50_side = str(proximity.get("ema50_direction") or "NEUTRAL").upper()
+            adjustment = 8.0 if ema50_side == side else (-6.0 if ema50_side in ("BUY", "SELL") else 0.0)
+            rank = max(0.0, min(100.0, base_rank + adjustment))
+            discovered.append({"symbol": symbol, "canonical_symbol": key, "side": side, "side_hint": side, "score": round(rank, 2), "source": "ema9_vwap_global_discovery", "discovery_source": "ema9_vwap_global_discovery", "discovery_sources": ["ema9_vwap_global_discovery"], "state": state, "cross_trigger": proximity.get("cross_trigger"), "ema9_vwap_proximity": {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}, "ema50_confirmation": "ALIGNED" if ema50_side == side else "OPPOSITE" if ema50_side in ("BUY", "SELL") else "NEUTRAL", "closed_candle_timestamp": candle_ts, "discovered_at": time.time()})
+            last_seen[key] = candle_ts
+        except Exception:
+            errors += 1
+    if discovered:
+        current = MEMORY.setdefault("top_candidates", [])
+        merged = {roro_canonical_symbol(x.get("symbol")): dict(x) for x in current if isinstance(x, dict) and roro_canonical_symbol(x.get("symbol"))}
+        for row in discovered:
+            key = row["canonical_symbol"]
+            prior = merged.get(key, {})
+            sources = list(dict.fromkeys((prior.get("discovery_sources") or []) + row["discovery_sources"]))
+            merged[key] = {**prior, **row, "discovery_sources": sources}
+        MEMORY["top_candidates"] = sorted(merged.values(), key=lambda x: float(x.get("score", 0) or 0), reverse=True)[:60]
+    meta.update({"state": "IDLE", "last_started": started, "last_completed": time.time(), "universe_size": len(universe), "batch_size": len(batch), "cursor": _EMA9_VWAP_CURSOR, "discovered": len(discovered), "data_errors": errors, "unchanged_or_stale": stale, "coverage_estimate_seconds": round((len(universe) / max(1, EMA9_VWAP_DISCOVERY_BATCH)) * EMA9_VWAP_DISCOVERY_INTERVAL, 1), "interval_seconds": EMA9_VWAP_DISCOVERY_INTERVAL, "closed_candles_only": True, "entry_authority": "UNIFIED_ENTRY_AUTHORITY_ONLY", "last_symbols": [x.get("symbol") for x in discovered[:12]]})
+    if discovered:
+        log_execution(f"[EMA9_VWAP_DISCOVERY] batch={len(batch)} found={len(discovered)} errors={errors} stale={stale} coverage~{meta['coverage_estimate_seconds']}s", "INFO", debounce_key="ema9_vwap_discovery", debounce_sec=15)
 
 def run_global_discovery_scanner():
     """Scanner 1: bounded global discovery; RF, V2 and professional scan share one OHLCV cache.
