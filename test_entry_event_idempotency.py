@@ -21,21 +21,26 @@ def test_distinct_closed_candles_remain_independent_events(tmp_path):
     assert journal.consume_event("BUY:1795133700000", "trade-2") is True
 
 
-def test_final_entry_wrapper_checks_consumption_before_order_and_persists_after_fill():
+def test_entry_checks_current_event_before_order_and_persists_after_verified_fill():
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     functions = [node for node in tree.body
                  if isinstance(node, ast.FunctionDef) and node.name == "execute_entry"]
-    wrapper = functions[-1]
-    calls = [node.func.attr if isinstance(node.func, ast.Attribute)
-             else node.func.id if isinstance(node.func, ast.Name) else ""
-             for node in ast.walk(wrapper) if isinstance(node, ast.Call)]
-    assert "is_event_consumed" in calls
-    assert "consume_event" in calls
-    assert "_original_execute_entry_for_journal" in calls
+    assert len(functions) >= 2
+    core_entry, wrapper = functions[0], functions[-1]
+
+    core_calls = [node.func.attr if isinstance(node.func, ast.Attribute)
+                  else node.func.id if isinstance(node.func, ast.Name) else ""
+                  for node in ast.walk(core_entry) if isinstance(node, ast.Call)]
+    assert "is_event_consumed" in core_calls
+
+    wrapper_calls = [node.func.attr if isinstance(node.func, ast.Attribute)
+                     else node.func.id if isinstance(node.func, ast.Name) else ""
+                     for node in ast.walk(wrapper) if isinstance(node, ast.Call)]
+    assert "_original_execute_entry_for_journal" in wrapper_calls
+    assert "consume_event" in wrapper_calls
     assert any(isinstance(node, ast.With) for node in wrapper.body)
-    # The final wrapper must persist the event only after the underlying verified
-    # execution call, not before it.
+
     body_calls = []
     for stmt in wrapper.body:
         body_calls.extend(
