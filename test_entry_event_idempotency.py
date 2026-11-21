@@ -1,0 +1,47 @@
+import ast
+from pathlib import Path
+
+from roro_trade_journal import TradeJournal
+
+
+def test_entry_signal_consumption_survives_journal_restart(tmp_path):
+    path = tmp_path / "trade-journal.sqlite3"
+    first = TradeJournal(str(path))
+    assert first.consume_event("BUY:1795132800000", "trade-1") is True
+    assert first.is_event_consumed("BUY:1795132800000") is True
+
+    restarted = TradeJournal(str(path))
+    assert restarted.is_event_consumed("BUY:1795132800000") is True
+    assert restarted.consume_event("BUY:1795132800000", "trade-2") is False
+
+
+def test_distinct_closed_candles_remain_independent_events(tmp_path):
+    journal = TradeJournal(str(tmp_path / "trade-journal.sqlite3"))
+    assert journal.consume_event("BUY:1795132800000", "trade-1") is True
+    assert journal.consume_event("BUY:1795133700000", "trade-2") is True
+
+
+def test_final_entry_wrapper_checks_consumption_before_order_and_persists_after_fill():
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "execute_entry"]
+    wrapper = functions[-1]
+    calls = [node.func.attr if isinstance(node.func, ast.Attribute)
+             else node.func.id if isinstance(node.func, ast.Name) else ""
+             for node in ast.walk(wrapper) if isinstance(node, ast.Call)]
+    assert "is_event_consumed" in calls
+    assert "consume_event" in calls
+    assert "_original_execute_entry_for_journal" in calls
+    assert any(isinstance(node, ast.With) for node in wrapper.body)
+    # The final wrapper must persist the event only after the underlying verified
+    # execution call, not before it.
+    body_calls = []
+    for stmt in wrapper.body:
+        body_calls.extend(
+            node.func.id if isinstance(node.func, ast.Call) and isinstance(node.func, ast.Name)
+            else node.func.attr if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            else ""
+            for node in ast.walk(stmt)
+        )
+    assert body_calls.index("_original_execute_entry_for_journal") < body_calls.index("consume_event")
