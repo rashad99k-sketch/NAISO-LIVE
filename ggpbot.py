@@ -11364,6 +11364,131 @@ def run_global_discovery_scanner():
     MEMORY["radar_watchlist"] = radar_candidates[:30]
     MEMORY["radar_top5"] = radar_candidates[:5]
 
+    # Dedicated EMA9/VWAP proximity discovery across the SAME bounded universe.
+    # Frames come from the shared scanner cache populated by Scanner V2 above.
+    # This path ranks candidates only; it never authorizes or submits orders.
+    proximity_candidates = []
+    proximity_rows = []
+    proximity_now = time.time()
+    proximity_now_ms = int(proximity_now * 1000)
+    proximity_timeframe_seconds = _roro_timeframe_seconds(INTERVAL)
+    proximity_max_age = 2.0 * float(proximity_timeframe_seconds)
+    for proximity_symbol in symbols:
+        if STATE.get("open") or TRADE_STATE.get("in_position"):
+            break
+        try:
+            proximity_frame = _get_scanner_frame(proximity_symbol, 150)
+            if proximity_frame is None:
+                continue
+            proximity_closed = roro_validate_closed_frame(
+                proximity_frame, now_ms=proximity_now_ms,
+                timeframe_s=proximity_timeframe_seconds
+            )
+            if len(proximity_closed) < 55:
+                continue
+            proximity = _roro_ema9_vwap_proximity(
+                proximity_closed, ema, ema_len=9,
+                timeframe_seconds=proximity_timeframe_seconds,
+                now_ms=proximity_now_ms
+            )
+            if not isinstance(proximity, dict):
+                continue
+            state = str(proximity.get("state") or "UNKNOWN").upper()
+            if state not in {"NEAR_CROSS", "CONVERGING", "CROSS_CONFIRMED"}:
+                continue
+            candle_ts = int(proximity.get("candle_timestamp") or 0)
+            candle_age = proximity_now - (candle_ts / 1000.0 + float(proximity_timeframe_seconds))
+            if candle_age < 0 or candle_age > proximity_max_age:
+                continue
+
+            ema9_cross = str(proximity.get("cross_ema9") or "").upper()
+            ema50_cross = str(proximity.get("cross_ema50") or "").upper()
+            direction = str(proximity.get("direction") or "NEUTRAL").upper()
+            side_hint = "BUY" if ema9_cross == "BULLISH" else (
+                "SELL" if ema9_cross == "BEARISH" else direction
+            )
+            if side_hint not in {"BUY", "SELL"}:
+                continue
+
+            # EMA9/VWAP is primary. EMA50 is a soft confirmation, never a veto.
+            raw_score = float(proximity.get("score", 0.0) or 0.0)
+            if not math.isfinite(raw_score):
+                continue
+            base_score = max(0.0, raw_score - (20.0 if proximity.get("cross_any") else 0.0))
+            score = base_score
+            if ema9_cross:
+                score += 28.0
+            if ema9_cross and ema50_cross == ema9_cross:
+                score += 12.0
+            elif ema9_cross and ema50_cross and ema50_cross != ema9_cross:
+                score -= 12.0
+            elif ema50_cross and not ema9_cross:
+                score += 3.0
+            elif proximity.get("ema50_direction") == direction:
+                score += 5.0
+
+            volume_base = float(proximity_closed.volume.iloc[-21:-1].mean()) if len(proximity_closed) >= 21 else 0.0
+            volume_ratio = float(proximity_closed.volume.iloc[-1]) / volume_base if volume_base > 0 else 0.0
+            if math.isfinite(volume_ratio):
+                score += min(8.0, max(0.0, (volume_ratio - 1.0) * 4.0))
+            score = round(max(0.0, min(100.0, score)), 2)
+
+            canonical = roro_canonical_symbol(proximity_symbol)
+            proximity_item = {
+                **proximity,
+                "symbol": canonical,
+                "exchange_symbol": roro_exchange_symbol(proximity_symbol),
+                "score": score,
+                "updated_at": proximity_now,
+                "cross_age_seconds": round(candle_age, 2) if ema9_cross or ema50_cross else None,
+                "cross_max_age_seconds": proximity_max_age,
+                "cross_fresh": bool((ema9_cross or ema50_cross) and candle_age <= proximity_max_age),
+                "timeframe_seconds": float(proximity_timeframe_seconds),
+                "volume_ratio": round(volume_ratio, 3),
+                "ema9_primary": True,
+                "ema50_role": "SOFT_CONFIRMATION",
+                "data_quality": "CLOSED_CANDLES",
+                "role": "RANKING_ONLY_NOT_ENTRY_GATE",
+            }
+            proximity_rows.append(proximity_item)
+            proximity_candidates.append({
+                "symbol": canonical,
+                "exchange_symbol": roro_exchange_symbol(proximity_symbol),
+                "side": side_hint,
+                "side_hint": side_hint,
+                "score": score,
+                "source": "ema9_vwap_proximity",
+                "ema9_vwap_proximity": proximity_item,
+                "proximity_score": score,
+                "side_hint_is_soft": True,
+            })
+        except Exception as proximity_scan_exc:
+            log_execution(
+                f"[EMA_VWAP_DISCOVERY] {proximity_symbol} skipped: {type(proximity_scan_exc).__name__}",
+                "WARN", debounce_key=f"ema_vwap_discovery_{proximity_symbol}", debounce_sec=300
+            )
+
+    proximity_candidates.sort(
+        key=lambda row: (
+            float(row.get("score", 0.0) or 0.0),
+            bool((row.get("ema9_vwap_proximity") or {}).get("cross_ema9")),
+            bool((row.get("ema9_vwap_proximity") or {}).get("cross_ema50")),
+        ), reverse=True
+    )
+    proximity_rows.sort(key=lambda row: (float(row.get("score", 0.0) or 0.0), float(row.get("updated_at", 0.0) or 0.0)), reverse=True)
+    MEMORY["ema9_vwap_proximity_scanner"] = proximity_rows[:30]
+    MEMORY["ema9_vwap_proximity_scanner_meta"] = {
+        "state": "READY" if proximity_rows else "NO_CANDIDATES",
+        "observed_this_batch": len(proximity_rows),
+        "symbols": len(proximity_rows),
+        "universe_scanned": len(symbols),
+        "updated_at": proximity_now,
+        "role": "RANKING_ONLY",
+        "ema9_primary": True,
+        "ema50_role": "SOFT_CONFIRMATION",
+        "closed_candles_only": True,
+    }
+
     # Present a deduplicated blended discovery panel; do not replace the independent RF panel.
     blended = []
     seen = set()
@@ -11373,6 +11498,7 @@ def run_global_discovery_scanner():
         ("scanner_v2_sell", MEMORY.get("scanner_v2_sell", [])),
         ("radar", radar_candidates),
         ("rf", rf_candidates),
+        ("ema9_vwap", proximity_candidates),
     ):
         for row in source_rows or []:
             symbol = row.get("symbol")
@@ -11389,6 +11515,10 @@ def run_global_discovery_scanner():
                 if target is not None:
                     if source_name not in target["discovery_sources"]:
                         target["discovery_sources"].append(source_name)
+                    if source_name == "ema9_vwap":
+                        target["ema9_vwap_proximity"] = row.get("ema9_vwap_proximity")
+                        target["proximity_score"] = float(row.get("proximity_score", score) or score)
+                        target["proximity_source"] = "ema9_vwap_proximity"
                     if score > float(target.get("score", 0) or 0):
                         target["score"] = score
     blended.sort(key=lambda item: float(item.get("score", 0) or 0), reverse=True)
