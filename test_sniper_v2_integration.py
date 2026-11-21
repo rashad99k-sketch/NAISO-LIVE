@@ -375,6 +375,11 @@ def test_compute_sl_tp_preserves_two_stage_target_order_for_normal_atr(monkeypat
     monkeypatch.setattr(ggpbot.PrecisionSafety, "normalize_price",
                         lambda _symbol, value: round(float(value), 4))
     monkeypatch.setattr(ggpbot, "_market_price_tick_size", lambda _symbol, _price: 0.0001)
+    # Isolate TP ordering/precision behavior from the separate adaptive target
+    # selector. The production target-selection engine remains unchanged.
+    monkeypatch.setattr(ggpbot, "trend_target_prices",
+                        lambda side, entry: (entry * 0.995, entry * 0.990)
+                        if side == "SELL" else (entry * 1.005, entry * 1.010))
 
     sl, tp1, tp2 = ggpbot.compute_sl_tp(
         100.0, "SELL", "REVERSAL", 0.5, frame, symbol="TEST/USDT:USDT"
