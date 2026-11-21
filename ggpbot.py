@@ -11336,7 +11336,7 @@ def run_fast_ema9_vwap_discovery():
             # Persist the last confirmed EMA9 cross across scan rotations; EMA50 never releases entry.
             cross_memory = MEMORY.setdefault("_ema9_vwap_last_confirmed_cross", {})
             key = roro_canonical_symbol(symbol)
-            current_cross = str(proximity.get("cross_ema9") or "").upper()
+            current_cross = str(proximity.get("signal") or "").upper() if bool(proximity.get("cross_ema9")) else ""
             if current_cross in ("BULLISH", "BEARISH"):
                 cross_memory[key] = {"direction": current_cross, "candle_timestamp": int(proximity.get("candle_timestamp") or 0), "timeframe_seconds": timeframe_seconds}
             remembered = cross_memory.get(key)
