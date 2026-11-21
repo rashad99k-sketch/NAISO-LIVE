@@ -831,9 +831,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
             )
             zones = []
             if ob_valid:
-                zones.append(("ORDER_BLOCK", safe_float(ob.get("low"), 0.0), safe_float(ob.get("high"), 0.0)))
+                zones.append(("ORDER_BLOCK", float(ob.get("low") or 0.0), float(ob.get("high") or 0.0)))
             if fvg_valid:
-                zones.append(("FVG", safe_float(fvg.get("lower"), 0.0), safe_float(fvg.get("upper"), 0.0)))
+                zones.append(("FVG", float(fvg.get("lower") or 0.0), float(fvg.get("upper") or 0.0)))
             for zone_type, zone_low, zone_high in zones:
                 if (cross_row is not None and 0 < zone_low < zone_high
                         and float(cross_row["low"]) <= zone_high
