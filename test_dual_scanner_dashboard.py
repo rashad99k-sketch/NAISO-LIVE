@@ -187,3 +187,20 @@ def test_effective_watchlist_cleanup_uses_copy_snapshot():
     )
     source = ast.get_source_segment(SOURCE, fn)
     assert "wl.copy().items()" in source
+
+
+def test_global_discovery_injects_closed_candle_ema_vwap_candidates_into_unified_sources():
+    fn = _function("run_global_discovery_scanner")
+    source = ast.get_source_segment(SOURCE, fn)
+    assert "_roro_ema9_vwap_proximity" in source
+    assert '("ema9_vwap", proximity_candidates)' in source
+    assert '"ema9_primary": True' in source
+    assert '"ema50_role": "SOFT_CONFIRMATION"' in source
+    assert "cross_age_seconds" in source
+    assert "execute_entry" not in source
+
+
+def test_proximity_candidates_can_be_ranked_before_first_watchlist_enrichment():
+    bridge_source = (ROOT / "ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    assert 'item.get("ema9_vwap_proximity")' in bridge_source
+    assert "cross_fresh" in bridge_source
