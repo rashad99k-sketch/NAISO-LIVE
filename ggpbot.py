@@ -9706,7 +9706,7 @@ function updateUI(d) {{
                 (stage === "ENTRY_WINDOW_MISSED" || stage === "CHOP_FILTER" || stage === "STALE_DATA" ? "#e74c3c" :
                 (stage === "NO_FRESH_CROSS" ? "#95a5a6" : "#f1c40f"));
             let active = st.active_side || "NONE";
-            let sideCheck = st[active.toLowerCase()] || {};
+            let sideCheck = st[active.toLowerCase()] || {{}};
             pHtml += `<div style="padding:8px;border-bottom:1px solid #26364a;">
               ${{icon}} <b>${{item.symbol}}</b> | <span style="color:${{stageColor}};font-weight:bold;">${{stage}}</span> | Side: ${{active}}
               <br><small>EMA9/VWAP context: ${{item.state || "UNKNOWN"}} · ${{item.cross_trigger || "No EMA9/VWAP cross"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}}</small>
@@ -9760,7 +9760,7 @@ function updateUI(d) {{
               <br><small>BUY hypothesis: ${{buyHyp.state || "NOT_ANALYZED"}} / ${{buyHyp.setup || "-"}} | SELL hypothesis: ${{sellHyp.state || "NOT_ANALYZED"}} / ${{sellHyp.setup || "-"}}</small>
               <br><small>Trend Engine: ${{instTrend.state || "UNKNOWN"}} / Health ${{instTrend.health ?? "?"}} | Trade State: ${{w.trade_state || "UNKNOWN"}}</small>
               <br><small>SL: ${{stopText}} | Data: ${{quality}} | Updated: ${{lastUpdate}}</small>
-              <br><small>EMA9/EMA50/VWAP: mandatory execution gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
+              <br><small>EMA9/EMA15/session VWAP pullback gate: mandatory execution gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
             </div>`;
         }}
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
