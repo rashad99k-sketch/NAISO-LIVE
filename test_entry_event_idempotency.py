@@ -52,12 +52,14 @@ def test_entry_checks_current_event_before_order_and_persists_after_verified_fil
     assert "consume_event" in wrapper_calls
     assert any(isinstance(node, ast.With) for node in wrapper.body)
 
-    body_calls = []
-    for stmt in wrapper.body:
-        body_calls.extend(
-            node.func.id if isinstance(node.func, ast.Call) and isinstance(node.func, ast.Name)
-            else node.func.attr if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            else ""
-            for node in ast.walk(stmt)
-        )
-    assert body_calls.index("_original_execute_entry_for_journal") < body_calls.index("consume_event")
+    original_call_line = min(
+        node.lineno for node in ast.walk(wrapper)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "_original_execute_entry_for_journal"
+    )
+    consume_call_line = min(
+        node.lineno for node in ast.walk(wrapper)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "consume_event"
+    )
+    assert original_call_line < consume_call_line
