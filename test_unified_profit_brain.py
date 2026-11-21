@@ -930,3 +930,133 @@ def test_board_does_not_execute_and_keeps_single_authority_source_shape():
     assert "def evaluate(self, context: Dict) -> TradeDecision" in source
     assert "self._publish_brain_decision" in source
     assert "self._record_shadow_comparison" in source
+
+
+# ---------------------------------------------------------------------------
+# Execution adapter integration: exercise the real LiveTradeManager executor
+# with a deterministic fake exchange boundary (no network / real orders).
+# ---------------------------------------------------------------------------
+
+def _execution_manager():
+    manager = object.__new__(ggpbot.LiveTradeManager)
+    manager.lifecycle_state = ggpbot.TradeLifecycleState.LIVE
+    return manager
+
+
+def _patch_management_side_effects(monkeypatch, events):
+    monkeypatch.setattr(ggpbot, "record_trade_management_event",
+                        lambda *args, **kwargs: events.append((args, kwargs)))
+    monkeypatch.setattr(ggpbot, "_persist_trade_journal_snapshot", lambda **kwargs: None)
+    monkeypatch.setattr(ggpbot, "tg_tp_hit", lambda *args, **kwargs: None)
+
+
+def test_live_manager_executor_verifies_tp1_half_close_and_runner_protection(monkeypatch):
+    events = []
+    _patch_management_side_effects(monkeypatch, events)
+    for key, value in {
+        "side": "BUY", "entry": 100.0, "mark_price": 100.3, "roe_pct": 6.0,
+        "profit_mode": "TWO_STAGE_50_50", "trade_id": "exec-tp1",
+        "remaining_qty": 1.0, "qty": 1.0, "initial_qty": 1.0,
+        "initial_margin": 10.0, "atr": 1.0, "synthetic_sl": 99.0,
+        "tp1_hit": False, "partial_closed": False, "be_done": False,
+        "close_verified": False, "native_sl_order_id": "native-sl-1",
+    }.items():
+        monkeypatch.setitem(ggpbot.STATE, key, value)
+
+    calls = []
+    def fake_partial(symbol, ratio, close_reason=None, target_remaining_qty=None):
+        calls.append((symbol, ratio, close_reason, target_remaining_qty))
+        ggpbot.STATE.update({
+            "remaining_qty": 0.5, "last_close_filled_qty": 0.5,
+            "last_close_fill_price": 100.3, "last_close_order_id": "paper-tp1",
+            "last_close_order_realized_pnl": 0.15,
+            "last_close_order_pnl_source": "PAPER_SIMULATED",
+        })
+        return True
+
+    monkeypatch.setattr(ggpbot, "safe_close_partial", fake_partial)
+    decision = TradeDecision(
+        TradeDecisionType.PARTIAL_CLOSE,
+        params={"ratio": 0.5, "target_remaining_qty": 0.5, "close_reason": "TP1"},
+        reason="verified_tp1_target",
+    )
+    _execution_manager()._execute_decision(decision, "BTC/USDT:USDT")
+
+    assert calls == [("BTC/USDT:USDT", 0.5, "TP1", 0.5)]
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(0.5)
+    assert ggpbot.STATE["tp1_hit"] is True
+    assert ggpbot.STATE["partial_closed"] is True
+    assert ggpbot.STATE["be_done"] is True
+    assert ggpbot.STATE["synthetic_sl"] > ggpbot.STATE["entry"]
+    assert any(args and args[0] == "TP1_VERIFIED" for args, _ in events)
+
+
+def test_live_manager_executor_tp2_closes_only_remaining_runner_after_verification(monkeypatch):
+    events = []
+    _patch_management_side_effects(monkeypatch, events)
+    for key, value in {
+        "side": "BUY", "entry": 100.0, "mark_price": 103.0, "roe_pct": 30.0,
+        "profit_mode": "TWO_STAGE_50_50", "trade_id": "exec-tp2",
+        "remaining_qty": 0.5, "qty": 1.0, "initial_qty": 1.0,
+        "initial_margin": 10.0, "tp1_hit": True, "tp2_hit": False,
+        "close_verified": False, "open": True,
+    }.items():
+        monkeypatch.setitem(ggpbot.STATE, key, value)
+    monkeypatch.setitem(ggpbot.DASHBOARD_STATE, "live_trade_mode", True)
+
+    calls = []
+    def fake_full_close(symbol, close_reason=None):
+        calls.append((symbol, close_reason))
+        ggpbot.STATE.update({
+            "close_verified": True, "remaining_qty": 0.0,
+            "last_close_filled_qty": 0.5, "last_close_fill_price": 103.0,
+            "last_close_order_id": "paper-tp2",
+            "last_close_order_realized_pnl": 1.5,
+            "last_close_order_pnl_source": "PAPER_SIMULATED",
+        })
+        return True
+
+    finalized = []
+    monkeypatch.setattr(ggpbot, "safe_close_position", fake_full_close)
+    monkeypatch.setattr(ggpbot, "finalize_trade_with_reality",
+                        lambda symbol, close_reason=None: finalized.append((symbol, close_reason)))
+    decision = TradeDecision(
+        TradeDecisionType.FULL_CLOSE,
+        params={"close_reason": "TP2"},
+        reason="verified_tp2_target",
+    )
+    manager = _execution_manager()
+    manager._execute_decision(decision, "BTC/USDT:USDT")
+
+    assert calls == [("BTC/USDT:USDT", "TP2")]
+    assert ggpbot.STATE["tp2_hit"] is True
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(0.0)
+    assert finalized == [("BTC/USDT:USDT", "TP2")]
+    assert manager.lifecycle_state == ggpbot.TradeLifecycleState.CLOSED
+    assert any(args and args[0] == "TP2_VERIFIED" for args, _ in events)
+
+
+def test_live_manager_executor_does_not_mark_tp1_when_partial_fill_is_unverified(monkeypatch):
+    events = []
+    _patch_management_side_effects(monkeypatch, events)
+    for key, value in {
+        "side": "BUY", "entry": 100.0, "mark_price": 100.3, "roe_pct": 6.0,
+        "profit_mode": "TWO_STAGE_50_50", "trade_id": "exec-tp1-unverified",
+        "remaining_qty": 1.0, "qty": 1.0, "initial_qty": 1.0,
+        "synthetic_sl": 99.0, "tp1_hit": False, "partial_closed": False,
+        "be_done": False, "execution_unresolved": True,
+    }.items():
+        monkeypatch.setitem(ggpbot.STATE, key, value)
+
+    monkeypatch.setattr(ggpbot, "safe_close_partial", lambda *args, **kwargs: False)
+    decision = TradeDecision(
+        TradeDecisionType.PARTIAL_CLOSE,
+        params={"ratio": 0.5, "target_remaining_qty": 0.5, "close_reason": "TP1"},
+        reason="tp1_fill_not_confirmed",
+    )
+    _execution_manager()._execute_decision(decision, "BTC/USDT:USDT")
+
+    assert ggpbot.STATE["remaining_qty"] == pytest.approx(1.0)
+    assert ggpbot.STATE["tp1_hit"] is False
+    assert ggpbot.STATE["partial_closed"] is False
+    assert any(args and args[0] == "EXECUTION_UNCERTAIN" for args, _ in events)
